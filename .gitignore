@@ -1,0 +1,12 @@
+# Decrypted/downloaded Octo bundles, DummyDll, and manifest
+cache/
+
+# Generated glTF/JSON/PNG assets exported from cache/bundles/
+web/assets/
+out/
+
+# Python bytecode & virtualenvs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
