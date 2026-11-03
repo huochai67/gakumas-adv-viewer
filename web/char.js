@@ -8,12 +8,15 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { PoseSolver } from './pose.js';
+import { getBrowserEnv } from './runtime/bundle_env.js';
+import { buildCharFromBundles } from './runtime/bundle_loaders.js';
 
 const OUTLINE_SCALE = parseFloat(new URLSearchParams(location.search).get('outline') ?? '1.0');
 const STENCIL_MASK = 108; // 0x6C (bits 2, 3, 5, 6 used by Campus/Actor/Default)
 
 const TEX_CACHE = new Map();
-let TEX_BASE = './assets/';
+// Texture name -> { data, width, height } decoded straight from the .bundle
+let bundleTextures = null;
 
 // Fallback 1x1 white & neutral textures so shader uniforms are never null
 function solidTex(r, g, b, a = 255, srgb = false) {
@@ -26,22 +29,35 @@ const WHITE_SRGB = solidTex(255, 255, 255, 255, true);
 const DEF_NEUTRAL = solidTex(128, 0, 0, 0, false); // R=0.5 (no shadow bias), B=0, A=0
 const RAMP_DEFAULT = solidTex(255, 255, 255, 0, true);
 
-function loadMap(desc, key, srgb, clamp = false) {
-  const rel = desc && desc.maps && desc.maps[key];
-  if (!rel) return null;
-  const url = TEX_BASE + rel;
-  const ckey = `${url}|${srgb ? 1 : 0}|${clamp ? 1 : 0}`;
+/**
+ * Wrap a decoded bundle texture (row 0 = top of the source image, exactly like
+ * a TextureLoader image with flipY = false) in a cached THREE.DataTexture.
+ */
+function texFromBundle(rel, srgb, clamp = false) {
+  const entry = bundleTextures && bundleTextures.get(rel);
+  if (!entry) return null;
+  const ckey = `${rel}|${srgb ? 1 : 0}|${clamp ? 1 : 0}`;
   let tex = TEX_CACHE.get(ckey);
   if (!tex) {
-    tex = new THREE.TextureLoader().load(url);
+    tex = new THREE.DataTexture(entry.data, entry.width, entry.height, THREE.RGBAFormat);
     tex.flipY = false;
     tex.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
     tex.wrapS = clamp ? THREE.ClampToEdgeWrapping : THREE.RepeatWrapping;
     tex.wrapT = clamp ? THREE.ClampToEdgeWrapping : THREE.RepeatWrapping;
+    tex.magFilter = THREE.LinearFilter;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.generateMipmaps = true;
     tex.anisotropy = 4;
+    tex.needsUpdate = true;
     TEX_CACHE.set(ckey, tex);
   }
   return tex;
+}
+
+function loadMap(desc, key, srgb, clamp = false) {
+  const rel = desc && desc.maps && desc.maps[key];
+  if (!rel) return null;
+  return texFromBundle(rel, srgb, clamp);
 }
 
 // View-space light direction from VLActorParameter / VLActorShadow angles (deg):
@@ -642,12 +658,12 @@ function evalSimpleCurve(pts, x) {
  * Load the actor model, build its authentic Campus/Actor/Default materials,
  * stencil passes, outlines, and Mecanim PoseSolver.
  */
-export async function loadCharacter(scene, opts = {}) {
-  const metaUrl = opts.metaUrl || './assets/char.json';
-  const url = opts.url || './assets/char.glb';
-  TEX_BASE = opts.texBase || metaUrl.replace(/char\.json.*$/, '');
-  const meta = await (await fetch(metaUrl)).json();
-  const gltf = await new GLTFLoader().loadAsync(url);
+export async function loadCharacter(scene) {
+  const env = await getBrowserEnv();
+  const { glbBytes, meta, textures } = await buildCharFromBundles(env);
+  bundleTextures = textures;
+  const gltf = await new GLTFLoader().parseAsync(
+    glbBytes.buffer.slice(glbBytes.byteOffset, glbBytes.byteOffset + glbBytes.byteLength), '');
   const root = gltf.scene;
 
   const nodeByIndex = new Map();

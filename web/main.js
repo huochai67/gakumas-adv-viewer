@@ -6,7 +6,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { loadCharacter } from './char.js';
-import { getClip, evalClip } from './clips.js';
+import { getClip, evalClip, setClipCharMeta } from './clips.js';
 import { applyCameraSetting } from './camera.js';
 
 const statusEl = document.getElementById('status');
@@ -61,6 +61,7 @@ const MODE = params.get('mode') || 'anim';
 async function boot() {
   try {
     char = await loadCharacter(scene);
+    setClipCharMeta(char.meta);
     poseClip = await getClip('mot_all_chr_cmmn_talk-015_pose_b');
     facialClip = await getClip('mot_all_chr_amao_facial-all-default_in_f');
     statusEl.textContent =

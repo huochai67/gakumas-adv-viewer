@@ -1,12 +1,12 @@
 # Gakumas ADV Viewer
 
-Offline re-implementation of the game's ADV (adventure) scene player: it reads
-the game's own script files, its exported stage/model/animation bundles, and
-replays the scene in a browser with the game's camera settings, staging and
-dialogue window.
-
-Everything here is derived from the shipped assets in `cache/bundles/` (raw
-Octo bundles, decrypted by `pipeline/`) — no game process is started.
+Browser-native re-implementation of the game's ADV (adventure) scene player:
+the browser directly parses the game's raw UnityFS `.bundle` packages
+(`cache/bundles/*.bundle`) and CRI `.acb` voice containers
+(`cache/resources/*.acb`) in-memory via a 103 KB Rust WebAssembly module
+(`web/wasm/gakumas_core.wasm`), constructing Three.js meshes, skeletons,
+materials, animations, and WebAudio PCM + 60 Hz AIUEO lip-sync on the fly
+with zero pre-exported `.glb`, `.png`, or `.mp3` files required.
 
 ## Run
 
@@ -27,21 +27,29 @@ and a per-request-connection server exhausts the Windows ephemeral port range
 Controls: space = play/pause, arrows = +-1 s, "next msg" jumps to the next
 dialogue line, slider scrubs.
 
-## Pipeline
+## Browser WASM Runtime & Optional CLI Pipeline
 
-Order matters; every step reads `cache/bundles/` and writes `web/assets/`.
+At runtime, `story.html` and `index.html` load raw bundles and `.acb` cue sheets
+directly from `/cache/bundles/*` and `/cache/resources/*` (indexed by
+`/cache/index.json` in `web/serve.ts`) using `web/wasm/gakumas_core.wasm`
+(built from `wasm/lib.rs`, `wasm/lz4_bcn.rs`, and `wasm/clhca.rs`):
+
+* **WASM primitives (`web/wasm/gakumas_core.wasm`)**: Octo `0x100`-byte XOR
+  header unmasking, raw LZ4 block decompression, `RGB24`/`RGBA32`/`DXT1`/`DXT5`/`BC6H`
+  (14 modes)/`BC7` (8 modes) texture decoding, CRI HCA v3.0 audio decoding, and
+  2048-point radix-2 FFT 60 Hz 5-vowel (`A/I/U/E/O`) lip-sync extraction.
+* **Browser runtime (`web/runtime/bundle_env.js`, `web/runtime/bundle_loaders.js`)**:
+  `UnityFS` + `SerializedFile` v22 + embedded `TypeTree` parser, cross-bundle
+  `PPtr` & `.resS` resolver, lazy `LazyTextureMap` `THREE.DataTexture` uploader,
+  in-memory GLB + `ClipSampler` builder, and `@UTF`/`AFS2` `.acb` voice loader.
+
+To rebuild `web/wasm/gakumas_core.wasm` or fetch/export offline assets via CLI:
 
 ```bash
+bun run build:wasm               # compile wasm/lib.rs -> web/wasm/gakumas_core.wasm
 bun pipeline/fetch.ts mdl_chr_amao-casl-0000_body env_3d_adv_classroom-00-00-noon ...
-bun pipeline/export_char.ts      # char.glb + char.json (body/face/hair + skeleton + swing)
-bun pipeline/export_clips.ts     # clips/*.json for every mot_*.bundle in cache
-bun pipeline/export_env.ts       # env.glb + env.json (static lightmapped stage + decals)
-bun pipeline/export_bg.ts        # tex/env_2d_*.png + bg.json (2D backgrounds)
-bun pipeline/export_voices.ts    # voices/*.mp3 + voices/lipsync.json (CRI HCA + 60Hz AIUEO)
-# or run all exporters at once:
-bun run export:all
+bun run export:all               # optional CLI export of .glb / .png / .mp3 / .json
 ```
-
 Extra bundles are pulled by name from `cache/OctoManifest.json` (or
 `GAKUMAS_OCTO_MANIFEST`); `fetch.ts` resolves the dependency closure. All
 `SerializedFile` v22 objects and `MonoBehaviour`s embed complete `TypeTree`

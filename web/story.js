@@ -1,13 +1,16 @@
 // Offline ADV story player.
 //
 // Consumes the game's own ADV script (assets/script.txt or ?script=...),
-// the exported 3D stage (assets/env.glb + env.json), 2D backgrounds (bg.json),
-// and the authentic Campus/Actor/Default character renderer.
+// the raw .bundle packages (3D stage, 2D backgrounds, character, clips) and
+// .acb voice packages decoded in the browser through gakumas_core.wasm, and
+// the authentic Campus/Actor/Default character renderer.
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { loadCharacter } from './char.js';
-import { getClip, evalClip } from './clips.js';
+import { getClip, evalClip, setClipCharMeta } from './clips.js';
+import { getBrowserEnv } from './runtime/bundle_env.js';
+import { buildEnv3dFromBundles, loadBg2dFromBundle, loadVoiceCueFromAcb } from './runtime/bundle_loaders.js';
 import { parseAdv, buildTimeline } from './adv.js';
 import { applyCameraSetting, unityEulerQuat } from './camera.js';
 import { createBloom } from './bloom.js';
@@ -108,29 +111,100 @@ resize();
 let skyTexture = null;
 
 async function loadEnv() {
-  const meta = await (await fetch('./assets/env.json')).json();
-  const gltf = await new GLTFLoader().loadAsync('./assets/env.glb');
-  const loader = new THREE.TextureLoader();
+  const env = await getBrowserEnv();
+  const { glbBytes, meta, textures } = await buildEnv3dFromBundles(env);
+  const gltf = await new GLTFLoader().parseAsync(
+    glbBytes.buffer.slice(glbBytes.byteOffset, glbBytes.byteOffset + glbBytes.byteLength), '');
+
+  // Bundle textures arrive as decoded RGBA with row 0 = top of the source
+  // image, i.e. exactly what TextureLoader hands over for a PNG. A DataTexture
+  // uploads row 0 to v = 0 with flipY = false, matching the old PNG path; the
+  // lightmap keeps flipY = true so Unity's bottom-up v = 1 UVs line up.
+  // Downsample oversized 3D prop textures (2048x2048 -> 1024x1024) via a 2x2 box
+  // filter so 50 stage atlases take ~180 MB VRAM instead of ~940 MB uncompressed RGBA8.
+  const downsampleRgba = (src, sw, sh, maxDim) => {
+    let w = sw, h = sh, data = src;
+    while ((w > maxDim || h > maxDim) && w >= 2 && h >= 2) {
+      const nw = w >> 1, nh = h >> 1;
+      const dst = new Uint8Array(nw * nh * 4);
+      for (let y = 0; y < nh; y++) {
+        const r0 = (y * 2) * w * 4;
+        const r1 = r0 + w * 4;
+        let di = y * nw * 4;
+        for (let x = 0; x < nw; x++) {
+          const i00 = r0 + (x << 3);
+          const i01 = i00 + 4;
+          const i10 = r1 + (x << 3);
+          const i11 = i10 + 4;
+          dst[di]     = (data[i00]     + data[i01]     + data[i10]     + data[i11]     + 2) >> 2;
+          dst[di + 1] = (data[i00 + 1] + data[i01 + 1] + data[i10 + 1] + data[i11 + 1] + 2) >> 2;
+          dst[di + 2] = (data[i00 + 2] + data[i01 + 2] + data[i10 + 2] + data[i11 + 2] + 2) >> 2;
+          dst[di + 3] = (data[i00 + 3] + data[i01 + 3] + data[i10 + 3] + data[i11 + 3] + 2) >> 2;
+          di += 4;
+        }
+      }
+      data = dst;
+      w = nw;
+      h = nh;
+    }
+    return { data, width: w, height: h };
+  };
+
+  const stageTexCache = new Map();
+  const stageTex = (rel, srgb, flipY = false, maxDim = 1024) => {
+    if (!rel) return null;
+    const entry = textures.get(rel);
+    if (!entry) return null;
+    const ckey = `${rel}|${srgb ? 1 : 0}|${flipY ? 1 : 0}|${maxDim}`;
+    let tex = stageTexCache.get(ckey);
+    if (!tex) {
+      const img = (entry.width > maxDim || entry.height > maxDim)
+        ? downsampleRgba(entry.data, entry.width, entry.height, maxDim)
+        : entry;
+      tex = new THREE.DataTexture(img.data, img.width, img.height, THREE.RGBAFormat);
+      tex.flipY = flipY;
+      tex.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.magFilter = THREE.LinearFilter;
+      tex.minFilter = THREE.LinearMipmapLinearFilter;
+      tex.generateMipmaps = true;
+      tex.anisotropy = 4;
+      tex.needsUpdate = true;
+      stageTexCache.set(ckey, tex);
+    }
+    return tex;
+  };
 
   let lmap = null;
   if (meta.lightmap && meta.lightmap.light) {
-    lmap = await loader.loadAsync('./assets/' + meta.lightmap.light).catch((e) => {
-      console.warn('lightmap load failed', e);
-      return null;
-    });
+    lmap = stageTex(meta.lightmap.light, true, true, 2048);
     if (lmap) {
-      lmap.flipY = true;
-      lmap.colorSpace = THREE.SRGBColorSpace;
       lmap.channel = 1;
       lmap.needsUpdate = true;
     }
   }
 
   if (meta.skybox) {
-    skyTexture = await loader.loadAsync('./assets/' + meta.skybox).catch(() => null);
-    if (skyTexture) {
-      skyTexture.mapping = THREE.EquirectangularReflectionMapping;
-      skyTexture.colorSpace = THREE.SRGBColorSpace;
+    // Pre-generate the CubeUV PMREM texture once from a 1024x512 skybox so
+    // Three.js never invokes PMREMGenerator mid-frame inside setProgram() when
+    // scrubbing into the 3D stage (which previously allocated two 3072x4096
+    // HalfFloat targets mid-render and corrupted renderStateStack).
+    const skyEntry = textures.get(meta.skybox);
+    if (skyEntry) {
+      const small = downsampleRgba(skyEntry.data, skyEntry.width, skyEntry.height, 1024);
+      const eqTex = new THREE.DataTexture(small.data, small.width, small.height, THREE.RGBAFormat);
+      eqTex.flipY = false;
+      eqTex.colorSpace = THREE.SRGBColorSpace;
+      eqTex.mapping = THREE.EquirectangularReflectionMapping;
+      eqTex.minFilter = THREE.LinearFilter;
+      eqTex.magFilter = THREE.LinearFilter;
+      eqTex.generateMipmaps = false;
+      eqTex.needsUpdate = true;
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      skyTexture = pmrem.fromEquirectangular(eqTex).texture;
+      pmrem.dispose();
+      eqTex.dispose();
     }
   }
 
@@ -155,16 +229,6 @@ async function loadEnv() {
   // Three.js MeshBasicMaterial multiplies lightMapIntensity by RECIPROCAL_PI (1 / Math.PI)!
   // Multiply by Math.PI * 1.45 to cancel RECIPROCAL_PI and match native URP baked irradiance.
   const lmScale = 1.45 * Math.PI * lmVolIntensity;
-  const defTexCache = new Map();
-  const loadStageDef = (rel) => {
-    if (!rel) return null;
-    if (defTexCache.has(rel)) return defTexCache.get(rel);
-    const t = loader.load('./assets/' + rel);
-    t.flipY = false;
-    t.colorSpace = THREE.NoColorSpace;
-    defTexCache.set(rel, t);
-    return t;
-  };
   gltf.scene.traverse((o) => {
     if (!o.isMesh) return;
     if (o.geometry && o.geometry.attributes.uv2 && !o.geometry.attributes.uv1) {
@@ -177,12 +241,10 @@ async function loadEnv() {
     const matName = info.material || exactName.split('|')[0] || '';
     const mdesc = (meta.materials && meta.materials[matName]) || { colors: {}, floats: {} };
 
-    const src = o.material;
-    const albedo = src && src.map ? src.map : null;
-    if (albedo) {
-      albedo.colorSpace = THREE.SRGBColorSpace;
-      albedo.anisotropy = 4;
-    }
+    // The in-memory GLB carries no texture objects, so resolve the albedo from
+    // the material descriptor and the bundle texture map.
+    const albedoRel = mdesc.maps && (mdesc.maps._BaseMap || mdesc.maps._MainTex);
+    const albedo = albedoRel ? stageTex(albedoRel, true, false) : null;
 
     const bc = mdesc.colors._BaseColor || mdesc.colors._Color || [1, 1, 1, 1];
     const ovr = info.overrideColor || [1, 1, 1, 1];
@@ -198,7 +260,7 @@ async function loadEnv() {
     const ec = mdesc.colors._EmissionColor || [0, 0, 0, 1];
     const emMax = Math.max(ec[0] || 0, ec[1] || 0, ec[2] || 0);
     const defRel = mdesc.maps && mdesc.maps._DefMap;
-    const defMap = (emMax > 0.5 && defRel) ? loadStageDef(defRel) : null;
+    const defMap = (emMax > 0.5 && defRel) ? stageTex(defRel, false, false) : null;
 
     let mat;
     if (info.lightmap && lmap) {
@@ -252,16 +314,6 @@ async function loadEnv() {
   envGroup.add(gltf.scene);
 
   // Build DecalProjector quads (whiteboard drawings, blackboard chalk, monitor, prop contact shadows)
-  const decalTexCache = new Map();
-  const loadDecalTex = (rel) => {
-    if (decalTexCache.has(rel)) return decalTexCache.get(rel);
-    const t = loader.load('./assets/' + rel);
-    t.flipY = false;
-    t.colorSpace = THREE.SRGBColorSpace;
-    t.anisotropy = 4;
-    decalTexCache.set(rel, t);
-    return t;
-  };
   for (const d of (meta.decals || [])) {
     if (!d.map || !d.positions || d.fade <= 0.005) continue;
     const geo = new THREE.BufferGeometry();
@@ -271,7 +323,7 @@ async function loadEnv() {
     geo.computeVertexNormals();
     const dmat = new THREE.MeshBasicMaterial({
       name: d.material,
-      map: loadDecalTex(d.map),
+      map: stageTex(d.map, true, false),
       color: new THREE.Color(...(d.color || [1, 1, 1])),
       transparent: true,
       opacity: Math.min(1, d.fade),
@@ -1040,8 +1092,6 @@ function applyLipSyncToMorph(morph, vowels) {
   }
 }
 
-const VOICE_ASSET_VER = 'hca3';
-
 class VoiceController {
   constructor() {
     this.audio = new Audio();
@@ -1065,19 +1115,24 @@ class VoiceController {
   }
 
   resolveUrl(cueName) {
-    return this.blobUrls.get(cueName) || `./assets/voices/${cueName}.mp3?v=${VOICE_ASSET_VER}`;
+    return this.blobUrls.get(cueName) || null;
   }
 
+  /**
+   * Decode each cue's CRI HCA stream out of its .acb sheet into a WAV blob URL
+   * and cache the 60 Hz AIUEO lip-sync weights on `lipsyncDb`.
+   */
   async preloadCues(cueNames) {
     for (const vc of cueNames) {
       if (this.blobUrls.has(vc)) continue;
       try {
-        const res = await fetch(`./assets/voices/${vc}.mp3?v=${VOICE_ASSET_VER}`);
-        if (res.ok) {
-          const blob = await res.blob();
-          this.blobUrls.set(vc, URL.createObjectURL(blob));
-        }
-      } catch { /* ignore */ }
+        const info = await loadVoiceCueFromAcb(vc);
+        if (!info) continue;
+        lipsyncDb.cues[vc] = { duration: info.duration, fps: info.fps, frames: info.frames };
+        this.blobUrls.set(vc, info.wavBlobUrl);
+      } catch (e) {
+        console.warn(`voice load failed ${vc}`, e);
+      }
     }
   }
 
@@ -1153,6 +1208,8 @@ class VoiceController {
 
   replayLine(vObj) {
     if (!vObj || !vObj.voice) return;
+    const url = this.resolveUrl(vObj.voice);
+    if (!url) return;
     if (this.muted) this.muted = false;
     if (this.userVolume <= 0) this.setVolume(1);
     this.autoplayBlocked = false;
@@ -1161,7 +1218,7 @@ class VoiceController {
     this._cueVolume = vObj.volume ?? 1;
     this.audio.volume = Math.max(0, Math.min(1, this._cueVolume * this.userVolume));
     this.audio.playbackRate = 1;
-    this.audio.src = this.resolveUrl(vObj.voice);
+    this.audio.src = url;
     try { this.audio.currentTime = vObj.clipIn || 0; } catch { /* wait metadata */ }
     this._tryPlay();
   }
@@ -1208,8 +1265,13 @@ class VoiceController {
         this._updateBtn();
         return;
       }
+      const url = this.resolveUrl(v.voice);
+      if (!url) {
+        this._updateBtn();
+        return;
+      }
       this.currentCue = v.voice;
-      this.audio.src = this.resolveUrl(v.voice);
+      this.audio.src = url;
       const seekAndPlay = () => {
         if (this.currentCue !== v.voice) return;
         const liveWant = Math.max(0, (time - v.start) + (v.clipIn || 0));
@@ -1320,7 +1382,7 @@ function applyBackground(t, st, bgMeta) {
   let img = bgImages.get(src);
   if (!img) {
     img = document.createElement('img');
-    if (meta.texture) img.src = './assets/' + meta.texture;
+    if (meta.blobUrl) img.src = meta.blobUrl;
     bgEl.appendChild(img);
     bgImages.set(src, img);
   }
@@ -1448,17 +1510,15 @@ let cameraLocked = false;
 
 async function boot() {
   statusEl.textContent = 'loading assets…';
-  const [text, char, bgJson, env, lipJson] = await Promise.all([
+  const env = await getBrowserEnv();
+  const [text, char, stage] = await Promise.all([
     fetch(SCRIPT_URL).then((r) => r.text()),
     loadCharacter(scene),
-    fetch('./assets/bg.json').then((r) => r.json()).catch(() => ({})),
     loadEnv().catch((e) => { console.warn('env load failed', e?.stack || e); return null; }),
-    fetch(`./assets/voices/lipsync.json?v=${VOICE_ASSET_VER}`).then((r) => r.json()).catch(() => ({ fps: 60, cues: {} })),
   ]);
-  bgMeta = bgJson;
-  lipsyncDb = lipJson || { fps: 60, cues: {} };
-  if (env && env.meta && env.meta.volumes) {
-    char.applyActorVolume(env.meta.volumes);
+  setClipCharMeta(char.meta);
+  if (stage && stage.meta && stage.meta.volumes) {
+    char.applyActorVolume(stage.meta.volumes);
   }
   char.root.position.set(0, 0, 0);
   actorGroup.add(char.root);
@@ -1470,21 +1530,40 @@ async function boot() {
     timeline.cues.filter((c) => c.type === 'voice' && c.params.voice).map((c) => c.params.voice),
   )];
   player.hasVoices = voiceCueNames.length > 0;
+
+  // 2D backgrounds: decode once per bundle into a WebGL texture (bloom path)
+  // and a PNG blob URL for the DOM fallback path.
   const bgLoads = [];
   for (const bg of timeline.backgrounds.values()) {
     const src = bg && bg.src;
-    if (!src || src.startsWith('env_3d') || bgImages.has(src)) continue;
-    const meta = bgMeta[src];
-    if (!meta || !meta.texture) continue;
-    const img = document.createElement('img');
-    img.src = './assets/' + meta.texture;
-    img.style.display = 'none';
-    bgEl.appendChild(img);
-    bgImages.set(src, img);
-    if (typeof img.decode === 'function') bgLoads.push(img.decode().catch(() => {}));
+    if (!src || src.startsWith('env_3d') || bgMeta[src]) continue;
+    bgLoads.push((async () => {
+      const info = await loadBg2dFromBundle(env, src);
+      if (!info) return;
+      bgMeta[src] = info;
+      const tex = new THREE.DataTexture(info.rgba, info.width, info.height, THREE.RGBAFormat);
+      tex.flipY = false;
+      tex.wrapS = THREE.ClampToEdgeWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.generateMipmaps = false;
+      tex.needsUpdate = true;
+      bgTextures.set(src, tex);
+      const img = document.createElement('img');
+      img.src = info.blobUrl;
+      img.style.display = 'none';
+      bgEl.appendChild(img);
+      bgImages.set(src, img);
+      if (typeof img.decode === 'function') await img.decode().catch(() => {});
+    })().catch((e) => console.warn(`bg load failed ${src}`, e)));
   }
   await Promise.all(bgLoads);
+
   const pre = await player.preload();
+  // Decode every voice cue's HCA stream and 60 Hz AIUEO weights up front so the
+  // timeline has real durations and lip-sync from the first rendered frame.
+  await voiceCtrl.preloadCues(voiceCueNames);
 
   seekEl.max = String(Math.ceil(timeline.duration * 1000));
   statusEl.textContent =
@@ -1509,8 +1588,6 @@ async function boot() {
   };
   frame();
   requestAnimationFrame(loop);
-  // Preload upcoming voice MP3s into in-memory Blob URLs after initial scene & clip boot completes
-  voiceCtrl.preloadCues(voiceCueNames);
 }
 
 let last = performance.now();
@@ -1551,7 +1628,7 @@ function frame() {
     groundShadow.position.set(hp.x, actorGroup.position.y + 0.004, hp.z);
   }
 
-  if (seekEl) seekEl.value = String(Math.round(time * 1000));
+  if (seekEl && !seeking) seekEl.value = String(Math.round(time * 1000));
   if (timeEl) timeEl.textContent = `${time.toFixed(2)}s`;
   if (bloom) bloom.render(scene, camera);
   else renderer.render(scene, camera);
@@ -1568,7 +1645,7 @@ seekEl?.addEventListener('input', () => {
   }
   voiceCtrl.manualCue = null;
   time = Number(seekEl.value) / 1000;
-  frame();
+  if (timeEl) timeEl.textContent = `${time.toFixed(2)}s`;
 });
 seekEl?.addEventListener('change', () => {
   if (seeking) {

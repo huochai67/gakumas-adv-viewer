@@ -1,36 +1,47 @@
 // Animation clip sampling shared by the debug viewer and the story player.
 //
-// Clips are exported by pipeline/export_clips.py as JSON: one entry per
-// AnimationCurve binding, sampled at 30 Hz.
+// Clips are decoded on demand from the raw AnimationClip assets inside the
+// game's .bundle packages (one track per AnimationCurve binding, sampled at
+// 30 Hz):
 //   muscle - humanoid muscle (index = Unity HumanTrait order, 0..94)
 //   bone   - Transform TRS curve keyed by glTF node index
 //   blend  - VLActorFaceModel blendShapeWeights slot (morph target index)
 //   custom - face-model custom channel (unused)
 
+import { getBrowserEnv } from './runtime/bundle_env.js';
+import { buildCharFromBundles, loadClipFromBundle } from './runtime/bundle_loaders.js';
+
 export const MUSCLE_COUNT = 95;
 
 const cache = new Map();
 
+// Character metadata (glTF node indices per bone, morph target mapping) that
+// clip tracks are resolved against. Provided by loadCharacter() via
+// setClipCharMeta(); rebuilt from the bundles when a clip is requested first.
+let charMeta = null;
+let charMetaPromise = null;
+
+export function setClipCharMeta(meta) {
+  charMeta = meta || null;
+  charMetaPromise = null;
+}
+
+async function ensureCharMeta(env) {
+  if (charMeta) return charMeta;
+  if (!charMetaPromise) {
+    charMetaPromise = buildCharFromBundles(env).then(({ meta }) => meta);
+  }
+  charMeta = await charMetaPromise;
+  return charMeta;
+}
+
 export async function getClip(name) {
   if (cache.has(name)) return cache.get(name);
-  // the player resolves a few hundred candidate names at once; Chromium on
-  // Windows occasionally fails individual connects (ERR_ADDRESS_IN_USE) under
-  // that burst, so a transient failure is retried while a 404 is not
-  let lastErr = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const r = await fetch(`./assets/clips/${name}.json`);
-      if (r.status === 404) throw Object.assign(new Error(`clip missing: ${name}`), { fatal: true });
-      if (!r.ok) throw new Error(`clip ${r.status}: ${name}`);
-      cache.set(name, await r.json());
-      return cache.get(name);
-    } catch (e) {
-      if (e.fatal) throw e;
-      lastErr = e;
-      await new Promise((res) => setTimeout(res, 60 + attempt * 120));
-    }
-  }
-  throw lastErr;
+  const env = await getBrowserEnv();
+  const clip = await loadClipFromBundle(env, name, await ensureCharMeta(env));
+  if (!clip) throw Object.assign(new Error('clip missing: ' + name), { fatal: true });
+  cache.set(name, clip);
+  return clip;
 }
 
 export function hasClip(name) {
