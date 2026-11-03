@@ -31,7 +31,7 @@ import {
   type BundleContainer,
   type SkeletonNode,
 } from "./assets";
-import { Glb } from "./gltf";
+import { Glb } from "./core/gltf.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
@@ -589,10 +589,11 @@ function main(): void {
       };
       continue;
     }
-    if (t.blendShapes === undefined) continue;
+    if (t.blendShapes === undefined || !t.mesh) continue;
     const mb = t;
     const sf = o.assetsFile;
-    const mesh = env().readPPtr(sf, mb.mesh)!;
+    const mesh = env().readPPtr(sf, mb.mesh);
+    if (!mesh) continue;
     const mats = (mb.sharedMaterials ?? []).map((m: any) =>
       exp.material(env().readPPtr(sf, m)!, "face"),
     );

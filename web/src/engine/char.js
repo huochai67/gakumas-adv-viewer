@@ -8,8 +8,8 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { PoseSolver } from './pose.js';
-import { getBrowserEnv } from './runtime/bundle_env.js';
-import { buildCharFromBundles } from './runtime/bundle_loaders.js';
+import { getBrowserEnv } from '../runtime/bundle_env.js';
+import { buildCharFromBundles } from '../runtime/bundle_loaders.js';
 
 const OUTLINE_SCALE = parseFloat(new URLSearchParams(location.search).get('outline') ?? '1.0');
 const STENCIL_MASK = 108; // 0x6C (bits 2, 3, 5, 6 used by Campus/Actor/Default)
@@ -658,9 +658,9 @@ function evalSimpleCurve(pts, x) {
  * Load the actor model, build its authentic Campus/Actor/Default materials,
  * stencil passes, outlines, and Mecanim PoseSolver.
  */
-export async function loadCharacter(scene) {
+export async function loadCharacter(scene, parts = null) {
   const env = await getBrowserEnv();
-  const { glbBytes, meta, textures } = await buildCharFromBundles(env);
+  const { glbBytes, meta, textures } = await buildCharFromBundles(env, parts || undefined);
   bundleTextures = textures;
   const gltf = await new GLTFLoader().parseAsync(
     glbBytes.buffer.slice(glbBytes.byteOffset, glbBytes.byteOffset + glbBytes.byteLength), '');
@@ -768,7 +768,7 @@ export async function loadCharacter(scene) {
   });
 
   for (const [parent, child] of extraPasses) parent.add(child);
-  scene.add(root);
+  if (scene) scene.add(root);
 
   const solver = new PoseSolver(nodeByIndex, meta);
   const headNode = solver.nameToNode.Head || null;
@@ -918,6 +918,16 @@ export async function loadCharacter(scene) {
       }
     },
     reset() { solver.resetPose(); },
+    dispose() {
+      if (root.parent) root.parent.remove(root);
+      actorShadowRT.dispose();
+      root.traverse((o) => {
+        if (o.isMesh) {
+          if (o.geometry) o.geometry.dispose();
+          if (o.material && o.material.dispose) o.material.dispose();
+        }
+      });
+    },
   };
   return char;
 }

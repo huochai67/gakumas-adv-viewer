@@ -588,6 +588,8 @@ export class PoseSolver {
     this._lastSimTime = null;
     this._lastHipsW = new THREE.Vector3();
     this._lastRootPosW = new THREE.Vector3();
+    this.enableIK = true;
+    this.enableSwing = true;
     this._lastRootQuatW = new THREE.Quaternion();
     this._hasLastRoot = false;
 
@@ -703,6 +705,12 @@ export class PoseSolver {
     };
   }
 
+  resetSwing() {
+    this._lastSimTime = null;
+    this._hasLastRoot = false;
+    this.swingParticles.clear();
+  }
+
   /**
    * Run post-FK / post-LookTarget torso anti-clipping 2-bone arm IK, elbow/waist Quartz
    * helpers, and ActorSwing + ActorSwingChain cloth/hair capsule-net physics.
@@ -721,9 +729,9 @@ export class PoseSolver {
     while (rootObj.parent) rootObj = rootObj.parent;
     rootObj.updateMatrixWorld(true);
 
-    this._applyArmIKCorrection();
+    if (this.enableIK !== false) this._applyArmIKCorrection();
     this._updateElbowAndWaistHelpers();
-
+    if (this.enableSwing === false) return;
     const sc = this._swScratch;
     hips.getWorldPosition(sc.hipsW);
     const stageNode = hips.parent || rootObj;

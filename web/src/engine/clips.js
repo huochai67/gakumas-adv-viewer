@@ -8,8 +8,8 @@
 //   blend  - VLActorFaceModel blendShapeWeights slot (morph target index)
 //   custom - face-model custom channel (unused)
 
-import { getBrowserEnv } from './runtime/bundle_env.js';
-import { buildCharFromBundles, loadClipFromBundle } from './runtime/bundle_loaders.js';
+import { getBrowserEnv } from '../runtime/bundle_env.js';
+import { buildCharFromBundles, loadClipFromBundle } from '../runtime/bundle_loaders.js';
 
 export const MUSCLE_COUNT = 95;
 
@@ -22,6 +22,9 @@ let charMeta = null;
 let charMetaPromise = null;
 
 export function setClipCharMeta(meta) {
+  if (charMeta !== meta) {
+    cache.clear();
+  }
   charMeta = meta || null;
   charMetaPromise = null;
 }

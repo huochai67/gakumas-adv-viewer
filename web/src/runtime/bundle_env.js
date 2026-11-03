@@ -8,7 +8,7 @@
  * decoding are performed by `wasm/gakumas_core.wasm` through `wasm_bridge.js`.
  */
 
-import { initWasm, decryptBundle, decompressLz4Block } from '../wasm_bridge.js';
+import { initWasm, decryptBundle, decompressLz4Block } from './wasm_bridge.js';
 
 const utf8 = new TextDecoder('utf-8');
 const ALIGN_FLAG = 0x4000;
@@ -940,6 +940,26 @@ export class BrowserAssetEnv {
     this.bundleNames = new Set();
     for (const entry of this.index.bundles) this.bundleNames.add(stripBundleSuffix(entry));
     this._inflight = new Map();
+  }
+
+  updateIndex(index = {}) {
+    if (Array.isArray(index.bundles)) {
+      this.index.bundles = index.bundles;
+      for (const entry of index.bundles) this.bundleNames.add(stripBundleSuffix(entry));
+    }
+    if (Array.isArray(index.resources)) {
+      this.index.resources = index.resources;
+    }
+    if (index.cabToBundle && typeof index.cabToBundle === 'object') {
+      Object.assign(this.index.cabToBundle, index.cabToBundle);
+    }
+  }
+
+  async refreshIndex() {
+    const response = await fetch('/cache/index.json');
+    if (response.ok) {
+      this.updateIndex(await response.json());
+    }
   }
 
   hasBundle(name) {

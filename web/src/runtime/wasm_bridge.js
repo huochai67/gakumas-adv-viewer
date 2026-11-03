@@ -12,7 +12,7 @@
  * call. Allocated buffers are always released in a `finally` block.
  */
 
-const DEFAULT_WASM_URL = './wasm/gakumas_core.wasm';
+const DEFAULT_WASM_URL = '/wasm/gakumas_core.wasm';
 
 /** @type {WebAssembly.Exports | null} */
 let wasmExports = null;

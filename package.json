@@ -5,14 +5,30 @@
   "type": "module",
   "description": "Standalone cross-platform browser-based ADV scene & character renderer and asset pipeline for Gakuen Idolmaster",
   "scripts": {
-    "serve": "bun web/serve.ts",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "serve": "bun web/server/serve.ts",
     "build:wasm": "rustc --edition 2021 --target wasm32-unknown-unknown -C opt-level=3 -C lto=fat -C codegen-units=1 -C strip=symbols --crate-type cdylib wasm/lib.rs -o web/wasm/gakumas_core.wasm",
     "fetch": "bun pipeline/fetch.ts",
+    "fetch:all": "bun pipeline/fetch.ts --all",
+    "fetch:adv": "bun pipeline/fetch.ts --all-adv",
+    "fetch:scripts": "bun pipeline/fetch.ts --all-scripts",
     "export:char": "bun pipeline/export_char.ts",
     "export:clips": "bun pipeline/export_clips.ts",
     "export:env": "bun pipeline/export_env.ts",
     "export:bg": "bun pipeline/export_bg.ts",
     "export:voices": "bun pipeline/export_voices.ts",
     "export:all": "bun pipeline/export_char.ts && bun pipeline/export_clips.ts && bun pipeline/export_env.ts && bun pipeline/export_bg.ts && bun pipeline/export_voices.ts"
+  },
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "vite": "^8.3.5"
   }
 }

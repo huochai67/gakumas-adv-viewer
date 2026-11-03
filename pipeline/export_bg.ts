@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 
 import { loadEnv, objectsOf } from "./assets.ts";
 import type { BundleContainer } from "./assets.ts";
-import { textureInfo } from "./bcn_png.ts";
+import { textureInfo } from "./core/bcn_png.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");

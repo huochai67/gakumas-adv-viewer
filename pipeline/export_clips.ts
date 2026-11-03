@@ -22,7 +22,7 @@ import {
   type BundleContainer,
   type SkeletonNode,
 } from "./assets";
-import { ClipSampler, bindingDimension, crc32 } from "./unity_anim";
+import { ClipSampler, bindingDimension, crc32 } from "./core/unity_anim.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");

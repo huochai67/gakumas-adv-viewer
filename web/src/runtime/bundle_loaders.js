@@ -11,7 +11,7 @@
  *   - voices are decoded to a WAV blob URL plus 60 Hz AIUEO frames
  */
 
-import { decodeTextureRgba, decodeHcaAndLipsync } from '../wasm_bridge.js';
+import { decodeTextureRgba, decodeHcaAndLipsync } from './wasm_bridge.js';
 import {
   skeleton,
   localTrs,
@@ -152,7 +152,7 @@ class LazyTextureMap extends Map {
 /* Character build (pipeline/export_char.ts)                                  */
 /* -------------------------------------------------------------------------- */
 
-const PARTS = {
+export const PARTS = {
   body: 'mdl_chr_amao-casl-0000_body',
   face: 'mdl_chr_amao-base-0000_face',
   hair: 'mdl_chr_amao-base-0000_hair',
@@ -506,23 +506,29 @@ function findRoot(env, bundle) {
  * Build the character GLB + metadata + in-memory RGBA textures from the three
  * character bundles.
  */
-export async function buildCharFromBundles(env) {
+export async function buildCharFromBundles(env, parts = PARTS) {
+  const activeParts = {
+    body: parts?.body || PARTS.body,
+    face: parts?.face || PARTS.face,
+    hair: parts?.hair || PARTS.hair,
+  };
   await Promise.all([
-    env.ensureBundle(PARTS.body, true),
-    env.ensureBundle(PARTS.face, true),
-    env.ensureBundle(PARTS.hair, true),
+    env.ensureBundle(activeParts.body, true),
+    env.ensureBundle(activeParts.face, true),
+    env.ensureBundle(activeParts.hair, true),
   ]);
-  if (env.hasBundle(RAMP_BUNDLE)) {
+  const actorMatch = /^mdl_chr_([a-z0-9]+)-/i.exec(activeParts.face) || /^mdl_chr_([a-z0-9]+)-/i.exec(activeParts.body);
+  const rampBundle = actorMatch ? `t_chr_${actorMatch[1]}-base-0000` : RAMP_BUNDLE;
+  if (env.hasBundle(rampBundle)) {
     try {
-      await env.ensureBundle(RAMP_BUNDLE, true);
+      await env.ensureBundle(rampBundle, true);
     } catch {
       // optional ramp bundle
     }
   }
 
   const exp = new CharExporter(env);
-  const body_bundle = env.bundleFile(PARTS.body);
-
+  const body_bundle = env.bundleFile(activeParts.body);
   // ---------------- body ----------------
   const [body_root] = skeleton(findRoot(env, body_bundle), env);
   const actor = exp.glb.node('actor');
@@ -612,7 +618,7 @@ export async function buildCharFromBundles(env) {
   if (head_bone === undefined) throw new Error('Head bone not found');
 
   // ---------------- face ----------------
-  const face_bundle = env.bundleFile(PARTS.face);
+  const face_bundle = env.bundleFile(activeParts.face);
   const [face_root] = skeleton(findRoot(env, face_bundle), env);
   exp.emit_tree(face_root, head_bone);
 
@@ -627,10 +633,11 @@ export async function buildCharFromBundles(env) {
       };
       continue;
     }
-    if (t.blendShapes === undefined) continue;
+    if (t.blendShapes === undefined || !t.mesh) continue;
     const mb = t;
     const sf = o.assetsFile;
     const mesh = env.readPPtr(sf, mb.mesh);
+    if (!mesh) continue;
     const mats = (mb.sharedMaterials ?? []).map((m) => exp.material(env.readPPtr(sf, m), 'face'));
     const shapes = [];
     for (const bs of mb.blendShapes ?? []) {
@@ -693,9 +700,9 @@ export async function buildCharFromBundles(env) {
   }
 
   // Also export character ramp texture from t_chr_amao-base-0000 if not already referenced
-  if (env.hasBundle(RAMP_BUNDLE)) {
+  if (env.hasBundle(rampBundle)) {
     try {
-      const base_tex_b = env.bundleFile(RAMP_BUNDLE);
+      const base_tex_b = env.bundleFile(rampBundle);
       for (const o of env.objectsOf(base_tex_b, 'Texture2D')) {
         const tx = o.read();
         if (String(tx.m_Name).endsWith('_rmp')) {
@@ -708,7 +715,7 @@ export async function buildCharFromBundles(env) {
   }
 
   // ---------------- hair ----------------
-  const hair_bundle = env.bundleFile(PARTS.hair);
+  const hair_bundle = env.bundleFile(activeParts.hair);
   const [hair_root] = skeleton(findRoot(env, hair_bundle), env);
   exp.emit_tree(hair_root, head_bone);
   const hair_renderers = env.objectsOf(hair_bundle, 'SkinnedMeshRenderer');

@@ -14,8 +14,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import * as assets from "./assets.ts";
-import { Glb } from "./gltf.ts";
-import type { SerializedFile, UnityObject } from "./serialized_file.ts";
+import { Glb } from "./core/gltf.ts";
+import type { SerializedFile, UnityObject } from "./core/serialized_file.ts";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(MODULE_DIR, "..");

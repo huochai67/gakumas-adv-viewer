@@ -8,37 +8,91 @@ the browser directly parses the game's raw UnityFS `.bundle` packages
 materials, animations, and WebAudio PCM + 60 Hz AIUEO lip-sync on the fly
 with zero pre-exported `.glb`, `.png`, or `.mp3` files required.
 
-## Run
+## Run (React + Vite Studio UI)
 
 ```bash
-bun run serve                 # 127.0.0.1:8777, keep-alive (web/serve.ts)
+bun run dev                   # Vite dev server on http://127.0.0.1:8777
+bun run build                 # Production build into web/dist
+bun run serve                 # Serve production build on http://127.0.0.1:8777
 ```
 
-`web/serve.ts` answers with HTTP/1.1 keep-alive: the page pulls a few hundred files
-and a per-request-connection server exhausts the Windows ephemeral port range
-(`ERR_ADDRESS_IN_USE` mid-load).
+The React + Vite frontend (`web/src/`) provides a top multi-tab navigation bar
+and a left-sidebar / right-viewport split workspace sharing a single persistent
+WebGL renderer (`web/src/engine/ViewerEngine.js`):
 
-* `http://127.0.0.1:8777/story.html` — the ADV player (this is the deliverable)
-* `http://127.0.0.1:8777/story.html?script=./assets/other.txt` — other script
-* `http://127.0.0.1:8777/story.html?faceuv=uv0` — face UV fallback
-* `http://127.0.0.1:8777/story.html?bloom=0` — disable the bloom pass
-* `http://127.0.0.1:8777/index.html` — rig/material/clip debug page
+* **Tab 1 — 资产浏览器 (Asset Browser)**: browse and switch characters, costumes
+  (`body`/`hair`/`face`), body motion clips, facial expression clips, manual
+  BlendShape overrides, IK/Swing physics toggles, and studio vs. 3D classroom
+  stages (with on-demand Octo bundle fetching via `/api/ensure`).
+* **Tab 2 — 剧情浏览器 (Story Browser)**: select built-in or local/pasted `.txt`
+  ADV scripts, jump directly to any dialogue cue on the timeline, and render the
+  full 2D/3D stage, character animations, DOF bokeh, Bloom, and CRI `.acb` voice
+  lip-sync. Deep-linking via `?tab=story` or `/story.html?script=...` opens
+  directly in Story Browser mode.
 
-Controls: space = play/pause, arrows = +-1 s, "next msg" jumps to the next
-dialogue line, slider scrubs.
+## Project Structure
+
+```text
+gakumas-adv-viewer/
+├── wasm/                         # Rust WebAssembly core (compiled to web/wasm/gakumas_core.wasm)
+│   ├── lib.rs
+│   ├── lz4_bcn.rs                # Octo XOR unmasking, LZ4, BC1/BC3/BC6H/BC7 decoders
+│   └── clhca.rs                  # CRI HCA v3.0 audio decoder + 60 Hz AIUEO lip-sync FFT
+├── pipeline/                     # CLI asset fetcher & offline exporter tools
+│   ├── fetch.ts                  # Octo manifest loader & bundle dependency downloader
+│   ├── assets.ts                 # Node/Bun Unity bundle environment
+│   ├── export_{char,clips,env,bg,voices}.ts
+│   ├── decode_hca.mjs
+│   ├── clhca/                    # C HCA reference decoder
+│   └── core/                     # Low-level binary/format codecs for CLI pipeline
+│       ├── bcn_png.ts
+│       ├── gltf.ts
+│       ├── lz4.ts
+│       ├── masked_bundle.ts
+│       ├── serialized_file.ts
+│       ├── unity_anim.ts
+│       └── unity_fs.ts
+└── web/                          # React + Vite Web Application
+    ├── index.html                # Vite HTML entry
+    ├── assets/                   # Built-in .txt ADV scripts
+    ├── wasm/                     # Compiled gakumas_core.wasm binary
+    ├── vendor/                   # Vendored Three.js r170 ES modules
+    ├── server/                   # HTTP server & Vite/standalone API middleware
+    │   ├── serve.ts              # Standalone production HTTP server
+    │   └── api.ts                # /cache/* & /api/{catalog,ensure} middleware
+    └── src/                      # Frontend source code
+        ├── main.jsx              # React root entry
+        ├── App.jsx               # Top multi-tab bar + split-pane workspace shell
+        ├── styles.css            # Studio UI stylesheet
+        ├── components/           # React UI panels
+        │   ├── AssetBrowserPanel.jsx
+        │   ├── StoryBrowserPanel.jsx
+        │   └── ViewportPane.jsx
+        ├── engine/               # 3D Character, Stage, PostFX, Animation & Story Engine
+        │   ├── ViewerEngine.js   # Unified Asset/Story WebGL engine & state store
+        │   ├── adv.js            # ADV script parser & timeline builder
+        │   ├── bloom.js          # 3D/2D Vogel bokeh DOF & Bloom post-processing
+        │   ├── camera.js         # Unity camera FOV & transform adapter
+        │   ├── char.js           # Campus/Actor/Default character & shader builder
+        │   ├── clips.js          # AnimationClip 30 Hz evaluator
+        │   └── pose.js           # 95-muscle Mecanim FK, IK & ActorSwing physics solver
+        └── runtime/              # Browser WASM & UnityFS/ACB asset loaders
+            ├── wasm_bridge.js    # JS <-> gakumas_core.wasm bridge
+            ├── bundle_env.js     # Browser UnityFS, SerializedFile & ACB container reader
+            └── bundle_loaders.js # In-memory GLB, Texture2D, Clip & Voice builders
+```
 
 ## Browser WASM Runtime & Optional CLI Pipeline
 
-At runtime, `story.html` and `index.html` load raw bundles and `.acb` cue sheets
-directly from `/cache/bundles/*` and `/cache/resources/*` (indexed by
-`/cache/index.json` in `web/serve.ts`) using `web/wasm/gakumas_core.wasm`
-(built from `wasm/lib.rs`, `wasm/lz4_bcn.rs`, and `wasm/clhca.rs`):
+At runtime, the web app loads raw bundles and `.acb` cue sheets directly from
+`/cache/bundles/*` and `/cache/resources/*` (indexed by `/cache/index.json` in
+`web/server/api.ts`) using `web/wasm/gakumas_core.wasm`:
 
 * **WASM primitives (`web/wasm/gakumas_core.wasm`)**: Octo `0x100`-byte XOR
   header unmasking, raw LZ4 block decompression, `RGB24`/`RGBA32`/`DXT1`/`DXT5`/`BC6H`
   (14 modes)/`BC7` (8 modes) texture decoding, CRI HCA v3.0 audio decoding, and
   2048-point radix-2 FFT 60 Hz 5-vowel (`A/I/U/E/O`) lip-sync extraction.
-* **Browser runtime (`web/runtime/bundle_env.js`, `web/runtime/bundle_loaders.js`)**:
+* **Browser runtime (`web/src/runtime/bundle_env.js`, `web/src/runtime/bundle_loaders.js`)**:
   `UnityFS` + `SerializedFile` v22 + embedded `TypeTree` parser, cross-bundle
   `PPtr` & `.resS` resolver, lazy `LazyTextureMap` `THREE.DataTexture` uploader,
   in-memory GLB + `ClipSampler` builder, and `@UTF`/`AFS2` `.acb` voice loader.
@@ -47,7 +101,10 @@ To rebuild `web/wasm/gakumas_core.wasm` or fetch/export offline assets via CLI:
 
 ```bash
 bun run build:wasm               # compile wasm/lib.rs -> web/wasm/gakumas_core.wasm
-bun pipeline/fetch.ts mdl_chr_amao-casl-0000_body env_3d_adv_classroom-00-00-noon ...
+bun run fetch:all                # download ALL bundles (26k+) + resources (22k+) concurrently
+bun run fetch:adv                # download all ADV viewer assets (chars, motions, envs, scripts, voices)
+bun run fetch:scripts            # download all 3,900+ ADV .txt scripts into cache/resources/
+bun pipeline/fetch.ts "mdl_chr_hski-*" "adv_dear_hski_*.txt" -j 12
 bun run export:all               # optional CLI export of .glb / .png / .mp3 / .json
 ```
 Extra bundles are pulled by name from `cache/OctoManifest.json` (or

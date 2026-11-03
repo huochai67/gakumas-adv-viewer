@@ -10,8 +10,8 @@
 
 import { deflateSync } from "node:zlib";
 
-import { loadEnv } from "./assets.ts";
-import type { AssetEnvironment } from "./assets.ts";
+import { loadEnv } from "../assets.ts";
+import type { AssetEnvironment } from "../assets.ts";
 
 /* -------------------------------------------------------------------------- */
 /* Partition / anchor / weight tables (BC6H & BC7)                            */

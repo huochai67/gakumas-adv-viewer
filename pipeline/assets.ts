@@ -8,10 +8,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { texturePng } from "./bcn_png.ts";
-import { decrypt } from "./masked_bundle.ts";
-import { SerializedFile, UnityObject } from "./serialized_file.ts";
-import { readUnityFS } from "./unity_fs.ts";
+import { texturePng } from "./core/bcn_png.ts";
+import { decrypt } from "./core/masked_bundle.ts";
+import { SerializedFile, UnityObject } from "./core/serialized_file.ts";
+import { readUnityFS } from "./core/unity_fs.ts";
 
 export { texturePng };
 

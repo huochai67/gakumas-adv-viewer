@@ -1,0 +1,2357 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+import { parseAdv, buildTimeline } from './adv.js';
+import { createBloom } from './bloom.js';
+import { applyCameraSetting, unityEulerQuat } from './camera.js';
+import { loadCharacter } from './char.js';
+import { getClip, evalClip, setClipCharMeta } from './clips.js';
+import { TPOSE_MUSCLES } from './pose.js';
+import { getBrowserEnv } from '../runtime/bundle_env.js';
+import {
+  PARTS as DEFAULT_PARTS,
+  buildEnv3dFromBundles,
+  loadBg2dFromBundle,
+  loadVoiceCueFromAcb,
+} from '../runtime/bundle_loaders.js';
+
+const USER_NAME = 'プロデューサー';
+const DEFAULT_ACTOR_ID = 'amao';
+const STAND_MOTION = 'mot_all_chr_cmmn_stand-001_lp';
+const BLINK_MORPH_INDEX = 20;
+const CHARS_PER_SEC = 24;
+const CLOSED_EXPR_MOUTHS = [42, 45, 46, 54, 71, 74, 75];
+
+const DEFAULT_LOOK_TARGET = {
+  type: 0,
+  actorId: '',
+  bones: 10,
+  azimuth: 0,
+  elevation: 0,
+  weight: 0,
+  eyesWeight: 0.3,
+  headWeight: 0.6,
+  bodyWeight: 0.1,
+};
+
+function stripRuby(s) {
+  return String(s || '').replace(/<r=([^>]*)>([^<]*)<\/r>/g, '$2');
+}
+
+function hash01(n) {
+  const x = Math.sin(n * 12.9898) * 43758.5453;
+  return x - Math.floor(x);
+}
+
+function lerp(a, b, w) {
+  return a + (b - a) * w;
+}
+
+function lerpArr(a, b, w) {
+  if (!a) return b;
+  if (!b) return a;
+  const out = new Array(a.length);
+  for (let i = 0; i < a.length; i++) out[i] = a[i] * (1 - w) + b[i] * w;
+  return out;
+}
+
+function nlerpQuat(a, b, w) {
+  if (!a) return b;
+  if (!b) return a;
+  const dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+  const s = dot < 0 ? -1 : 1;
+  const x = a[0] * (1 - w) + b[0] * s * w;
+  const y = a[1] * (1 - w) + b[1] * s * w;
+  const z = a[2] * (1 - w) + b[2] * s * w;
+  const qw = a[3] * (1 - w) + b[3] * s * w;
+  const l = Math.hypot(x, y, z, qw) || 1;
+  return [x / l, y / l, z / l, qw / l];
+}
+
+function blendRoot(ra, rb, w) {
+  if (!ra || !Object.keys(ra).length) return rb || null;
+  if (!rb || !Object.keys(rb).length) return ra || null;
+  return {
+    rootT: lerpArr(ra.rootT, rb.rootT, w),
+    rootQ: nlerpQuat(ra.rootQ, rb.rootQ, w),
+    lfT: lerpArr(ra.lfT, rb.lfT, w),
+    rfT: lerpArr(ra.rfT, rb.rfT, w),
+    lhT: lerpArr(ra.lhT, rb.lhT, w),
+    lhQ: nlerpQuat(ra.lhQ, rb.lhQ, w),
+    rhT: lerpArr(ra.rhT, rb.rhT, w),
+    rhQ: nlerpQuat(ra.rhQ, rb.rhQ, w),
+  };
+}
+
+function blobTexture() {
+  const S = 128;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+  grad.addColorStop(0, 'rgba(28,20,18,0.48)');
+  grad.addColorStop(0.55, 'rgba(28,20,18,0.18)');
+  grad.addColorStop(1, 'rgba(28,20,18,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, S, S);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function kanaVowelVec(ch) {
+  if (!ch || /[、。！？…・\s「」（）『』]/.test(ch)) return [0, 0, 0, 0, 0];
+  const code = ch.charCodeAt(0);
+  if ((code >= 0x3041 && code <= 0x3096) || (code >= 0x30a1 && code <= 0x30f6)) {
+    const h = code >= 0x30a1 ? code - 0x60 : code;
+    if (h === 0x3093 || h === 0x3063) return [0, 0, 0.15, 0, 0];
+    const aCols = 'あかさたなはまやらわがざだばぱぁゃゎ';
+    const iCols = 'いきしちにひみりぎじぢびぴぃ';
+    const uCols = 'うくすつぬふむゆるぐずづぶぷぅゅ';
+    const eCols = 'えけせてねへめれげぜでべぺぇ';
+    const oCols = 'おこそとのほもよろをごぞどぼぽぉょ';
+    const hc = String.fromCharCode(h);
+    if (aCols.includes(hc)) return [0.85, 0, 0, 0.1, 0];
+    if (iCols.includes(hc)) return [0, 0.85, 0, 0.15, 0];
+    if (uCols.includes(hc)) return [0, 0, 0.85, 0, 0.15];
+    if (eCols.includes(hc)) return [0.15, 0.15, 0, 0.75, 0];
+    if (oCols.includes(hc)) return [0.1, 0, 0.15, 0, 0.8];
+  }
+  const pick = Math.floor(hash01(code) * 5);
+  const out = [0.08, 0.08, 0.08, 0.08, 0.08];
+  out[pick] = 0.68;
+  return out;
+}
+
+function evalTextFallbackLipSync(text, elapsed, totalDur) {
+  const clean = stripRuby(text || '').replace(/\s+/g, '');
+  if (!clean || /^[\s…・。、！？?]+$/.test(clean)) return null;
+  const speakDur = Math.min(totalDur * 0.9, Math.max(0.4, clean.length * 0.11));
+  if (elapsed < 0 || elapsed > speakDur) return null;
+  const pos = (elapsed / speakDur) * clean.length;
+  const idx = Math.min(clean.length - 1, Math.floor(pos));
+  const frac = pos - idx;
+  const pulse = Math.sin(Math.PI * Math.min(1, frac * 1.15));
+  const v = kanaVowelVec(clean[idx]);
+  return v.map((x) => x * pulse * 0.85);
+}
+
+function applyLipSyncToMorph(morph, vowels) {
+  const [va, vi, vu, ve, vo] = vowels;
+  const openTotal = Math.min(1, va + vi + vu + ve + vo);
+  if (openTotal <= 0.004) return;
+
+  const smile = Math.min(
+    1,
+    Math.max(0, (morph.get(71) || 0) + (morph.get(42) || 0) + (morph.get(75) || 0)),
+  );
+  const serious = 1 - smile;
+  const closedKeep = 1 - Math.min(0.88, openTotal * 0.85);
+  for (const idx of CLOSED_EXPR_MOUTHS) {
+    if (morph.has(idx)) morph.set(idx, morph.get(idx) * closedKeep);
+  }
+  const addM = (idx, val) => {
+    if (val > 0.001) morph.set(idx, Math.min(1, (morph.get(idx) || 0) + val));
+  };
+  if (smile > 0.01) {
+    addM(64, va * smile * 0.86);
+    addM(44, (vi + ve * 0.3) * smile * 0.78);
+    addM(47, vu * smile * 0.68);
+    addM(72, ve * smile * 0.66);
+    addM(49, vo * smile * 0.74);
+  }
+  if (serious > 0.01) {
+    addM(72, va * serious * 0.6);
+    addM(53, (vi * 0.68 + ve * 0.42) * serious);
+    addM(47, vu * serious * 0.64);
+    addM(48, (vo * 0.72 + va * 0.18 + ve * 0.28) * serious);
+  }
+}
+
+function downsampleRgba(src, sw, sh, maxDim) {
+  let w = sw;
+  let h = sh;
+  let data = src;
+  while ((w > maxDim || h > maxDim) && w >= 2 && h >= 2) {
+    const nw = w >> 1;
+    const nh = h >> 1;
+    const dst = new Uint8Array(nw * nh * 4);
+    for (let y = 0; y < nh; y++) {
+      const r0 = y * 2 * w * 4;
+      const r1 = r0 + w * 4;
+      let di = y * nw * 4;
+      for (let x = 0; x < nw; x++) {
+        const i00 = r0 + (x << 3);
+        const i01 = i00 + 4;
+        const i10 = r1 + (x << 3);
+        const i11 = i10 + 4;
+        dst[di] = (data[i00] + data[i01] + data[i10] + data[i11] + 2) >> 2;
+        dst[di + 1] = (data[i00 + 1] + data[i01 + 1] + data[i10 + 1] + data[i11 + 1] + 2) >> 2;
+        dst[di + 2] = (data[i00 + 2] + data[i01 + 2] + data[i10 + 2] + data[i11 + 2] + 2) >> 2;
+        dst[di + 3] = (data[i00 + 3] + data[i01 + 3] + data[i10 + 3] + data[i11 + 3] + 2) >> 2;
+        di += 4;
+      }
+    }
+    data = dst;
+    w = nw;
+    h = nh;
+  }
+  return { data, width: w, height: h };
+}
+
+class VoiceController {
+  constructor(lipsyncDb, onChange) {
+    this.lipsyncDb = lipsyncDb;
+    this.onChange = onChange;
+    this.audio = new Audio();
+    this.audio.preload = 'auto';
+    this.blobUrls = new Map();
+    this.muted = false;
+    this.userVolume = 1;
+    this.autoplayBlocked = false;
+    this.currentCue = null;
+    this.manualCue = null;
+    this._pendingPlay = null;
+    this._cueVolume = 1;
+
+    this.audio.addEventListener('ended', () => {
+      this.manualCue = null;
+      this.onChange?.();
+    });
+    this.audio.addEventListener('pause', () => this.onChange?.());
+    this.audio.addEventListener('play', () => this.onChange?.());
+  }
+
+  resolveUrl(cueName) {
+    return this.blobUrls.get(cueName) || null;
+  }
+
+  async preloadCues(cueNames) {
+    for (const vc of cueNames) {
+      if (this.blobUrls.has(vc)) continue;
+      try {
+        const info = await loadVoiceCueFromAcb(vc);
+        if (!info) continue;
+        this.lipsyncDb.cues[vc] = { duration: info.duration, fps: info.fps, frames: info.frames };
+        this.blobUrls.set(vc, info.wavBlobUrl);
+      } catch (e) {
+        console.warn(`voice load failed ${vc}`, e);
+      }
+    }
+  }
+
+  isSpeaking() {
+    return !this.audio.paused && !this.audio.ended && !this.muted && this.userVolume > 0;
+  }
+
+  setVolume(v) {
+    this.userVolume = Math.max(0, Math.min(1, v));
+    this.audio.volume = Math.max(0, Math.min(1, (this._cueVolume ?? 1) * this.userVolume));
+    if (this.userVolume > 0 && this.muted) this.muted = false;
+    this.onChange?.();
+  }
+
+  toggleMute() {
+    this.muted = !this.muted;
+    this.autoplayBlocked = false;
+    if (this.muted) {
+      this.manualCue = null;
+      this.audio.pause();
+    }
+    this.onChange?.();
+  }
+
+  unlock() {
+    this.autoplayBlocked = false;
+    if (!this.muted && this.currentCue && this.audio.paused) {
+      this._tryPlay();
+    }
+    this.onChange?.();
+  }
+
+  replayLine(vObj) {
+    if (!vObj || !vObj.voice) return;
+    const url = this.resolveUrl(vObj.voice);
+    if (!url) return;
+    if (this.muted) this.muted = false;
+    if (this.userVolume <= 0) this.setVolume(1);
+    this.autoplayBlocked = false;
+    this.manualCue = vObj;
+    this.currentCue = vObj.voice;
+    this._cueVolume = vObj.volume ?? 1;
+    this.audio.volume = Math.max(0, Math.min(1, this._cueVolume * this.userVolume));
+    this.audio.playbackRate = 1;
+    this.audio.src = url;
+    try {
+      this.audio.currentTime = vObj.clipIn || 0;
+    } catch {
+      /* wait metadata */
+    }
+    this._tryPlay();
+  }
+
+  getManualActorPlayback() {
+    if (!this.manualCue || !this.manualCue.isMine) return null;
+    if (this.audio.paused || this.audio.ended) {
+      if (this.audio.ended) this.manualCue = null;
+      return null;
+    }
+    return {
+      voice: this.manualCue.voice,
+      currentTime: this.audio.currentTime || 0,
+      dur: this.manualCue.dur || this.audio.duration || 0,
+    };
+  }
+
+  sync(t, st, isPlaying, playbackSpeed, getLiveTime) {
+    if (isPlaying && this.manualCue) {
+      this.manualCue = null;
+    }
+    if (!isPlaying && this.manualCue) {
+      return;
+    }
+    const v = st && st.activeVoice;
+    if (!v || !isPlaying || this.muted || this.userVolume <= 0) {
+      if (!this.audio.paused) this.audio.pause();
+      if (!v) this.currentCue = null;
+      return;
+    }
+    const wantTime = Math.max(0, t - v.start + (v.clipIn || 0));
+    const rate = Math.max(0.25, Math.min(4, playbackSpeed || 1));
+    if (this.audio.playbackRate !== rate) this.audio.playbackRate = rate;
+    this._cueVolume = v.volume ?? 1;
+    const vol = Math.max(0, Math.min(1, this._cueVolume * this.userVolume));
+    if (Math.abs(this.audio.volume - vol) > 0.01) this.audio.volume = vol;
+
+    if (this.currentCue !== v.voice) {
+      if (wantTime >= v.dur - 0.05) return;
+      const url = this.resolveUrl(v.voice);
+      if (!url) return;
+      this.currentCue = v.voice;
+      this.audio.src = url;
+      const seekAndPlay = () => {
+        if (this.currentCue !== v.voice) return;
+        const liveT = getLiveTime ? getLiveTime() : t;
+        const liveWant = Math.max(0, liveT - v.start + (v.clipIn || 0));
+        try {
+          if (
+            liveWant > 0.05 &&
+            (!Number.isFinite(this.audio.duration) || liveWant < this.audio.duration - 0.05)
+          ) {
+            this.audio.currentTime = liveWant;
+          }
+        } catch {
+          /* metadata still loading */
+        }
+        if (!this.muted && !this.autoplayBlocked) {
+          this._tryPlay();
+        }
+      };
+      if (this.audio.readyState >= 1) seekAndPlay();
+      else this.audio.addEventListener('loadedmetadata', seekAndPlay, { once: true });
+      return;
+    }
+
+    if (this.audio.ended) {
+      if (wantTime < v.dur - 0.25) {
+        try {
+          this.audio.currentTime = wantTime;
+        } catch {
+          /* ignore */
+        }
+        if (!this.autoplayBlocked && !this._pendingPlay) this._tryPlay();
+      }
+      return;
+    }
+
+    if (this.audio.readyState >= 3 && Math.abs(this.audio.currentTime - wantTime) > 0.45) {
+      if (
+        wantTime < v.dur - 0.08 &&
+        (!Number.isFinite(this.audio.duration) || wantTime < this.audio.duration - 0.05)
+      ) {
+        try {
+          this.audio.currentTime = wantTime;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    if (this.audio.paused && wantTime < v.dur - 0.08 && !this.autoplayBlocked && !this._pendingPlay) {
+      this._tryPlay();
+    }
+  }
+
+  _tryPlay() {
+    const p = this.audio.play();
+    this._pendingPlay = p;
+    if (p && typeof p.then === 'function') {
+      p.then(() => {
+        this._pendingPlay = null;
+        this.autoplayBlocked = false;
+        this.onChange?.();
+      }).catch((err) => {
+        this._pendingPlay = null;
+        if (err && err.name === 'NotAllowedError') {
+          this.autoplayBlocked = true;
+          this.onChange?.();
+        }
+      });
+    } else {
+      this._pendingPlay = null;
+    }
+  }
+}
+
+class StoryPlayer {
+  constructor(timeline, char, actorId, lipsyncDb, voiceCtrl, actorGroup) {
+    this.timeline = timeline;
+    this.char = char;
+    this.actorId = actorId || DEFAULT_ACTOR_ID;
+    this.lipsyncDb = lipsyncDb;
+    this.voiceCtrl = voiceCtrl;
+    this.actorGroup = actorGroup;
+    this.clips = new Map();
+    this.baseClip = null;
+    this.baseTime = 0;
+    this.defaultBg = [...timeline.backgrounds.keys()][0] || null;
+    this.hasVoices = false;
+  }
+
+  async preload() {
+    const names = new Set([STAND_MOTION]);
+    for (const c of this.timeline.cues) {
+      if (
+        c.type === 'actormotion' ||
+        c.type === 'actorfacialmotion' ||
+        c.type === 'actoradditivemotion'
+      ) {
+        if (c.params.id && c.params.id !== this.actorId) continue;
+        if (c.params.motion) names.add(c.params.motion);
+      }
+    }
+    const candidates = new Set();
+    for (const n of names) {
+      for (const c of [n, `${n}_b`, `${n}_f`]) candidates.add(c);
+    }
+    const queue = [...candidates];
+    const worker = async () => {
+      while (queue.length) {
+        const n = queue.pop();
+        try {
+          this.clips.set(n, await getClip(n));
+        } catch {
+          this.clips.set(n, null);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: 6 }, worker));
+    this.baseClip = this.clipOf(STAND_MOTION, 'b');
+    this.baseTime = this.baseClip ? this.baseClip.duration : 0;
+    const want = [...names].filter((n) => !this.clipOf(n, 'b') && !this.clipOf(n, 'f'));
+    return { total: names.size, missing: want };
+  }
+
+  clipOf(name, variant) {
+    if (!name) return null;
+    if (variant === 'f') {
+      return (
+        this.clips.get(`${name}_f`) || (name.endsWith('_f') ? this.clips.get(name) : null) || null
+      );
+    }
+    if (variant === 'b') {
+      return (
+        this.clips.get(`${name}_b`) || (!name.endsWith('_f') ? this.clips.get(name) : null) || null
+      );
+    }
+    return (
+      this.clips.get(name) || this.clips.get(`${name}_b`) || this.clips.get(`${name}_f`) || null
+    );
+  }
+
+  stateAt(t) {
+    const st = {
+      bgActive: this.defaultBg,
+      bgSet: new Map(),
+      camera: null,
+      dof: null,
+      layout: null,
+      actorVisible: true,
+      motion: null,
+      prevMotion: null,
+      facial: null,
+      prevFacial: null,
+      overrides: [],
+      additive: [],
+      shakes: [],
+      looks: [],
+      transitions: [],
+      activeVoice: null,
+      actorVoice: null,
+      lineVoice: null,
+      message: null,
+      fade: { from: 0, to: 0, t: 0, dur: 0, color: '#000000' },
+    };
+    for (const c of this.timeline.cues) {
+      if (c.t > t) break;
+      const p = c.params;
+      switch (c.type) {
+        case 'backgroundlayoutgroup': {
+          const l = (c.all.layouts || []).flat()[0];
+          if (l && l.params.id) st.bgActive = l.params.id;
+          break;
+        }
+        case 'backgroundsetting': {
+          if (p.id) st.bgSet.set(p.id, p.setting || null);
+          if (!st.bgActive && p.id) st.bgActive = p.id;
+          break;
+        }
+        case 'camerasetting':
+          st.camera = p.setting;
+          st.dof = (p.setting && p.setting.dofSetting) || null;
+          break;
+        case 'cameratween': {
+          const from = p.from || st.camera;
+          const to = p.to || from;
+          if (from && to) {
+            let u = c.dur > 0 ? Math.min(1, Math.max(0, (t - c.t) / c.dur)) : 1;
+            if (p.ease === 'OutQuad') u = 1 - (1 - u) * (1 - u);
+            const lv3 = (a, b) => ({
+              x: lerp(a.x, b.x, u),
+              y: lerp(a.y, b.y, u),
+              z: lerp(a.z, b.z, u),
+            });
+            st.camera = {
+              ...to,
+              focalLength: lerp(from.focalLength ?? 30, to.focalLength ?? 30, u),
+              transform:
+                from.transform && to.transform
+                  ? {
+                      position: lv3(from.transform.position, to.transform.position),
+                      rotation: lv3(from.transform.rotation, to.transform.rotation),
+                      scale: to.transform.scale || { x: 1, y: 1, z: 1 },
+                    }
+                  : to.transform || from.transform,
+            };
+            if (to.dofSetting) st.dof = to.dofSetting;
+          }
+          break;
+        }
+        case 'dof': {
+          const s = p.setting || {};
+          const val = (k, fb) =>
+            s[k] && typeof s[k] === 'object' && 'm_Value' in s[k] ? s[k].m_Value : (s[k] ?? fb);
+          st.dof = {
+            active: true,
+            focalPoint: Number(val('focalPoint', 2.0)),
+            fNumber: Number(val('fNumber', 2.8)),
+            maxBlurSpread: Number(val('maxBlurSpread', 2.0)),
+            foregroundBlurExtrude: Number(val('foregroundBlurExtrude', 1.15)),
+            focalSize: Number(val('focalSize', 1.0)),
+          };
+          break;
+        }
+        case 'actorlayoutgroup': {
+          const layouts = (c.all.layouts || []).flat();
+          const mine = layouts.find((l) => !l.params.id || l.params.id === this.actorId);
+          if (mine) {
+            st.actorVisible = true;
+            if (mine.params.transform) st.layout = mine.params.transform;
+          } else {
+            st.actorVisible = false;
+          }
+          break;
+        }
+        case 'actormotion': {
+          if (p.id && p.id !== this.actorId) break;
+          const tr = Number(p.transition ?? 0);
+          st.prevMotion = st.motion;
+          st.motion = {
+            name: p.motion,
+            variant: 'b',
+            start: c.t,
+            clipIn: c.clipIn,
+            transition: tr,
+          };
+          if (
+            this.clipOf(p.motion, 'f') &&
+            !(st.facial && st.facial.explicit && Math.abs(st.facial.start - c.t) < 1e-4)
+          ) {
+            const ftr =
+              p.facialTransition !== undefined
+                ? Number(p.facialTransition)
+                : tr > 0
+                  ? 0.22
+                  : 0;
+            st.prevFacial = st.facial;
+            st.facial = {
+              name: p.motion,
+              variant: 'f',
+              start: c.t,
+              clipIn: c.clipIn,
+              transition: ftr,
+              explicit: false,
+            };
+          }
+          break;
+        }
+        case 'actorfacialmotion': {
+          if (p.id && p.id !== this.actorId) break;
+          if (!(st.facial && !st.facial.explicit && Math.abs(st.facial.start - c.t) < 1e-4)) {
+            st.prevFacial = st.facial;
+          }
+          st.facial = {
+            name: p.motion,
+            variant: 'f',
+            start: c.t,
+            clipIn: c.clipIn,
+            transition: Number(p.transition ?? 0),
+            explicit: true,
+          };
+          break;
+        }
+        case 'actorfacialoverridemotion': {
+          if (p.id && p.id !== this.actorId) break;
+          const models = (p.setting && p.setting.faceModels) || [];
+          const clipMeta = p.clip || {};
+          st.overrides.push({
+            start: c.t,
+            dur: c.dur,
+            easeIn: Number(clipMeta._easeInDuration ?? 0),
+            easeOut: Number(clipMeta._easeOutDuration ?? 0),
+            models,
+          });
+          break;
+        }
+        case 'actoradditivemotion': {
+          if (p.id && p.id !== this.actorId) break;
+          st.additive.push({ name: p.motion, start: c.t, clipIn: c.clipIn });
+          break;
+        }
+        case 'transition':
+          if (p.type) st.transitions.push({ start: c.t, dur: c.dur || 0.2, type: p.type });
+          break;
+        case 'shake':
+          st.shakes.push({ start: c.t, dur: c.dur, setting: p.setting || {} });
+          break;
+        case 'actorlooktarget': {
+          if (p.id && p.id !== this.actorId) break;
+          const target = p.target || DEFAULT_LOOK_TARGET;
+          st.looks.push({ kind: 'instant', start: c.t, dur: 0, target, endTarget: target });
+          break;
+        }
+        case 'actorlooktargettween': {
+          if (p.id && p.id !== this.actorId) break;
+          const prev = st.looks.length ? st.looks[st.looks.length - 1].endTarget : null;
+          const from = p.from || prev || DEFAULT_LOOK_TARGET;
+          const to = p.to || DEFAULT_LOOK_TARGET;
+          st.looks.push({ kind: 'tween', start: c.t, dur: c.dur || 0.01, from, to, endTarget: to });
+          break;
+        }
+        case 'voice': {
+          const cueName = p.voice;
+          if (!cueName) break;
+          const metaDur =
+            (this.lipsyncDb && this.lipsyncDb.cues && this.lipsyncDb.cues[cueName]?.duration) || 0;
+          const dur = Math.max(c.dur || 0, metaDur);
+          const isMine = p.actorId
+            ? p.actorId === this.actorId
+            : String(cueName).includes(`_${this.actorId}-`);
+          const vObj = {
+            voice: cueName,
+            actorId: p.actorId || '',
+            isMine,
+            start: c.t,
+            dur,
+            clipIn: c.clipIn || 0,
+            volume: Number(p.volume ?? 1),
+          };
+          st.lineVoice = vObj;
+          if (t < c.t + dur + 0.35) st.activeVoice = vObj;
+          if (isMine && t < c.t + dur + 0.15) st.actorVoice = vObj;
+          break;
+        }
+        case 'message':
+          if (t < c.t + c.dur) {
+            st.message = {
+              text: p.text,
+              name: p.name,
+              hide: p.hide,
+              start: c.t,
+              dur: c.dur,
+              narration: false,
+            };
+          }
+          break;
+        case 'narration':
+          if (t < c.t + c.dur && !p.hide) {
+            st.message = { text: p.text, name: '', hide: true, start: c.t, narration: true };
+          }
+          break;
+        case 'fade': {
+          const rawCol = String(p.color || '#000000');
+          st.fade = {
+            from: Number(p.from ?? 0),
+            to: Number(p.to ?? 1),
+            t: c.t,
+            dur: c.dur,
+            color: rawCol.startsWith('#') ? rawCol.slice(0, 7) : '#000000',
+          };
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    return st;
+  }
+
+  sampleLipSyncEntry(voiceName, lt, dur, msgText) {
+    if (lt < 0 || (dur > 0 && lt > dur + 0.03)) return null;
+    const entry = this.lipsyncDb && this.lipsyncDb.cues && this.lipsyncDb.cues[voiceName];
+    if (entry && entry.frames && entry.frames.length > 0) {
+      const fps = entry.fps || this.lipsyncDb.fps || 60;
+      const clipDur = dur > 0 ? dur : entry.duration || entry.frames.length / fps;
+      const f = lt * fps;
+      const i0 = Math.max(0, Math.min(entry.frames.length - 1, Math.floor(f)));
+      const i1 = Math.min(entry.frames.length - 1, i0 + 1);
+      const u = Math.max(0, Math.min(1, f - i0));
+      const a0 = entry.frames[i0];
+      const a1 = entry.frames[i1];
+      const tail = clipDur > 0.08 ? Math.min(1, Math.max(0, (clipDur + 0.02 - lt) / 0.06)) : 1;
+      return [
+        ((a0[0] * (1 - u) + a1[0] * u) / 100) * tail,
+        ((a0[1] * (1 - u) + a1[1] * u) / 100) * tail,
+        ((a0[2] * (1 - u) + a1[2] * u) / 100) * tail,
+        ((a0[3] * (1 - u) + a1[3] * u) / 100) * tail,
+        ((a0[4] * (1 - u) + a1[4] * u) / 100) * tail,
+      ];
+    }
+    if (msgText) return evalTextFallbackLipSync(msgText, lt, dur || 2.5);
+    return null;
+  }
+
+  evalLipSync(t, st) {
+    const mv = this.voiceCtrl && this.voiceCtrl.getManualActorPlayback();
+    if (mv) {
+      return this.sampleLipSyncEntry(mv.voice, mv.currentTime, mv.dur, st.message?.text);
+    }
+    const av = st.actorVoice;
+    if (av) {
+      const liveAudioT =
+        this.voiceCtrl && this.voiceCtrl.currentCue === av.voice && this.voiceCtrl.isSpeaking()
+          ? this.voiceCtrl.audio.currentTime
+          : t - av.start + (av.clipIn || 0);
+      return this.sampleLipSyncEntry(av.voice, liveAudioT, av.dur, st.message?.text);
+    }
+    if (!this.hasVoices && st.message && st.message.name === '麻央' && !st.message.hide) {
+      return evalTextFallbackLipSync(st.message.text, t - st.message.start, st.message.dur || 2.5);
+    }
+    return null;
+  }
+
+  applyCharacter(t, st) {
+    this.actorGroup.visible = st.actorVisible;
+    if (!st.actorVisible) return;
+
+    const { solver } = this.char;
+    const evalOf = (m) => {
+      if (!m) return null;
+      const clip = this.clipOf(m.name, m.variant);
+      if (!clip) return null;
+      const isLoop = m.name.endsWith('_lp');
+      const elapsed = Math.max(0, t - m.start + (m.clipIn || 0));
+      const lt =
+        isLoop && clip.duration > 0 ? elapsed % clip.duration : Math.min(clip.duration, elapsed);
+      return { ev: evalClip(clip, lt), clip, elapsed };
+    };
+
+    const base = this.baseClip
+      ? evalClip(this.baseClip, this.baseTime > 0 ? t % this.baseTime : 0)
+      : null;
+
+    const curM = evalOf(st.motion);
+    const prevM = evalOf(st.prevMotion);
+    let w = 1;
+    if (curM && st.motion.transition > 0) {
+      const u = Math.min(1, Math.max(0, (t - st.motion.start) / st.motion.transition));
+      w = u * u * (3 - 2 * u);
+    }
+
+    const muscles = new Float32Array(95);
+    let root = null;
+    const bones = [];
+
+    if (curM) {
+      const ce = curM.ev;
+      const pe = prevM ? prevM.ev : base;
+      for (let i = 0; i < 95; i++) {
+        const cv = ce.hasMuscle[i] ? ce.muscles[i] : base ? base.muscles[i] : TPOSE_MUSCLES[i];
+        const pv = pe && pe.hasMuscle[i] ? pe.muscles[i] : cv;
+        muscles[i] = pv * (1 - w) + cv * w;
+      }
+      root = pe && w < 1 ? blendRoot(pe.root, ce.root, w) : ce.root;
+      if (pe && w < 1 && pe.bones && pe.bones.length) {
+        const pMap = new Map();
+        for (const b of pe.bones) pMap.set(`${b.node}:${b.prop}`, b.value);
+        const seen = new Set();
+        for (const b of ce.bones) {
+          const key = `${b.node}:${b.prop}`;
+          seen.add(key);
+          const pv = pMap.get(key);
+          if (!pv) {
+            bones.push(b);
+          } else {
+            bones.push({
+              node: b.node,
+              prop: b.prop,
+              value: b.prop === 'rotation' ? nlerpQuat(pv, b.value, w) : lerpArr(pv, b.value, w),
+            });
+          }
+        }
+        for (const b of pe.bones) {
+          if (!seen.has(`${b.node}:${b.prop}`)) bones.push(b);
+        }
+      } else {
+        bones.push(...ce.bones);
+      }
+
+      if (curM.elapsed > curM.clip.duration) {
+        const settle = Math.min(1, (curM.elapsed - curM.clip.duration) / 0.8);
+        const breath = Math.sin((t - st.motion.start) * 1.75) * 0.01 * settle;
+        muscles[3] += breath;
+        muscles[6] += breath;
+      }
+    } else if (base) {
+      muscles.set(base.muscles);
+      root = base.root;
+      bones.push(...base.bones);
+    } else {
+      muscles.set(TPOSE_MUSCLES);
+    }
+
+    for (const a of st.additive) {
+      const clip = this.clipOf(a.name, 'b');
+      if (!clip) continue;
+      const lt = t - a.start + (a.clipIn || 0);
+      if (lt < 0 || lt > clip.duration) continue;
+      const ev = evalClip(clip, lt);
+      const ref0 = evalClip(clip, 0);
+      const fade = Math.min(1, lt / 0.12, (clip.duration - lt) / 0.12);
+      if (fade <= 0) continue;
+      for (let i = 0; i < 95; i++) {
+        if (ev.hasMuscle[i]) muscles[i] += (ev.muscles[i] - ref0.muscles[i]) * fade;
+      }
+    }
+
+    solver.applyPose(null, solver.poseFrom(muscles, bones, root), 1);
+
+    const morph = new Map();
+    const curF = evalOf(st.facial);
+    const prevF = evalOf(st.prevFacial);
+    const fallbackF = !curF && st.motion ? evalOf({ ...st.motion, variant: 'f' }) : null;
+    const activeF = curF || fallbackF;
+    if (activeF) {
+      const fw =
+        curF && prevF && st.facial.transition > 0
+          ? Math.min(1, Math.max(0, (t - st.facial.start) / st.facial.transition))
+          : 1;
+      if (prevF && fw < 1) {
+        for (const [i, v] of prevF.ev.morph) morph.set(i, v * (1 - fw));
+      }
+      for (const [i, v] of activeF.ev.morph) {
+        morph.set(i, (morph.get(i) || 0) + v * fw);
+      }
+    }
+
+    for (const o of st.overrides) {
+      if (t < o.start || t > o.start + o.dur) continue;
+      let ow = 1;
+      if (o.easeIn > 0) ow = Math.min(ow, (t - o.start) / o.easeIn);
+      if (o.easeOut > 0) ow = Math.min(ow, (o.start + o.dur - t) / o.easeOut);
+      ow = Math.max(0, Math.min(1, ow));
+      for (const m of o.models) {
+        if (m.path === 'Root_Face') {
+          morph.set(m.index, Math.max(morph.get(m.index) || 0, m.value * ow));
+        }
+      }
+    }
+
+    let eyeBusy = 0;
+    for (let ei = 20; ei <= 38; ei++) eyeBusy += morph.get(ei) || 0;
+    if (eyeBusy < 0.12) {
+      const period = 3.6 + 0.9 * hash01(Math.floor(t / 3.6));
+      const x = t % period;
+      if (x > 1.4 && x < 1.53) {
+        const closed = Math.sin(((x - 1.4) / 0.13) * Math.PI);
+        morph.set(BLINK_MORPH_INDEX, Math.max(morph.get(BLINK_MORPH_INDEX) || 0, closed));
+      }
+    }
+
+    const vowels = this.evalLipSync(t, st);
+    if (vowels) applyLipSyncToMorph(morph, vowels);
+
+    this.char.setMorph(morph);
+    const L = st.layout;
+    if (L) {
+      this.actorGroup.position.set(L.position.x, L.position.y, -L.position.z);
+      this.actorGroup.quaternion.copy(unityEulerQuat(L.rotation.x, L.rotation.y, L.rotation.z));
+      const s = L.scale || { x: 1, y: 1, z: 1 };
+      this.actorGroup.scale.set(s.x, s.y, s.z);
+    }
+  }
+}
+
+export class ViewerEngine {
+  constructor() {
+    this.listeners = new Set();
+    this.mode = 'asset'; // 'asset' | 'story'
+    this.mounted = false;
+    this.container = null;
+    this.bgEl = null;
+    this.viewportWidth = 960;
+    this.viewportHeight = 540;
+
+    this.renderer = null;
+    this.scene = null;
+    this.camera = null;
+    this.controls = null;
+    this.bloom = null;
+    this.useBloom = true;
+    this.sunLight = null;
+    this.stageHemi = null;
+    this.groundShadow = null;
+    this.actorGroup = null;
+    this.envGroup = null;
+    this.skyTexture = null;
+    this.envInfo = null;
+    this.envLoaded = false;
+
+    this.char = null;
+    this.currentParts = { ...DEFAULT_PARTS };
+
+    // Asset Browser state
+    this.assetPlaying = true;
+    this.assetLoop = true;
+    this.assetSpeed = 1;
+    this.assetTime = 0;
+    this.assetDuration = 4;
+    this.assetBodyMotionName = 'mot_all_chr_amao_glad-001_in';
+    this.assetFacialMotionName = 'mot_all_chr_amao_facial-all-default_in';
+    this.assetBodyClip = null;
+    this.assetFacialClip = null;
+    this.assetStageMode = 'studio'; // 'studio' | 'classroom'
+    this.assetEnableIK = true;
+    this.assetEnableSwing = true;
+    this.assetManualMorphs = new Map();
+
+    // Story Browser state
+    this.lipsyncDb = { fps: 60, cues: {} };
+    this.voiceCtrl = new VoiceController(this.lipsyncDb, () => this._emit());
+    this.storyScriptUrl = './assets/script.txt';
+    this.storyScriptLabel = 'script.txt';
+    this.storyTimeline = null;
+    this.storyPlayer = null;
+    this.storyPlaying = false;
+    this.storySpeed = 1;
+    this.storyTime = 0;
+    this.storyDuration = 0;
+    this.storyCameraLocked = false;
+    this.storyDialogueList = [];
+    this.storyCues = [];
+    this.storyActiveMessage = null;
+    this.storyFade = { color: '#000000', opacity: 0 };
+    this.storyStatus = 'Ready';
+    this.bgMeta = {};
+    this.bgImages = new Map();
+    this.bgTextures = new Map();
+    this._bgUvMat = new THREE.Matrix3();
+    this._lastVolumeSrc = null;
+
+    this.loading = true;
+    this.loadingText = 'Initializing WASM & 3D Engine…';
+
+    // Temp vectors for lookAt
+    this._lookActPosW = new THREE.Vector3();
+    this._lookActQuatW = new THREE.Quaternion();
+    this._lookActQuatInv = new THREE.Quaternion();
+    this._lookTargetA = new THREE.Vector3();
+    this._lookTargetB = new THREE.Vector3();
+    this._lookBonePosW = new THREE.Vector3();
+    this._lookBoneQuatW = new THREE.Quaternion();
+    this._lookParentQuatW = new THREE.Quaternion();
+    this._lookDesLocal = new THREE.Vector3();
+    this._lookCurLocal = new THREE.Vector3();
+    this._lookDeltaQuat = new THREE.Quaternion();
+    this._lookRotActor = new THREE.Quaternion();
+    this._lookRotWorld = new THREE.Quaternion();
+    this._lookEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+
+    this._lastEmitTs = 0;
+    this._rafId = 0;
+    this._lastFrameNow = performance.now();
+    this._resizeObserver = null;
+  }
+
+  subscribe(fn) {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  _emit() {
+    const snap = this.getSnapshot();
+    for (const fn of this.listeners) fn(snap);
+  }
+
+  getSnapshot() {
+    return {
+      mode: this.mode,
+      loading: this.loading,
+      loadingText: this.loadingText,
+      useBloom: this.useBloom,
+      currentParts: { ...this.currentParts },
+
+      // Asset mode state
+      assetPlaying: this.assetPlaying,
+      assetLoop: this.assetLoop,
+      assetSpeed: this.assetSpeed,
+      assetTime: this.assetTime,
+      assetDuration: this.assetDuration,
+      assetBodyMotionName: this.assetBodyMotionName,
+      assetFacialMotionName: this.assetFacialMotionName,
+      assetStageMode: this.assetStageMode,
+      assetEnableIK: this.assetEnableIK,
+      assetEnableSwing: this.assetEnableSwing,
+      faceBlendShapeCount: this.char?.meta?.faceBlendShapeCount || 0,
+
+      // Story mode state
+      storyScriptUrl: this.storyScriptUrl,
+      storyScriptLabel: this.storyScriptLabel,
+      storyPlaying: this.storyPlaying,
+      storySpeed: this.storySpeed,
+      storyTime: this.storyTime,
+      storyDuration: this.storyDuration,
+      storyCameraLocked: this.storyCameraLocked,
+      storyDialogueList: this.storyDialogueList,
+      storyActiveMessage: this.storyActiveMessage,
+      storyFade: this.storyFade,
+      storyStatus: this.storyStatus,
+      voiceMuted: this.voiceCtrl.muted,
+      voiceVolume: this.voiceCtrl.userVolume,
+      voiceSpeaking: this.voiceCtrl.isSpeaking(),
+      voiceAutoplayBlocked: this.voiceCtrl.autoplayBlocked,
+    };
+  }
+
+  mount(canvasContainer, bg2dContainer) {
+    this.container = canvasContainer;
+    this.bgEl = bg2dContainer;
+
+    if (!this.renderer) {
+      this._initThree();
+      this._bootInitial();
+    } else {
+      canvasContainer.innerHTML = '';
+      canvasContainer.appendChild(this.renderer.domElement);
+    }
+
+    if (this._resizeObserver) this._resizeObserver.disconnect();
+    this._resizeObserver = new ResizeObserver(() => this.resize());
+    this._resizeObserver.observe(canvasContainer);
+    this.resize();
+
+    if (!this._rafId) {
+      this._lastFrameNow = performance.now();
+      const loop = (now) => {
+        this._rafId = requestAnimationFrame(loop);
+        this._tick(now);
+      };
+      this._rafId = requestAnimationFrame(loop);
+    }
+  }
+
+  unmount() {
+    if (this._resizeObserver) {
+      this._resizeObserver.disconnect();
+      this._resizeObserver = null;
+    }
+  }
+
+  _initThree() {
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, stencil: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setClearColor(0x000000, 0);
+    this.renderer = renderer;
+    this.container.innerHTML = '';
+    this.container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    this.scene = scene;
+
+    const camera = new THREE.PerspectiveCamera(40, 16 / 9, 0.08, 1000);
+    camera.position.set(0, 1.24, -1.75);
+    this.camera = camera;
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1.08, 0);
+    controls.dampingFactor = 0.08;
+    controls.update();
+    this.controls = controls;
+
+    const sunLight = new THREE.DirectionalLight(0xfffaf0, 2.1);
+    sunLight.position.set(2.5, 4.5, -4.0);
+    scene.add(sunLight);
+    this.sunLight = sunLight;
+
+    const stageHemi = new THREE.HemisphereLight(0xf6f4ee, 0x9e9284, 1.45);
+    scene.add(stageHemi);
+    this.stageHemi = stageHemi;
+
+    const groundShadow = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.68, 0.52),
+      new THREE.MeshBasicMaterial({
+        map: blobTexture(),
+        transparent: true,
+        depthWrite: false,
+        opacity: 0.72,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
+      }),
+    );
+    groundShadow.rotation.x = -Math.PI / 2;
+    groundShadow.position.y = 0.004;
+    groundShadow.renderOrder = 4;
+    scene.add(groundShadow);
+    this.groundShadow = groundShadow;
+
+    const actorGroup = new THREE.Group();
+    scene.add(actorGroup);
+    this.actorGroup = actorGroup;
+
+    const envGroup = new THREE.Group();
+    envGroup.visible = false;
+    scene.add(envGroup);
+    this.envGroup = envGroup;
+
+    this.bloom = createBloom(renderer, {
+      strength: 0.32,
+      threshold: 0.98,
+      knee: 0.25,
+      exposure: 0.97,
+      contrast: 1.04,
+      saturation: 1.06,
+    });
+  }
+
+  resize() {
+    if (!this.container || !this.renderer || !this.camera) return;
+    const rect = this.container.getBoundingClientRect();
+    const w = Math.max(1, Math.floor(rect.width));
+    const h = Math.max(1, Math.floor(rect.height));
+    this.viewportWidth = w;
+    this.viewportHeight = h;
+    this.renderer.setSize(w, h);
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    if (this.bloom) this.bloom.setSize(w, h);
+    this.renderFrame();
+  }
+
+  async _bootInitial() {
+    try {
+      this.loading = true;
+      this.loadingText = '正在通过 WASM 解密并构建角色与 3D 教室资产…';
+      this._emit();
+
+      await getBrowserEnv();
+      const [char, stage] = await Promise.all([
+        loadCharacter(null, this.currentParts),
+        this._loadEnv3d().catch((e) => {
+          console.warn('env load failed', e);
+          return null;
+        }),
+      ]);
+      this.char = char;
+      this.envInfo = stage;
+      setClipCharMeta(char.meta);
+      if (stage?.meta?.volumes) {
+        char.applyActorVolume(stage.meta.volumes);
+      }
+      char.root.position.set(0, 0, 0);
+      this.actorGroup.add(char.root);
+
+      await Promise.all([
+        this.setAssetBodyMotion(this.assetBodyMotionName),
+        this.setAssetFacialMotion(this.assetFacialMotionName),
+      ]);
+
+      // Preload default story script in the background so switching to Story tab is instant
+      await this.loadStoryFromUrl(this.storyScriptUrl, 'script.txt', false);
+
+      this.loading = false;
+      this.loadingText = '';
+      this._setupWindowHooks();
+      this._emit();
+      this.renderFrame();
+    } catch (e) {
+      console.error('Boot error:', e);
+      this.loading = false;
+      this.loadingText = `Error: ${e?.message || e}`;
+      this._emit();
+    }
+  }
+
+  async _loadEnv3d() {
+    if (this.envLoaded && this.envInfo) return this.envInfo;
+    const env = await getBrowserEnv();
+    const { glbBytes, meta, textures } = await buildEnv3dFromBundles(env);
+    const gltf = await new GLTFLoader().parseAsync(
+      glbBytes.buffer.slice(glbBytes.byteOffset, glbBytes.byteOffset + glbBytes.byteLength),
+      '',
+    );
+
+    const stageTexCache = new Map();
+    const stageTex = (rel, srgb, flipY = false, maxDim = 1024) => {
+      if (!rel) return null;
+      const entry = textures.get(rel);
+      if (!entry) return null;
+      const ckey = `${rel}|${srgb ? 1 : 0}|${flipY ? 1 : 0}|${maxDim}`;
+      let tex = stageTexCache.get(ckey);
+      if (!tex) {
+        const img =
+          entry.width > maxDim || entry.height > maxDim
+            ? downsampleRgba(entry.data, entry.width, entry.height, maxDim)
+            : entry;
+        tex = new THREE.DataTexture(img.data, img.width, img.height, THREE.RGBAFormat);
+        tex.flipY = flipY;
+        tex.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.magFilter = THREE.LinearFilter;
+        tex.minFilter = THREE.LinearMipmapLinearFilter;
+        tex.generateMipmaps = true;
+        tex.anisotropy = 4;
+        tex.needsUpdate = true;
+        stageTexCache.set(ckey, tex);
+      }
+      return tex;
+    };
+
+    let lmap = null;
+    if (meta.lightmap && meta.lightmap.light) {
+      lmap = stageTex(meta.lightmap.light, true, true, 2048);
+      if (lmap) {
+        lmap.channel = 1;
+        lmap.needsUpdate = true;
+      }
+    }
+
+    if (meta.skybox) {
+      const skyEntry = textures.get(meta.skybox);
+      if (skyEntry) {
+        const small = downsampleRgba(skyEntry.data, skyEntry.width, skyEntry.height, 1024);
+        const eqTex = new THREE.DataTexture(small.data, small.width, small.height, THREE.RGBAFormat);
+        eqTex.flipY = false;
+        eqTex.colorSpace = THREE.SRGBColorSpace;
+        eqTex.mapping = THREE.EquirectangularReflectionMapping;
+        eqTex.minFilter = THREE.LinearFilter;
+        eqTex.magFilter = THREE.LinearFilter;
+        eqTex.generateMipmaps = false;
+        eqTex.needsUpdate = true;
+        const pmrem = new THREE.PMREMGenerator(this.renderer);
+        this.skyTexture = pmrem.fromEquirectangular(eqTex).texture;
+        pmrem.dispose();
+        eqTex.dispose();
+      }
+    }
+
+    if (meta.renderSettings) {
+      const rs = meta.renderSettings;
+      if (rs.ambientSkyColor) this.stageHemi.color.setRGB(...rs.ambientSkyColor);
+      if (rs.ambientGroundColor) this.stageHemi.groundColor.setRGB(...rs.ambientGroundColor);
+      this.stageHemi.intensity = 1.55;
+    }
+    if (Array.isArray(meta.lights)) {
+      const dirL = meta.lights.find((l) => l.type === 1);
+      if (dirL && dirL.direction) {
+        this.sunLight.color.setRGB(...dirL.color);
+        this.sunLight.position.set(
+          -dirL.direction[0] * 10,
+          -dirL.direction[1] * 10,
+          -dirL.direction[2] * 10,
+        );
+        this.sunLight.intensity = 2.0;
+      }
+    }
+
+    const lmVolIntensity =
+      (meta.volumes && meta.volumes.lightmap && meta.volumes.lightmap.intensity) ?? 0.95;
+    const lmScale = 1.45 * Math.PI * lmVolIntensity;
+
+    gltf.scene.traverse((o) => {
+      if (!o.isMesh) return;
+      if (o.geometry && o.geometry.attributes.uv2 && !o.geometry.attributes.uv1) {
+        o.geometry.setAttribute('uv1', o.geometry.attributes.uv2);
+      }
+      const exactName = o.name.replace(/^env_/, '');
+      const strippedName = exactName.replace(/_\d+$/, '');
+      const parentName = o.parent && o.parent.name ? o.parent.name.replace(/^env_/, '') : '';
+      const info =
+        meta.prims[exactName] || meta.prims[parentName] || meta.prims[strippedName] || {};
+      const matName = info.material || exactName.split('|')[0] || '';
+      const mdesc = (meta.materials && meta.materials[matName]) || { colors: {}, floats: {} };
+
+      const albedoRel = mdesc.maps && (mdesc.maps._BaseMap || mdesc.maps._MainTex);
+      const albedo = albedoRel ? stageTex(albedoRel, true, false) : null;
+
+      const bc = mdesc.colors._BaseColor || mdesc.colors._Color || [1, 1, 1, 1];
+      const ovr = info.overrideColor || [1, 1, 1, 1];
+      const tint = new THREE.Color(bc[0] * ovr[0], bc[1] * ovr[1], bc[2] * ovr[2]);
+      const alphaFactor = (bc[3] ?? 1) * (ovr[3] ?? 1);
+
+      const fl = mdesc.floats || {};
+      const alphaClip = (fl._AlphaClip ?? 0) >= 0.5;
+      const isGlass = /glass|window/i.test(matName);
+      const isBlend =
+        isGlass || /_trs|_alp/i.test(matName) || fl._Surface === 1 || fl._DstBlend === 10;
+      const side = fl._Cull === 0 ? THREE.DoubleSide : THREE.FrontSide;
+
+      const ec = mdesc.colors._EmissionColor || [0, 0, 0, 1];
+      const emMax = Math.max(ec[0] || 0, ec[1] || 0, ec[2] || 0);
+      const defRel = mdesc.maps && mdesc.maps._DefMap;
+      const defMap = emMax > 0.5 && defRel ? stageTex(defRel, false, false) : null;
+
+      let mat;
+      if (info.lightmap && lmap) {
+        mat = new THREE.MeshBasicMaterial({
+          name: matName,
+          map: albedo,
+          color: tint,
+          lightMap: lmap,
+          lightMapIntensity: lmScale,
+          side,
+          transparent: isBlend,
+          opacity: isBlend ? alphaFactor : 1.0,
+          alphaTest: alphaClip ? (fl._Cutoff ?? 0.5) : 0,
+          depthWrite: !isBlend,
+        });
+      } else {
+        mat = new THREE.MeshStandardMaterial({
+          name: matName,
+          map: albedo,
+          color: tint,
+          roughness: 0.68,
+          metalness: 0.04,
+          envMap: isGlass ? null : this.skyTexture || null,
+          envMapIntensity: isGlass ? 0.0 : 0.4,
+          side,
+          transparent: isBlend,
+          opacity: isBlend ? alphaFactor : 1.0,
+          alphaTest: alphaClip ? (fl._Cutoff ?? 0.5) : 0,
+          depthWrite: !isBlend,
+        });
+      }
+      if (defMap && emMax > 0.5) {
+        const emVec = new THREE.Vector3(ec[0], ec[1], ec[2]);
+        mat.onBeforeCompile = (shader) => {
+          shader.uniforms.uStageDef = { value: defMap };
+          shader.uniforms.uStageEmissive = { value: emVec };
+          shader.fragmentShader = shader.fragmentShader
+            .replace(
+              '#include <common>',
+              '#include <common>\nuniform sampler2D uStageDef;\nuniform vec3 uStageEmissive;',
+            )
+            .replace(
+              '#include <opaque_fragment>',
+              '#ifdef USE_MAP\n\toutgoingLight += texture2D(uStageDef, vMapUv).g * uStageEmissive;\n\t#endif\n\t#include <opaque_fragment>',
+            );
+        };
+        mat.customProgramCacheKey = () => `emis-${matName}`;
+      }
+      if (isBlend) o.renderOrder = 2;
+      o.material = mat;
+    });
+    this.envGroup.add(gltf.scene);
+
+    for (const d of meta.decals || []) {
+      if (!d.map || !d.positions || d.fade <= 0.005) continue;
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(d.positions, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(d.uvs, 2));
+      geo.setIndex([0, 1, 2, 0, 2, 3]);
+      geo.computeVertexNormals();
+      const dmat = new THREE.MeshBasicMaterial({
+        name: d.material,
+        map: stageTex(d.map, true, false),
+        color: new THREE.Color(...(d.color || [1, 1, 1])),
+        transparent: true,
+        opacity: Math.min(1, d.fade),
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: -2 - (d.priority || 0),
+        polygonOffsetUnits: -2 - (d.priority || 0),
+      });
+      const dm = new THREE.Mesh(geo, dmat);
+      dm.renderOrder = (d.isShadow ? 1 : 3) + (d.priority || 0);
+      this.envGroup.add(dm);
+    }
+
+    this.envLoaded = true;
+    return { meta, group: gltf.scene };
+  }
+
+  async ensureBundlesOnServer(bundleNames) {
+    const env = await getBrowserEnv();
+    const missing = bundleNames.filter((n) => n && !env.hasBundle(n));
+    if (missing.length === 0) return null;
+    this.loading = true;
+    this.loadingText = `正在从 Octo 清单拉取并解密数据包 (${missing.join(', ')})…`;
+    this._emit();
+    const resp = await fetch('/api/ensure', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bundles: missing }),
+    });
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      throw new Error(errData.error || `HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    if (data.index) env.updateIndex(data.index);
+    return data.catalog || null;
+  }
+
+  // -------------------- Mode Switching --------------------
+  setMode(newMode) {
+    if (this.mode === newMode) return;
+    this.mode = newMode;
+    if (newMode === 'asset') {
+      this.storyPlaying = false;
+      this.voiceCtrl.audio.pause();
+      if (this.bgEl) this.bgEl.style.display = 'none';
+      if (this.bloom) {
+        this.bloom.setBg2D({ active: false });
+        this.bloom.setDof(null, 35, this.assetStageMode === 'classroom');
+      }
+      this.actorGroup.visible = true;
+      this.actorGroup.position.set(0, 0, 0);
+      this.actorGroup.quaternion.identity();
+      this.actorGroup.scale.set(1, 1, 1);
+      this.controls.enabled = true;
+      this.setAssetCameraPreset('full');
+      if (this.char) {
+        this.char.solver.enableIK = this.assetEnableIK;
+        this.char.solver.enableSwing = this.assetEnableSwing;
+      }
+    } else {
+      // Story mode
+      this.controls.enabled = this.storyCameraLocked;
+      if (this.char) {
+        this.char.solver.enableIK = true;
+        this.char.solver.enableSwing = true;
+      }
+    }
+    this._emit();
+    this.renderFrame();
+  }
+
+  // -------------------- Tab 1: Asset Browser Controls --------------------
+  async loadCharacterParts(parts) {
+    const nextParts = {
+      body: parts.body || this.currentParts.body,
+      face: parts.face || this.currentParts.face,
+      hair: parts.hair || this.currentParts.hair,
+    };
+    try {
+      this.loading = true;
+      this.loadingText = `正在加载角色模型 (${nextParts.body})…`;
+      this._emit();
+
+      const updatedCatalog = await this.ensureBundlesOnServer([
+        nextParts.body,
+        nextParts.face,
+        nextParts.hair,
+      ]);
+      const newChar = await loadCharacter(null, nextParts);
+      if (this.char) {
+        this.char.dispose();
+      }
+      this.char = newChar;
+      this.currentParts = nextParts;
+      setClipCharMeta(newChar.meta);
+      if (this.envInfo?.meta?.volumes) {
+        newChar.applyActorVolume(this.envInfo.meta.volumes);
+      }
+      newChar.solver.enableIK = this.assetEnableIK;
+      newChar.solver.enableSwing = this.assetEnableSwing;
+      newChar.root.position.set(0, 0, 0);
+      this.actorGroup.add(newChar.root);
+
+      // Re-bind current asset clips against new character skeleton
+      await Promise.all([
+        this.setAssetBodyMotion(this.assetBodyMotionName),
+        this.setAssetFacialMotion(this.assetFacialMotionName),
+      ]);
+
+      if (this.storyPlayer) {
+        this.storyPlayer.char = newChar;
+      }
+
+      this.loading = false;
+      this.loadingText = '';
+      this._emit();
+      this.renderFrame();
+      return updatedCatalog;
+    } catch (e) {
+      console.error('Failed to load character parts:', e);
+      this.loading = false;
+      this.loadingText = `模型加载失败: ${e?.message || e}`;
+      this._emit();
+      return null;
+    }
+  }
+
+  async setAssetBodyMotion(motionName) {
+    if (!motionName) return;
+    try {
+      const env = await getBrowserEnv();
+      const baseName = motionName.replace(/_[bf]$/, '');
+      if (!env.hasBundle(motionName) && !env.hasBundle(baseName)) {
+        await this.ensureBundlesOnServer([baseName]);
+      }
+      let clip = null;
+      for (const cand of [`${baseName}_b`, motionName, baseName]) {
+        try {
+          clip = await getClip(cand);
+          if (clip) break;
+        } catch {
+          /* try next */
+        }
+      }
+      if (clip) {
+        this.assetBodyMotionName = motionName;
+        this.assetBodyClip = clip;
+        this.assetDuration = Math.max(0.05, clip.duration || 4);
+        this.assetTime = 0;
+        if (this.char) this.char.solver.resetSwing();
+        this._emit();
+        this.renderFrame();
+      }
+    } catch (e) {
+      console.warn('setAssetBodyMotion failed:', e);
+    }
+  }
+
+  async setAssetFacialMotion(motionName) {
+    if (!motionName) {
+      this.assetFacialMotionName = '';
+      this.assetFacialClip = null;
+      this._emit();
+      this.renderFrame();
+      return;
+    }
+    try {
+      const env = await getBrowserEnv();
+      const baseName = motionName.replace(/_[bf]$/, '');
+      if (!env.hasBundle(motionName) && !env.hasBundle(baseName)) {
+        await this.ensureBundlesOnServer([baseName]);
+      }
+      let clip = null;
+      for (const cand of [`${baseName}_f`, motionName, baseName]) {
+        try {
+          clip = await getClip(cand);
+          if (clip) break;
+        } catch {
+          /* try next */
+        }
+      }
+      if (clip) {
+        this.assetFacialMotionName = motionName;
+        this.assetFacialClip = clip;
+        this._emit();
+        this.renderFrame();
+      }
+    } catch (e) {
+      console.warn('setAssetFacialMotion failed:', e);
+    }
+  }
+
+  setAssetPlaying(v) {
+    this.assetPlaying = !!v;
+    this._emit();
+  }
+
+  setAssetLoop(v) {
+    this.assetLoop = !!v;
+    this._emit();
+  }
+
+  setAssetSpeed(s) {
+    this.assetSpeed = Number(s) || 1;
+    this._emit();
+  }
+
+  setAssetTime(t) {
+    this.assetTime = Math.max(0, Math.min(this.assetDuration, Number(t) || 0));
+    this.renderFrame();
+    this._emit();
+  }
+
+  setAssetStageMode(mode) {
+    this.assetStageMode = mode;
+    this._emit();
+    this.renderFrame();
+  }
+
+  setAssetPhysics({ enableIK, enableSwing }) {
+    if (enableIK !== undefined) this.assetEnableIK = !!enableIK;
+    if (enableSwing !== undefined) this.assetEnableSwing = !!enableSwing;
+    if (this.char) {
+      this.char.solver.enableIK = this.assetEnableIK;
+      this.char.solver.enableSwing = this.assetEnableSwing;
+      if (!this.assetEnableSwing) this.char.solver.resetSwing();
+    }
+    this._emit();
+    this.renderFrame();
+  }
+
+  setUseBloom(v) {
+    this.useBloom = !!v;
+    this._emit();
+    this.renderFrame();
+  }
+
+  setAssetManualMorph(idx, val) {
+    if (val <= 0.001) this.assetManualMorphs.delete(idx);
+    else this.assetManualMorphs.set(idx, Math.max(0, Math.min(1, val)));
+    this.renderFrame();
+  }
+
+  clearAssetManualMorphs() {
+    this.assetManualMorphs.clear();
+    this.renderFrame();
+  }
+
+  setAssetCameraPreset(preset) {
+    if (!this.camera || !this.controls) return;
+    if (preset === 'face') {
+      this.camera.position.set(0, 1.38, -0.58);
+      this.controls.target.set(0, 1.36, 0);
+    } else if (preset === 'bust') {
+      this.camera.position.set(0, 1.28, -1.05);
+      this.controls.target.set(0, 1.22, 0);
+    } else if (preset === 'side') {
+      this.camera.position.set(1.45, 1.12, -0.45);
+      this.controls.target.set(0, 1.02, 0);
+    } else if (preset === 'back') {
+      this.camera.position.set(0, 1.22, 1.75);
+      this.controls.target.set(0, 1.02, 0);
+    } else {
+      // full
+      this.camera.position.set(0, 1.18, -1.85);
+      this.controls.target.set(0, 1.02, 0);
+    }
+    this.controls.update();
+    this.renderFrame();
+  }
+
+  // -------------------- Tab 2: Story Browser Controls --------------------
+  async loadStoryFromUrl(url, label = '', autoPlay = false) {
+    this.storyScriptUrl = url;
+    this.storyScriptLabel = label || url.split('/').pop() || 'script.txt';
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} loading ${url}`);
+    const text = await resp.text();
+    await this.loadStoryFromText(text, this.storyScriptLabel, autoPlay);
+  }
+
+  async loadStoryFromText(text, label = 'custom.txt', autoPlay = false) {
+    try {
+      this.loading = true;
+      this.loadingText = `正在解析剧情脚本 ${label}…`;
+      this._emit();
+
+      const env = await getBrowserEnv();
+      const events = parseAdv(text);
+      const timeline = buildTimeline(events);
+
+      // Extract primary actor ID from script's [actorgroup] if present
+      let scriptActorId = DEFAULT_ACTOR_ID;
+      if (timeline.actors.size > 0 && !timeline.actors.has(DEFAULT_ACTOR_ID)) {
+        scriptActorId = [...timeline.actors.keys()][0];
+      }
+
+      const player = new StoryPlayer(
+        timeline,
+        this.char,
+        scriptActorId,
+        this.lipsyncDb,
+        this.voiceCtrl,
+        this.actorGroup,
+      );
+
+      const voiceCueNames = [
+        ...new Set(
+          timeline.cues
+            .filter((c) => c.type === 'voice' && c.params.voice)
+            .map((c) => c.params.voice),
+        ),
+      ];
+      player.hasVoices = voiceCueNames.length > 0;
+
+      // Load 2D backgrounds referenced by timeline
+      const bgLoads = [];
+      for (const bg of timeline.backgrounds.values()) {
+        const src = bg && bg.src;
+        if (!src || src.startsWith('env_3d') || this.bgMeta[src]) continue;
+        bgLoads.push(
+          (async () => {
+            if (!env.hasBundle(src)) {
+              await this.ensureBundlesOnServer([src]).catch(() => {});
+            }
+            const info = await loadBg2dFromBundle(env, src);
+            if (!info) return;
+            this.bgMeta[src] = info;
+            const tex = new THREE.DataTexture(
+              info.rgba,
+              info.width,
+              info.height,
+              THREE.RGBAFormat,
+            );
+            tex.flipY = false;
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.wrapS = THREE.ClampToEdgeWrapping;
+            tex.wrapT = THREE.ClampToEdgeWrapping;
+            tex.minFilter = THREE.LinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            tex.generateMipmaps = false;
+            tex.needsUpdate = true;
+            this.bgTextures.set(src, tex);
+            if (this.bgEl) {
+              const img = document.createElement('img');
+              img.src = info.blobUrl;
+              img.style.display = 'none';
+              this.bgEl.appendChild(img);
+              this.bgImages.set(src, img);
+              if (typeof img.decode === 'function') await img.decode().catch(() => {});
+            }
+          })().catch((e) => console.warn(`bg load failed ${src}`, e)),
+        );
+      }
+      await Promise.all(bgLoads);
+
+      const pre = await player.preload();
+      await this.voiceCtrl.preloadCues(voiceCueNames);
+
+      // Build interactive dialogue cue list for the Story Browser sidebar
+      const dialogues = [];
+      for (let i = 0; i < timeline.cues.length; i++) {
+        const c = timeline.cues[i];
+        if (c.type === 'message' || (c.type === 'narration' && !c.params.hide)) {
+          const speaker =
+            c.type === 'narration'
+              ? '旁白'
+              : c.params.name === '{user}'
+                ? USER_NAME
+                : c.params.name || '';
+          const cleanText = stripRuby(c.params.text || '');
+          // Find matching voice cue near c.t
+          let voiceCue = null;
+          for (const vc of timeline.cues) {
+            if (vc.type === 'voice' && vc.params.voice && Math.abs(vc.t - c.t) <= 0.65) {
+              voiceCue = vc.params.voice;
+              break;
+            }
+          }
+          dialogues.push({
+            index: dialogues.length,
+            t: c.t,
+            dur: c.dur || 2.5,
+            speaker,
+            text: cleanText,
+            narration: c.type === 'narration',
+            hide: !!c.params.hide,
+            voice: voiceCue,
+          });
+        }
+      }
+
+      this.storyTimeline = timeline;
+      this.storyPlayer = player;
+      this.storyScriptLabel = label;
+      this.storyDuration = timeline.duration;
+      this.storyTime = 0;
+      this.storyPlaying = !!autoPlay;
+      this.storyDialogueList = dialogues;
+      this.storyStatus =
+        `${events.length} cues · ${timeline.duration.toFixed(1)}s · clips ${pre.total - pre.missing.length}/${pre.total}` +
+        (pre.missing.length ? ` (missing: ${pre.missing.length})` : '');
+
+      this.loading = false;
+      this.loadingText = '';
+      this._emit();
+      this.renderFrame();
+    } catch (e) {
+      console.error('loadStoryFromText failed:', e);
+      this.loading = false;
+      this.loadingText = `脚本加载失败: ${e?.message || e}`;
+      this._emit();
+    }
+  }
+
+  setStoryPlaying(v) {
+    this.storyPlaying = !!v;
+    if (this.storyPlaying) this.voiceCtrl.unlock();
+    else {
+      this.voiceCtrl.manualCue = null;
+      this.voiceCtrl.audio.pause();
+    }
+    this._emit();
+    this.renderFrame();
+  }
+
+  setStorySpeed(s) {
+    this.storySpeed = Number(s) || 1;
+    this._emit();
+  }
+
+  seekStory(t, keepPlaying = false) {
+    this.storyTime = Math.max(0, Math.min(this.storyDuration || 0, Number(t) || 0));
+    if (!keepPlaying) {
+      this.storyPlaying = false;
+      this.voiceCtrl.audio.pause();
+    }
+    this.voiceCtrl.manualCue = null;
+    if (this.char) this.char.solver.resetSwing();
+    this.renderFrame();
+    this._emit();
+  }
+
+  nextStoryMessage() {
+    if (!this.storyTimeline) return;
+    const next = this.storyTimeline.cues.find(
+      (c) => (c.type === 'message' || c.type === 'narration') && c.t > this.storyTime + 0.05,
+    );
+    if (next) {
+      this.storyTime = next.t + 0.01;
+      if (this.storyPlaying) this.voiceCtrl.unlock();
+      this.renderFrame();
+      this._emit();
+    }
+  }
+
+  replayCurrentVoice() {
+    if (!this.storyPlayer) return;
+    const st = this.storyPlayer.stateAt(this.storyTime);
+    const m = st?.message;
+    const lv = st?.lineVoice;
+    const vObj = m && lv && !m.narration && Math.abs(lv.start - m.start) <= 0.6 ? lv : null;
+    if (!vObj) return;
+    if (this.storyPlaying) {
+      this.storyTime = vObj.start;
+      this.voiceCtrl.currentCue = null;
+      this.voiceCtrl.unlock();
+      this.renderFrame();
+    } else {
+      this.voiceCtrl.replayLine(vObj);
+    }
+    this._emit();
+  }
+
+  setStoryCameraLocked(locked) {
+    this.storyCameraLocked = !!locked;
+    if (this.mode === 'story' && this.controls) {
+      this.controls.enabled = this.storyCameraLocked;
+      if (this.storyCameraLocked) {
+        this.controls.target.set(
+          this.actorGroup.position.x,
+          this.actorGroup.position.y + 1.25,
+          this.actorGroup.position.z,
+        );
+        this.controls.update();
+      }
+    }
+    this._emit();
+  }
+
+  // -------------------- Frame Loop & Rendering --------------------
+  _tick(now) {
+    const rawDt = Math.min(0.1, Math.max(0, (now - this._lastFrameNow) / 1000));
+    this._lastFrameNow = now;
+    if (!this.char) return;
+
+    if (this.mode === 'asset') {
+      if (this.assetPlaying && this.assetDuration > 0) {
+        this.assetTime += rawDt * this.assetSpeed;
+        if (this.assetTime >= this.assetDuration) {
+          this.assetTime = this.assetLoop ? this.assetTime % this.assetDuration : this.assetDuration;
+          if (!this.assetLoop) this.assetPlaying = false;
+        }
+      }
+      this.renderFrame();
+      if (now - this._lastEmitTs > 80) {
+        this._lastEmitTs = now;
+        this._emit();
+      }
+    } else {
+      if (this.storyPlaying && this.storyDuration > 0) {
+        this.storyTime += rawDt * this.storySpeed;
+        if (this.storyTime > this.storyDuration) {
+          this.storyTime = 0;
+        }
+      }
+      this.renderFrame();
+      if (now - this._lastEmitTs > 65) {
+        this._lastEmitTs = now;
+        this._emit();
+      }
+    }
+  }
+
+  renderFrame() {
+    if (!this.renderer || !this.scene || !this.camera || !this.char) return;
+    if (this.mode === 'asset') {
+      this._renderAssetFrame();
+    } else {
+      this._renderStoryFrame();
+    }
+  }
+
+  _renderAssetFrame() {
+    const showClassroom = this.assetStageMode === 'classroom' && this.envLoaded;
+    this.envGroup.visible = showClassroom;
+    this.scene.background = showClassroom && this.skyTexture ? this.skyTexture : new THREE.Color(0x111520);
+    if (this.bgEl) this.bgEl.style.display = 'none';
+    if (this.bloom) {
+      this.bloom.setBg2D({ active: false });
+      this.bloom.setDof(null, 35, showClassroom);
+    }
+
+    if (this.controls && this.controls.enabled) {
+      this.controls.update();
+    }
+
+    this.actorGroup.visible = true;
+    this.actorGroup.position.set(0, 0, 0);
+    this.actorGroup.quaternion.identity();
+    this.actorGroup.scale.set(1, 1, 1);
+
+    if (this.assetBodyClip) {
+      const ev = evalClip(this.assetBodyClip, this.assetTime);
+      this.char.solver.applyPose(
+        null,
+        this.char.solver.poseFrom(ev.muscles, ev.bones, ev.root),
+        1,
+      );
+    } else {
+      this.char.reset();
+    }
+
+    const morph = new Map();
+    if (this.assetFacialClip) {
+      const lt =
+        this.assetFacialClip.duration > 0
+          ? Math.min(this.assetFacialClip.duration, this.assetTime)
+          : 0;
+      const fev = evalClip(this.assetFacialClip, lt);
+      for (const [k, v] of fev.morph) morph.set(k, v);
+    }
+    for (const [k, v] of this.assetManualMorphs) {
+      morph.set(k, v);
+    }
+    this.char.setMorph(morph);
+
+    this.char.solver.updatePostRig(this.assetTime);
+    this.char.update(this.camera);
+    this.char.renderShadow(this.renderer);
+
+    this.groundShadow.visible = true;
+    const hips = this.char.solver.nameToNode.Hips;
+    const hp = hips ? hips.getWorldPosition(new THREE.Vector3()) : this.actorGroup.position;
+    this.groundShadow.position.set(hp.x, 0.004, hp.z);
+
+    if (this.bloom && this.useBloom) this.bloom.render(this.scene, this.camera);
+    else this.renderer.render(this.scene, this.camera);
+  }
+
+  _renderStoryFrame() {
+    if (!this.storyPlayer || !this.storyTimeline) return;
+    const t = this.storyTime;
+    const st = this.storyPlayer.stateAt(t);
+
+    if (st.camera && !this.storyCameraLocked) {
+      applyCameraSetting(this.camera, st.camera);
+    } else if (this.storyCameraLocked && this.controls) {
+      this.controls.update();
+    }
+
+    const sk = this._shakeAt(st, t);
+    if (sk && !this.storyCameraLocked) {
+      this.camera.rotateY(sk.yaw);
+      this.camera.rotateX(sk.pitch);
+    }
+
+    this.storyPlayer.applyCharacter(t, st);
+    this._applyLookTarget(st, t);
+    if (st.actorVisible) {
+      this.char.solver.updatePostRig(t);
+    }
+
+    this._applyStoryBackground(t, st);
+    this._updateStoryOverlayState(t, st);
+    this.voiceCtrl.sync(t, st, this.storyPlaying, this.storySpeed, () => this.storyTime);
+
+    this.char.update(this.camera);
+    this.char.renderShadow(this.renderer);
+
+    this.groundShadow.visible = this.actorGroup.visible && this.envGroup.visible;
+    if (this.groundShadow.visible) {
+      const hips = this.char.solver.nameToNode.Hips;
+      const hp = hips ? hips.getWorldPosition(new THREE.Vector3()) : this.actorGroup.position;
+      this.groundShadow.position.set(hp.x, this.actorGroup.position.y + 0.004, hp.z);
+    }
+
+    if (this.bloom && this.useBloom) this.bloom.render(this.scene, this.camera);
+    else this.renderer.render(this.scene, this.camera);
+  }
+
+  _shakeAt(st, t) {
+    for (let i = st.shakes.length - 1; i >= 0; i--) {
+      const s = st.shakes[i];
+      if (t < s.start || t >= s.start + s.dur) continue;
+      const d = t - s.start;
+      const u = d / s.dur;
+      const amp = ((s.setting.strength ?? 8) / 540) * (1 - u) * (1 - u);
+      const f = 1 / Math.max(0.02, s.setting.interval ?? 0.05);
+      return {
+        yaw: Math.cos(2 * Math.PI * f * d) * amp,
+        pitch: Math.sin(2 * Math.PI * f * 1.37 * d) * amp * 0.6,
+      };
+    }
+    return null;
+  }
+
+  _resolveLookTargetPos(out, target) {
+    const D2R = Math.PI / 180;
+    const tp = target || DEFAULT_LOOK_TARGET;
+    if (tp.type === 1) {
+      this.camera.getWorldPosition(out);
+      return out;
+    }
+    const az = (tp.azimuth ?? 0) * D2R;
+    const el = (tp.elevation ?? 0) * D2R;
+    const ce = Math.cos(el);
+    out
+      .set(Math.sin(az) * ce, -Math.sin(el), -Math.cos(az) * ce)
+      .applyQuaternion(this._lookActQuatW)
+      .multiplyScalar(10)
+      .add(this._lookActPosW);
+    out.y += 1.38 * this.actorGroup.scale.y;
+    return out;
+  }
+
+  _evalLookState(st, t) {
+    if (!st.looks || !st.looks.length) return null;
+    let activeCue = null;
+    for (const l of st.looks) {
+      if (t < l.start) break;
+      activeCue = l;
+    }
+    if (!activeCue) return null;
+    if (activeCue.kind === 'instant') {
+      const tgt = activeCue.target || DEFAULT_LOOK_TARGET;
+      const w = Math.max(0, Math.min(1, tgt.weight ?? 0));
+      if (w <= 1e-4) return null;
+      return {
+        posW: this._resolveLookTargetPos(this._lookTargetA, tgt),
+        headW: w * (tgt.headWeight ?? 0.6),
+        bodyW: w * (tgt.bodyWeight ?? 0.1),
+        eyesW: w * (tgt.eyesWeight ?? 0.3),
+      };
+    }
+    const from = activeCue.from || DEFAULT_LOOK_TARGET;
+    const to = activeCue.to || DEFAULT_LOOK_TARGET;
+    const u =
+      activeCue.dur > 0 ? Math.min(1, Math.max(0, (t - activeCue.start) / activeCue.dur)) : 1;
+    const w0 = Math.max(0, Math.min(1, from.weight ?? 0));
+    const w1 = Math.max(0, Math.min(1, to.weight ?? 0));
+    if (Math.abs(w0 - w1) > 1e-4) {
+      const w = w0 + (w1 - w0) * u;
+      if (w <= 1e-4) return null;
+      const dom = w0 < w1 ? to : from;
+      const inCirc = 1 - Math.sqrt(Math.max(0, 1 - w * w));
+      return {
+        posW: this._resolveLookTargetPos(this._lookTargetA, dom),
+        headW: w * (dom.headWeight ?? 0.6),
+        bodyW: inCirc * (dom.bodyWeight ?? 0.1),
+        eyesW: w * (dom.eyesWeight ?? 0.3),
+      };
+    }
+    if (w1 <= 1e-4) return null;
+    this._resolveLookTargetPos(this._lookTargetA, from);
+    this._resolveLookTargetPos(this._lookTargetB, to);
+    this._lookTargetA.lerp(this._lookTargetB, u);
+    return {
+      posW: this._lookTargetA,
+      headW: w1 * (to.headWeight ?? 0.6),
+      bodyW: w1 * (to.bodyWeight ?? 0.1),
+      eyesW: w1 * (to.eyesWeight ?? 0.3),
+    };
+  }
+
+  _aimBoneAtTarget(solver, bname, targetPosW, weight, maxYawDeg, maxPitchDeg) {
+    if (weight <= 1e-4) return;
+    const bone = solver.nameToNode[bname];
+    if (!bone || !bone.parent) return;
+    const D2R = Math.PI / 180;
+    bone.updateWorldMatrix(true, false);
+    bone.getWorldPosition(this._lookBonePosW);
+    bone.getWorldQuaternion(this._lookBoneQuatW);
+
+    this._lookDesLocal.copy(targetPosW).sub(this._lookBonePosW).applyQuaternion(this._lookActQuatInv);
+    if (this._lookDesLocal.lengthSq() < 1e-8) return;
+    this._lookDesLocal.normalize();
+
+    const bindQ = solver.bindQuat3[bname];
+    this._lookDeltaQuat.copy(this._lookActQuatInv).multiply(this._lookBoneQuatW);
+    if (bindQ) this._lookDeltaQuat.multiply(this._lookParentQuatW.copy(bindQ).invert());
+    this._lookCurLocal.set(0, 0, -1).applyQuaternion(this._lookDeltaQuat).normalize();
+
+    const desYaw = Math.atan2(-this._lookDesLocal.x, -this._lookDesLocal.z);
+    const curYaw = Math.atan2(-this._lookCurLocal.x, -this._lookCurLocal.z);
+    let dYaw = desYaw - curYaw;
+    while (dYaw > Math.PI) dYaw -= Math.PI * 2;
+    while (dYaw < -Math.PI) dYaw += Math.PI * 2;
+
+    const desPitch = Math.asin(Math.max(-1, Math.min(1, this._lookDesLocal.y)));
+    const curPitch = Math.asin(Math.max(-1, Math.min(1, this._lookCurLocal.y)));
+    const maxYaw = maxYawDeg * D2R;
+    const maxPitch = maxPitchDeg * D2R;
+    const yaw = Math.max(-maxYaw, Math.min(maxYaw, dYaw)) * weight;
+    const pitch = Math.max(-maxPitch, Math.min(maxPitch, desPitch - curPitch)) * weight;
+
+    this._lookEuler.set(pitch, yaw, 0, 'YXZ');
+    this._lookRotActor.setFromEuler(this._lookEuler);
+    this._lookRotWorld
+      .copy(this._lookActQuatW)
+      .multiply(this._lookRotActor)
+      .multiply(this._lookActQuatInv);
+
+    bone.parent.getWorldQuaternion(this._lookParentQuatW);
+    this._lookDeltaQuat
+      .copy(this._lookParentQuatW)
+      .invert()
+      .multiply(this._lookRotWorld)
+      .multiply(this._lookParentQuatW);
+    bone.quaternion.premultiply(this._lookDeltaQuat);
+    bone.updateMatrixWorld(true);
+  }
+
+  _applyLookTarget(st, t) {
+    if (!this.char || !st.actorVisible) return;
+    const { solver } = this.char;
+    if (!solver.nameToNode.Head) return;
+
+    this.actorGroup.updateMatrixWorld(true);
+    this.actorGroup.getWorldPosition(this._lookActPosW);
+    this.actorGroup.getWorldQuaternion(this._lookActQuatW);
+    this._lookActQuatInv.copy(this._lookActQuatW).invert();
+
+    const lk = this._evalLookState(st, t);
+    if (!lk) return;
+
+    const chestName = solver.nameToNode.Chest
+      ? 'Chest'
+      : solver.nameToNode.Spine2
+        ? 'Spine2'
+        : 'Spine1';
+    this._aimBoneAtTarget(solver, chestName, lk.posW, lk.bodyW, 30, 20);
+    this._aimBoneAtTarget(solver, 'Head', lk.posW, lk.headW, 50, 35);
+    this._aimBoneAtTarget(solver, 'LeftEye', lk.posW, lk.eyesW, 8, 5);
+    this._aimBoneAtTarget(solver, 'RightEye', lk.posW, lk.eyesW, 8, 5);
+  }
+
+  _applyStoryBackground(t, st) {
+    const src = st.bgActive ? (this.storyTimeline.backgrounds.get(st.bgActive) || {}).src : null;
+    const is3d = !!src && src.startsWith('env_3d');
+    const activeDof = st.dof || (st.camera && st.camera.dofSetting) || null;
+    const camFocalMm = (st.camera && st.camera.focalLength) || 30;
+    if (this.bloom) this.bloom.setDof(activeDof, camFocalMm, is3d);
+
+    this.envGroup.visible = is3d;
+    this.scene.background = is3d && this.skyTexture ? this.skyTexture : null;
+    if (src && src !== this._lastVolumeSrc && this.char) {
+      this._lastVolumeSrc = src;
+      if (is3d && this.envInfo?.meta?.volumes) {
+        this.char.applyActorVolume(this.envInfo.meta.volumes);
+      } else if (!is3d && this.bgMeta[src]?.volumes) {
+        this.char.applyActorVolume(this.bgMeta[src].volumes);
+      }
+    }
+    if (is3d || !src) {
+      if (this.bgEl) {
+        this.bgEl.style.display = 'none';
+        this.bgEl.style.filter = 'none';
+        this.bgEl.style.transform = 'none';
+      }
+      if (this.bloom) this.bloom.setBg2D({ active: false });
+      return;
+    }
+
+    const meta = this.bgMeta[src] || {};
+    const W = this.viewportWidth;
+    const H = this.viewportHeight;
+    const setting = st.bgSet.get(st.bgActive) || {};
+    const pos = setting.position || { x: 0, y: 0 };
+    const scale = setting.scale || { x: 1, y: 1 };
+    const angle = setting.angle || 0;
+    const k = H / 1920;
+    const fit =
+      (W <= H ? meta.verticalSetting : meta.horizontalSetting) || meta.verticalSetting;
+
+    const webglTex = this.bgTextures.get(src) || null;
+    if (this.bloom && this.useBloom && webglTex && fit && fit.baseSize && fit.clippingRect) {
+      if (this.bgEl) this.bgEl.style.display = 'none';
+      const base = fit.baseSize;
+      const clip = fit.clippingRect;
+      const s0 = Math.max(W / clip.width, H / clip.height);
+      const imgW = base.x * s0;
+      const imgH = base.y * s0;
+      const cx = (clip.x + clip.width * 0.5) * s0;
+      const cy = (base.y - (clip.y + clip.height * 0.5)) * s0;
+      const tx = (pos.x || 0) * k;
+      const ty = -(pos.y || 0) * k;
+      const sx = Math.abs(scale.x || 1) > 1e-4 ? scale.x : 1;
+      const sy = Math.abs(scale.y || 1) > 1e-4 ? scale.y : 1;
+      const rad = ((angle || 0) * Math.PI) / 180;
+      const ca = Math.cos(rad);
+      const sa = Math.sin(rad);
+      const ax = W / sx;
+      const ay = H / sy;
+      const bx = (-0.5 * W - tx) / sx;
+      const by = (-0.5 * H - ty) / sy;
+      this._bgUvMat.set(
+        (ca * ax) / imgW,
+        (-sa * ay) / imgW,
+        (ca * bx - sa * by + cx) / imgW,
+        (sa * ax) / imgH,
+        (ca * ay) / imgH,
+        (sa * bx + ca * by + cy) / imgH,
+        0,
+        0,
+        1,
+      );
+      this.bloom.setBg2D({ active: true, texture: webglTex, uvMatrix: this._bgUvMat, srcId: src });
+      return;
+    }
+    if (this.bloom) this.bloom.setBg2D({ active: false });
+    if (this.bgEl) {
+      this.bgEl.style.display = 'block';
+      for (const [k, img] of this.bgImages) {
+        img.style.display = k === src ? 'block' : 'none';
+      }
+    }
+  }
+
+  _updateStoryOverlayState(t, st) {
+    const m = st.message;
+    if (!m) {
+      this.storyActiveMessage = null;
+    } else {
+      const name = m.name === '{user}' ? USER_NAME : m.name || '';
+      const clean = stripRuby(m.text);
+      const shown = Math.max(0, Math.floor((t - m.start) * CHARS_PER_SEC));
+      const lv = st.lineVoice;
+      const hasVoice = !!(lv && !m.narration && Math.abs(lv.start - m.start) <= 0.6);
+      this.storyActiveMessage = {
+        speaker: name,
+        fullText: clean,
+        shownText: clean.slice(0, shown),
+        narration: !!m.narration,
+        hasVoice,
+        start: m.start,
+      };
+    }
+
+    const f = st.fade;
+    const w = f.dur > 0 ? Math.min(1, Math.max(0, (t - f.t) / f.dur)) : 1;
+    const fadeA = lerp(f.from, f.to, w);
+    let flash = 0;
+    for (const tr of st.transitions) {
+      if (t < tr.start) break;
+      const u = Math.min(1, Math.max(0, (t - tr.start) / tr.dur));
+      flash = tr.type === 'In' ? u : 1 - u;
+    }
+    if (flash > fadeA) {
+      this.storyFade = { color: '#ffffff', opacity: flash };
+    } else {
+      this.storyFade = { color: f.color || '#000000', opacity: fadeA };
+    }
+  }
+
+  _setupWindowHooks() {
+    const self = this;
+    window.story = {
+      get timeline() {
+        return self.storyTimeline;
+      },
+      get player() {
+        return self.storyPlayer;
+      },
+      camera: this.camera,
+      scene: this.scene,
+      get char() {
+        return self.char;
+      },
+      THREE,
+      voice: this.voiceCtrl,
+      apply(t) {
+        self.seekStory(t, false);
+      },
+      get time() {
+        return self.storyTime;
+      },
+      seek(t) {
+        self.seekStory(t, false);
+      },
+      play() {
+        self.setStoryPlaying(true);
+      },
+      pause() {
+        self.setStoryPlaying(false);
+      },
+      lockCamera(v) {
+        self.setStoryCameraLocked(v);
+      },
+      render() {
+        self.renderFrame();
+      },
+      renderer: this.renderer,
+      lights: { sunLight: this.sunLight, stageHemi: this.stageHemi },
+      env: this.envGroup,
+      actorGroup: this.actorGroup,
+      shadow: this.groundShadow,
+    };
+
+    window.viewer = {
+      THREE,
+      get char() {
+        return self.char;
+      },
+      scene: this.scene,
+      camera: this.camera,
+      renderer: this.renderer,
+      controls: this.controls,
+      setClip: async (name, t = 0) => {
+        await self.setAssetBodyMotion(name);
+        self.setAssetTime(t);
+      },
+    };
+    window.viewerEngine = this;
+  }
+}
+
+export const viewerEngine = new ViewerEngine();
