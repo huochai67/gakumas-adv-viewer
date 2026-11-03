@@ -44,30 +44,64 @@ function loadMap(desc, key, srgb, clamp = false) {
   return tex;
 }
 
-// View-space light direction from VLActorParameter Euler angles (deg)
-function viewDirFromAngles(pitchDeg, yawDeg) {
+// View-space light direction from VLActorParameter / VLActorShadow angles (deg):
+// x = horizontal yaw (+x -> viewer's right +X), y = vertical elevation (+y -> up +Y).
+function viewDirFromAngles(yawXDeg, elevYDeg) {
   const D2R = Math.PI / 180;
-  const px = pitchDeg * D2R;
-  const py = yawDeg * D2R;
-  // In Three.js camera view space (+X right, +Y up, +Z towards viewer):
-  // key light from front-upper-left (yaw=+30 -> -X/+Z, pitch=-10 -> +Y/+Z)
+  const ax = yawXDeg * D2R;
+  const ay = elevYDeg * D2R;
   return new THREE.Vector3(
-    -Math.sin(py) * Math.cos(px),
-    -Math.sin(px) * 1.35 + 0.22,
-    Math.cos(py) * Math.cos(px),
+    Math.sin(ax) * Math.cos(ay),
+    Math.sin(ay),
+    Math.cos(ax) * Math.cos(ay),
   ).normalize();
 }
 
 const DEFAULT_ACTOR_LIGHT = {
-  lightDirView: viewDirFromAngles(-10, 28),
-  rimDirView: new THREE.Vector3(0.45, 0.55, 0.70).normalize(),
+  lightDirView: viewDirFromAngles(-10, 30),
+  rimDirView: viewDirFromAngles(10, 30),
+  shadowAngles: { x: 10, y: 3 },
+  shadowStrength: 1.0,
   lightColor: new THREE.Color(0.985, 0.985, 0.985),
-  shadeMultiply: new THREE.Color(0.84, 0.72, 0.71),
-  rimPower: 24.0,
-  rimIntensity: 0.35,
+  shadeMultiply: new THREE.Color(0.83, 0.69, 0.68),
+  rimPower: 32.0,
+  rimIntensity: 0.45,
   rimBaseRatio: 0.85,
 };
 
+// ---------------- Hair-to-Face Depth Shadow Pass GLSL ----------------
+const SHADOW_CASTER_VERT = /* glsl */`
+#include <common>
+#include <morphtarget_pars_vertex>
+#include <skinning_pars_vertex>
+uniform mat4 uActorShadowMatrix;
+varying vec2 vUv;
+varying float vShadowDepth;
+void main() {
+  vUv = uv;
+  #include <begin_vertex>
+  #include <morphtarget_vertex>
+  #include <skinbase_vertex>
+  #include <skinning_vertex>
+  vec4 wp = modelMatrix * vec4(transformed, 1.0);
+  vec4 clip = uActorShadowMatrix * wp;
+  vShadowDepth = clip.z * 0.5 + 0.5;
+  gl_Position = clip;
+}
+`;
+
+const SHADOW_CASTER_FRAG = /* glsl */`
+#include <common>
+#include <packing>
+uniform sampler2D uBaseMap;
+varying vec2 vUv;
+varying float vShadowDepth;
+void main() {
+  // Translucent eye-covering bang tips (base.a > 0.12) do not cast dark blocks under eyes
+  if (texture2D(uBaseMap, vUv).a > 0.12) discard;
+  gl_FragColor = packDepthToRGBA(clamp(vShadowDepth, 0.0, 1.0));
+}
+`;
 // ---------------- Campus/Actor/Default GLSL ----------------
 const ACTOR_VERT = /* glsl */`
 #include <common>
@@ -107,6 +141,7 @@ void main() {
 
 const ACTOR_FRAG = /* glsl */`
 #include <common>
+#include <packing>
 
 uniform sampler2D uBaseMap;
 uniform sampler2D uShadeMap;
@@ -114,6 +149,8 @@ uniform sampler2D uDefMap;
 uniform sampler2D uRampMap;
 uniform sampler2D uHighlightMap;
 uniform sampler2D uLayerMap;
+uniform sampler2D uActorShadowMap;
+uniform mat4 uActorShadowMatrix;
 uniform vec4 uBaseColor;
 uniform vec3 uLightDirView;
 uniform vec3 uRimDirView;
@@ -121,6 +158,7 @@ uniform vec3 uLightColor;
 uniform vec3 uShadeMultiply;
 uniform vec3 uHeadCenterView;
 uniform vec3 uHeadFrontView;
+uniform vec3 uHeadRightView;
 
 uniform float uShaderType;
 uniform float uAlphaClip;
@@ -134,11 +172,38 @@ uniform float uHasShade;
 uniform float uHasDef;
 uniform float uHasHighlight;
 uniform float uCheekWeight;
+uniform float uShadowStrength;
+uniform float uReceiveActorShadow;
 varying vec2 vUv;
 varying vec3 vNormalView;
 varying vec3 vViewDir;
 varying vec3 vWorldPos;
 varying vec4 vColor;
+
+float sampleActorShadow(vec3 worldPos, float defBias) {
+  if (uReceiveActorShadow < 0.5 || uShadowStrength <= 0.001) return 1.0;
+  vec4 sc = uActorShadowMatrix * vec4(worldPos, 1.0);
+  vec3 ndc = sc.xyz / max(sc.w, 1e-5);
+  vec2 suv = ndc.xy * 0.5 + 0.5;
+  float curZ = ndc.z * 0.5 + 0.5;
+  if (suv.x < 0.01 || suv.x > 0.99 || suv.y < 0.01 || suv.y > 0.99 || curZ < 0.0 || curZ > 1.0) {
+    return 1.0;
+  }
+  // 4-tap rotated Poisson / box PCF (1024x1024 ortho RT around Head)
+  const float texel = 1.0 / 1024.0;
+  const float bias = 0.0045;
+  float d0 = unpackRGBAToDepth(texture2D(uActorShadowMap, suv + vec2(-0.75, -0.25) * texel));
+  float d1 = unpackRGBAToDepth(texture2D(uActorShadowMap, suv + vec2( 0.25, -0.75) * texel));
+  float d2 = unpackRGBAToDepth(texture2D(uActorShadowMap, suv + vec2( 0.75,  0.25) * texel));
+  float d3 = unpackRGBAToDepth(texture2D(uActorShadowMap, suv + vec2(-0.25,  0.75) * texel));
+  float cZ = curZ - bias;
+  float lit = (cZ <= d0 ? 0.25 : 0.0) + (cZ <= d1 ? 0.25 : 0.0) + (cZ <= d2 ? 0.25 : 0.0) + (cZ <= d3 ? 0.25 : 0.0);
+  float s = lit + max(defBias, 0.0) * 0.30;
+  // Face skin hair-drop-shadow stays a soft ~45% warm peach tint ([230,208,200]), not full neck-shadow dark
+  float effStrength = abs(uShaderType - 9.0) < 0.5 ? uShadowStrength * 0.52 : uShadowStrength * 0.65;
+  s = mix(1.0, clamp(s, 0.0, 1.0), effStrength);
+  return clamp(s * s * (3.0 - 2.0 * s), 0.0, 1.0);
+}
 
 void main() {
   vec4 base = texture2D(uBaseMap, vUv) * uBaseColor;
@@ -153,7 +218,7 @@ void main() {
     return;
   }
 
-  // Type 5: Eye catchlight (additive)
+  // Type 5: Eye catchlight (additive RGB)
   if (abs(uShaderType - 5.0) < 0.5) {
     vec3 hl = base.rgb * base.a;
     if (max(hl.r, max(hl.g, hl.b)) < 0.005) discard;
@@ -166,16 +231,20 @@ void main() {
   if (abs(uShaderType - 3.0) < 0.5 || abs(uShaderType - 6.0) < 0.5) {
     vec3 col = base.rgb * uLightColor;
     if (abs(uShaderType - 3.0) < 0.5 && uHasShade > 0.5) {
-      // Subtle upper-lid sclera shadow from _ShadeMap where _DefMap.r < 0.45
       vec4 defS = uHasDef > 0.5 ? texture2D(uDefMap, vUv) : vec4(0.5, 0.5, 0.0, 0.0);
       vec4 sdwS = texture2D(uShadeMap, vUv);
       float lidSdw = clamp((0.5 - defS.r) * 1.6, 0.0, 0.55) * sdwS.a;
       col = mix(col, sdwS.rgb * uLightColor, lidSdw);
     }
+    // Type 6 mouth highlight corner boost in DXBC PS_ASM (vUv > 0.96875)
     gl_FragColor = vec4(col, 1.0);
     #include <colorspace_fragment>
     return;
   }
+
+  // Type 1 (m_hirco wispy forehead/side hair strands): soft alpha blend
+  bool isWisps = abs(uShaderType - 1.0) < 0.5;
+  if (isWisps && base.a < 0.01) discard;
 
   // Lit toon surfaces: Type 0 (Body), Type 9 (Face skin), Type 8 (Hair), Type 1 (Hair wisps)
   vec3 N = normalize(vNormalView);
@@ -184,60 +253,73 @@ void main() {
   vec4 defTex = uHasDef > 0.5 ? texture2D(uDefMap, vUv) : vec4(0.5, 0.5, 0.0, 0.0);
   vec4 shadeTex = uHasShade > 0.5 ? texture2D(uShadeMap, vUv) : vec4(base.rgb * 0.82, 1.0);
 
-  // Face skin (_ShaderType == 9): blend smooth head-sphere normal by _DefMap.b
-  // so anime cheeks/nose light smoothly without harsh polygon shadow creases
-  if (abs(uShaderType - 9.0) < 0.5) {
-    vec3 vpPos = -vViewDir; // fallback
-    vec3 headN = normalize(mix(N, normalize(uHeadFrontView * 0.55 + N * 0.45), 0.72));
-    N = normalize(mix(N, headN, clamp(defTex.b * 0.85 + 0.35, 0.0, 0.92)));
-  }
-
-  // Hair (_ShaderType == 8): angel-ring highlight from _DefMap.a * _HighlightMap
   vec3 litAlbedo = base.rgb;
-  // Face (_ShaderType == 9): rosy anime cheek blush from _LayerMap left tile (0..0.5 U)
+  // Optional _LayerMap overlay ONLY when _LayerWeight > 0 (concert sweat/blush override)
   if (uCheekWeight > 0.001) {
-    vec4 cheek = texture2D(uLayerMap, vec2(vUv.x * 0.5, vUv.y));
-    litAlbedo = mix(litAlbedo, cheek.rgb, cheek.a * uCheekWeight);
-  }
-  if (abs(uShaderType - 8.0) < 0.5 && uHasHighlight > 0.5) {
-    vec3 H = normalize(uLightDirView + vViewDir);
-    float ndh = max(dot(N, H), 0.0);
-    // Notice Unity UV V was flipped (vUv.y = 1.0 - v_unity), so v_unity > 0.75 is vUv.y < 0.25
-    float uvMask = (vUv.x > 0.75 && vUv.y < 0.25) ? 0.0 : 1.0;
-    float spec = smoothstep(uSpecThreshold, uSpecThreshold + 0.04, pow(ndh, 4.0)) * defTex.a * uvMask;
-    vec3 hhl = texture2D(uHighlightMap, vUv).rgb;
-    litAlbedo = mix(litAlbedo, hhl, clamp(spec * 0.9, 0.0, 1.0));
+    vec4 lyr = texture2D(uLayerMap, vUv);
+    litAlbedo = mix(litAlbedo, lyr.rgb, lyr.a * uCheekWeight);
   }
 
-  // DefMap.r shadow threshold bias (0.5 = neutral, <0.5 = AO/crevice, >0.5 = stays lit)
+  // Exact DXBC PS_ASM lines 107-116:
+  // r2.w = defTex.r * 2.0 - 1.0; halfL = clamp(0.5 * dot(N, L) + defTex.r, 0.0, 1.0)
   float defBias = 2.0 * defTex.r - 1.0;
-  float ndl = dot(N, uLightDirView);
-  float ndlShift = abs(uShaderType - 9.0) < 0.5 ? 0.02 : 0.14;
-  float rampU = clamp(0.5 * (ndl - ndlShift) * 1.45 + 0.50 + 0.95 * defBias, 0.01, 0.99);
+  float litTerm;
+  if (abs(uShaderType - 9.0) < 0.5) {
+    // Face (_ShaderType == 9): smooth head-front stabilization + DXBC Head-X reflection symmetry
+    // weighted by defTex.b so cheeks/forehead light cleanly while nose/chin shadows stay crisp
+    vec3 faceN = normalize(mix(N, normalize(uHeadFrontView * 0.62 + N * 0.38), clamp(defTex.b * 0.75 + 0.35, 0.0, 0.88)));
+    vec3 reflN = normalize(faceN - 2.0 * dot(faceN, uHeadRightView) * uHeadRightView);
+    float halfL = clamp(0.5 * dot(faceN, uLightDirView) + defTex.r, 0.0, 1.0);
+    float halfLRefl = clamp(0.5 * dot(reflN, uLightDirView) + defTex.r, 0.0, 1.0);
+    litTerm = mix(halfL, max(halfL, halfLRefl), defTex.b);
+  } else {
+    litTerm = clamp(0.5 * dot(N, uLightDirView) + defTex.r, 0.0, 1.0);
+  }
+
+  float actorShadow = sampleActorShadow(vWorldPos, defBias);
+
+  // Hair (_ShaderType == 8): angel-ring highlight from _DefMap.a * _HighlightMap (DXBC lines 163-191)
+  if (abs(uShaderType - 8.0) < 0.5 && uHasHighlight > 0.5) {
+    vec3 H = normalize(uLightDirView + vec3(0.0, 0.0, 1.0));
+    float ndh = max(dot(N, H), 0.0);
+    float uvMask = (vUv.x > 0.75 && vUv.y < 0.25) ? 0.0 : 1.0;
+    float specMask = min(actorShadow, defTex.a) * uvMask;
+    float spec = smoothstep(uSpecThreshold, uSpecThreshold + 0.04, pow(ndh, 4.0)) * specMask;
+    vec3 hhl = texture2D(uHighlightMap, vUv).rgb;
+    litAlbedo = mix(litAlbedo, hhl, clamp(spec * 0.92, 0.0, 1.0));
+  }
+
+  float rampU = clamp(min(actorShadow, litTerm), 0.01, 0.99);
   vec4 ramp = texture2D(uRampMap, vec2(rampU, 0.5));
 
-  // Authentic DXBC Campus/Actor/Default _ShadeMap.a mask:
-  // shadeTex.a == 0 -> cloth & hair: use artist-painted shadeTex.rgb (cool grey on white pants, berry on hair)
-  // shadeTex.a == 1 -> skin: blend warm subsurface ramp.rgb * uShadeMultiply
-  vec3 clothMul = abs(uShaderType - 8.0) < 0.5 ? mix(vec3(1.0), uShadeMultiply, 0.55) : mix(vec3(1.0), uShadeMultiply, 0.16);
-  vec3 nonSkinShadow = shadeTex.rgb * clothMul;
-  vec3 skinShadow = mix(shadeTex.rgb, litAlbedo * ramp.rgb, 0.58) * mix(vec3(1.0), uShadeMultiply, 0.78);
-  vec3 shadowTarget = uHasShade > 0.5 ? mix(nonSkinShadow, skinShadow, shadeTex.a) : (litAlbedo * ramp.rgb * uShadeMultiply);
-  vec3 shaded = mix(litAlbedo, shadowTarget, ramp.a) * uLightColor;
+  // Exact DXBC PS_ASM lines 203-216 _ShadeMap.a blend:
+  // shadeTex.a == 0 (cloth & hair): mix(litAlbedo, shadeTex.rgb * clothShadeMul, ramp.a)
+  // shadeTex.a == 1 (skin): litAlbedo * mix(ramp.rgb, ramp.rgb * uShadeMultiply, ramp.a)
+  vec3 clothShadeMul = abs(uShaderType - 8.0) < 0.5
+    ? mix(vec3(1.0), uShadeMultiply, 0.65)
+    : mix(vec3(1.0), uShadeMultiply, 0.28);
+  vec3 modeA = mix(litAlbedo, shadeTex.rgb * clothShadeMul, ramp.a);
+  vec3 rampMul = mix(ramp.rgb, ramp.rgb * uShadeMultiply, ramp.a);
+  vec3 modeB = litAlbedo * rampMul;
+  vec3 shaded = (uHasShade > 0.5 ? mix(modeA, modeB, shadeTex.a) : modeB) * uLightColor;
 
-  // Subtle view-space rim light on lit edges (body & hair)
-  if (abs(uShaderType - 9.0) > 0.5) {
+  // Exact DXBC PS_ASM lines 281-293 rim light (body & hair; crisp uRimPower = 32 edge)
+  if (abs(uShaderType - 9.0) > 0.5 && !isWisps) {
     float ndv = clamp(dot(N, vViewDir), 0.0, 1.0);
-    float rimDir = clamp(dot(N, uRimDirView), 0.0, 1.0);
-    float rim = pow(1.0 - ndv, uRimPower * 0.24) * smoothstep(0.15, 0.75, rimDir) * (1.0 - ramp.a * 0.75);
-    vec3 rimCol = mix(vec3(1.0), litAlbedo, uRimBaseRatio) * (uRimIntensity * 0.65);
-    shaded += rimCol * rim * defTex.g;
+    float rimSide = smoothstep(0.0, 0.55, dot(N, uRimDirView));
+    float rim = pow(1.0 - ndv, max(4.0, uRimPower * 0.35)) * rimSide * min(2.0 * defTex.r, 1.0) * (1.0 - ramp.a * 0.7);
+    vec3 rimCol = mix(vec3(1.0), litAlbedo, uRimBaseRatio) * (uRimIntensity * 0.45);
+    shaded += rimCol * rim * clamp(defTex.g + 0.25, 0.0, 1.0);
   }
 
-  float outAlpha = 1.0;
+  float outAlpha = isWisps ? base.a : 1.0;
   if (uBangsTranslucency > 0.5) {
-    // Pass 2 of m_hir over eyes/brows (stencil > 64): artist painted bangs alpha in base.a (0..0.37)
-    outAlpha = clamp(1.0 - base.a * 1.15, 0.48, 0.92);
+    // Exact DXBC PS_ASM lines 192-201: bangs translucency over eyes/brows (stencil > 64),
+    // fading smoothly to opaque as head turns into side/back view
+    float frontDot = dot(uHeadFrontView, vec3(0.0, 0.0, 1.0));
+    float rightAbs = abs(dot(uHeadRightView, vec3(0.0, 0.0, 1.0)));
+    float sideFade = max(clamp((0.45 - frontDot) * 2.5, 0.0, 1.0), clamp((rightAbs - 0.65) * 3.0, 0.0, 1.0));
+    outAlpha = clamp(1.0 - base.a * (1.0 - sideFade), 0.45, 1.0);
   }
 
   gl_FragColor = vec4(shaded, outAlpha);
@@ -323,6 +405,16 @@ void main() {
 }
 `;
 
+function applyPorterDuffOver(mat) {
+  mat.blending = THREE.CustomBlending;
+  mat.blendEquation = THREE.AddEquation;
+  mat.blendSrc = THREE.SrcAlphaFactor;
+  mat.blendDst = THREE.OneMinusSrcAlphaFactor;
+  mat.blendEquationAlpha = THREE.AddEquation;
+  mat.blendSrcAlpha = THREE.OneFactor;
+  mat.blendDstAlpha = THREE.OneMinusSrcAlphaFactor;
+}
+
 function createActorMaterial(desc, sharedUniforms, bangsPass = false) {
   const mname = desc.name;
   const stype = desc.floats._ShaderType ?? 0;
@@ -331,11 +423,15 @@ function createActorMaterial(desc, sharedUniforms, bangsPass = false) {
   const defMap = loadMap(desc, '_DefMap', false);
   const rampMap = loadMap(desc, '_RampMap', true, true) || RAMP_DEFAULT;
   const hlMap = loadMap(desc, '_HighlightMap', true);
-  const layerMap = (desc.floats._EnableLayerMap ?? 0) >= 0.5 ? loadMap(desc, '_LayerMap', true) : null;
+  const layerWeight = desc.floats._LayerWeight ?? 0.0;
+  const layerMap = ((desc.floats._EnableLayerMap ?? 0) >= 0.5 && layerWeight > 0.001)
+    ? loadMap(desc, '_LayerMap', true)
+    : null;
   const bc = desc.colors._BaseColor || [1, 1, 1, 1];
   const specTh = (desc.colors._SpecularThreshold && desc.colors._SpecularThreshold[0]) ?? 0.15;
   const isWisps = mname === 'm_hirco' || stype === 1;
   const cullZero = (desc.floats._Cull === 0) || isWisps || mname === 'm_eye';
+  const receiveShadow = (mname === 'm_fce' || mname === 'm_bdy') ? 1.0 : 0.0;
 
   const uniforms = {
     uBaseMap: { value: baseMap },
@@ -344,6 +440,8 @@ function createActorMaterial(desc, sharedUniforms, bangsPass = false) {
     uRampMap: { value: rampMap },
     uHighlightMap: { value: hlMap || WHITE_SRGB },
     uLayerMap: { value: layerMap || WHITE_SRGB },
+    uActorShadowMap: sharedUniforms.uActorShadowMap,
+    uActorShadowMatrix: sharedUniforms.uActorShadowMatrix,
     uBaseColor: { value: new THREE.Vector4(bc[0], bc[1], bc[2], bc[3]) },
     uLightDirView: sharedUniforms.uLightDirView,
     uRimDirView: sharedUniforms.uRimDirView,
@@ -351,8 +449,9 @@ function createActorMaterial(desc, sharedUniforms, bangsPass = false) {
     uShadeMultiply: sharedUniforms.uShadeMultiply,
     uHeadCenterView: sharedUniforms.uHeadCenterView,
     uHeadFrontView: sharedUniforms.uHeadFrontView,
+    uHeadRightView: sharedUniforms.uHeadRightView,
     uShaderType: { value: stype },
-    uAlphaClip: { value: isWisps ? 1.0 : 0.0 },
+    uAlphaClip: { value: (!isWisps && (desc.floats._AlphaClip ?? 0) >= 0.5) ? 1.0 : 0.0 },
     uCutoff: { value: desc.floats._Cutoff ?? 0.45 },
     uSpecThreshold: { value: specTh },
     uRimPower: sharedUniforms.uRimPower,
@@ -362,7 +461,9 @@ function createActorMaterial(desc, sharedUniforms, bangsPass = false) {
     uHasShade: { value: shadeMap ? 1.0 : 0.0 },
     uHasDef: { value: defMap ? 1.0 : 0.0 },
     uHasHighlight: { value: hlMap ? 1.0 : 0.0 },
-    uCheekWeight: { value: layerMap ? 0.24 : 0.0 },
+    uCheekWeight: { value: layerMap ? layerWeight : 0.0 },
+    uShadowStrength: sharedUniforms.uShadowStrength,
+    uReceiveActorShadow: { value: receiveShadow },
   };
 
   const mat = new THREE.ShaderMaterial({
@@ -376,7 +477,7 @@ function createActorMaterial(desc, sharedUniforms, bangsPass = false) {
     depthTest: true,
   });
 
-  // Configure exact Unity queue + stencil states
+  // Configure exact Unity queue + WebGL glStencilFunc ((ref & mask) OP (stencil & mask))
   if (mname === 'm_bdy' || mname === 'm_fce') {
     mat.stencilWrite = true;
     mat.stencilRef = 64;
@@ -397,6 +498,7 @@ function createActorMaterial(desc, sharedUniforms, bangsPass = false) {
   } else if (mname === 'm_eye') {
     mat.transparent = true;
     mat.depthWrite = false;
+    applyPorterDuffOver(mat);
     mat.polygonOffset = true;
     mat.polygonOffsetFactor = -2;
     mat.polygonOffsetUnits = -2;
@@ -422,6 +524,8 @@ function createActorMaterial(desc, sharedUniforms, bangsPass = false) {
     mat.blending = THREE.CustomBlending;
     mat.blendSrc = THREE.OneFactor;
     mat.blendDst = THREE.OneFactor;
+    mat.blendSrcAlpha = THREE.ZeroFactor;
+    mat.blendDstAlpha = THREE.OneFactor;
     mat.polygonOffset = true;
     mat.polygonOffsetFactor = -4;
     mat.polygonOffsetUnits = -4;
@@ -432,23 +536,29 @@ function createActorMaterial(desc, sharedUniforms, bangsPass = false) {
     mat.stencilWriteMask = 0;
     mat.stencilZPass = THREE.KeepStencilOp;
   } else if (mname === 'm_hir' && !bangsPass) {
-    // Pass 1: Opaque hair everywhere EXCEPT over eyes/brows (stencil <= 64)
+    // Pass 1: Opaque hair where stencil <= 64 -> WebGL (64 >= stencil) = GreaterEqualStencilFunc!
     mat.stencilWrite = true;
     mat.stencilRef = 64;
-    mat.stencilFunc = THREE.LessEqualStencilFunc;
+    mat.stencilFunc = THREE.GreaterEqualStencilFunc;
     mat.stencilFuncMask = STENCIL_MASK;
     mat.stencilWriteMask = 0;
     mat.stencilZPass = THREE.KeepStencilOp;
   } else if (mname === 'm_hir' && bangsPass) {
-    // Pass 2: Translucent bangs ONLY over eyes/brows (stencil > 64)
+    // Pass 2: Translucent bangs ONLY over eyes/brows where stencil > 64 -> WebGL (64 < stencil) = LessStencilFunc!
     mat.transparent = true;
-    mat.depthWrite = true;
+    mat.depthWrite = false;
+    applyPorterDuffOver(mat);
     mat.stencilWrite = true;
     mat.stencilRef = 64;
-    mat.stencilFunc = THREE.GreaterStencilFunc;
+    mat.stencilFunc = THREE.LessStencilFunc;
     mat.stencilFuncMask = STENCIL_MASK;
     mat.stencilWriteMask = 0;
     mat.stencilZPass = THREE.KeepStencilOp;
+  } else if (isWisps) {
+    // m_hirco: wispy forehead/side hair strands, soft alpha blend, no hard cutout
+    mat.transparent = true;
+    mat.depthWrite = false;
+    applyPorterDuffOver(mat);
   }
 
   mat.userData.desc = desc;
@@ -464,10 +574,9 @@ const RENDER_ORDER = {
   m_ehl: 15,
   m_hir: 16,
   m_hir_bangs: 17,
-  m_hirco: 18,
-  outline: 19,
+  outline: 18,
+  m_hirco: 19,
 };
-
 function cloneSkinnedPass(mesh, mat, suffix, order) {
   const o = new THREE.SkinnedMesh(mesh.geometry, mat);
   o.name = `${mesh.name}_${suffix}`;
@@ -500,11 +609,11 @@ function createOutlineMesh(mesh, desc, baseWidth) {
     depthWrite: true,
     depthTest: true,
   });
-  // Hair outlines must not draw dark lines across eyes/brows inside bangs
+  // Hair outlines draw over bg (0) and face skin (64), stopping cleanly at eyes/brows (68/72): 64 >= stencil
   if (desc.part === 'hair') {
     mat.stencilWrite = true;
     mat.stencilRef = 64;
-    mat.stencilFunc = THREE.LessEqualStencilFunc;
+    mat.stencilFunc = THREE.GreaterEqualStencilFunc;
     mat.stencilFuncMask = STENCIL_MASK;
     mat.stencilWriteMask = 0;
     mat.stencilZPass = THREE.KeepStencilOp;
@@ -549,6 +658,19 @@ export async function loadCharacter(scene, opts = {}) {
     n.userData.bindTRS = { p: n.position.clone(), q: n.quaternion.clone(), s: n.scale.clone() };
   }
 
+  // 1024x1024 RGBA-packed depth render target for crisp hair-to-face drop shadows (_ActorShadowmapTexture)
+  const actorShadowRT = new THREE.WebGLRenderTarget(1024, 1024, {
+    minFilter: THREE.NearestFilter,
+    magFilter: THREE.NearestFilter,
+    format: THREE.RGBAFormat,
+    type: THREE.UnsignedByteType,
+    depthBuffer: true,
+    stencilBuffer: false,
+  });
+  const shadowScene = new THREE.Scene();
+  const shadowCamera = new THREE.Camera();
+  let shadowAngles = { ...DEFAULT_ACTOR_LIGHT.shadowAngles };
+
   const sharedUniforms = {
     uLightDirView: { value: DEFAULT_ACTOR_LIGHT.lightDirView.clone() },
     uRimDirView: { value: DEFAULT_ACTOR_LIGHT.rimDirView.clone() },
@@ -556,9 +678,13 @@ export async function loadCharacter(scene, opts = {}) {
     uShadeMultiply: { value: DEFAULT_ACTOR_LIGHT.shadeMultiply.clone() },
     uHeadCenterView: { value: new THREE.Vector3(0, 0, -1.5) },
     uHeadFrontView: { value: new THREE.Vector3(0, 0, 1) },
+    uHeadRightView: { value: new THREE.Vector3(1, 0, 0) },
     uRimPower: { value: DEFAULT_ACTOR_LIGHT.rimPower },
     uRimIntensity: { value: DEFAULT_ACTOR_LIGHT.rimIntensity },
     uRimBaseRatio: { value: DEFAULT_ACTOR_LIGHT.rimBaseRatio },
+    uActorShadowMap: { value: WHITE_SRGB },
+    uActorShadowMatrix: { value: new THREE.Matrix4() },
+    uShadowStrength: { value: DEFAULT_ACTOR_LIGHT.shadowStrength },
   };
 
   const byName = new Map();
@@ -573,13 +699,12 @@ export async function loadCharacter(scene, opts = {}) {
 
   const morphMeshes = [];
   const extraPasses = [];
+  const shadowCasters = [];
   const OUTLINED_WIDTH = {
     m_bdy: 0.0022,
-    m_fce: 0.0017,
-    m_hir: 0.0019,
-    m_hirco: 0.0014,
+    m_fce: 0.0016,
+    m_hir: 0.0018,
   };
-
   root.traverse((o) => {
     if (!o.isMesh) return;
     const desc = descFor(o.material);
@@ -602,6 +727,23 @@ export async function loadCharacter(scene, opts = {}) {
       if (desc.name === 'm_hir') {
         const bangsMat = createActorMaterial(desc, sharedUniforms, true);
         extraPasses.push([o.parent, cloneSkinnedPass(o, bangsMat, 'bangs', RENDER_ORDER.m_hir_bangs)]);
+
+        const sMat = new THREE.ShaderMaterial({
+          name: 'm_hir_shadow_caster',
+          uniforms: {
+            uBaseMap: { value: loadMap(desc, '_BaseMap', false) || WHITE_SRGB },
+            uActorShadowMatrix: sharedUniforms.uActorShadowMatrix,
+          },
+          vertexShader: SHADOW_CASTER_VERT,
+          fragmentShader: SHADOW_CASTER_FRAG,
+          side: THREE.DoubleSide,
+          depthWrite: true,
+          depthTest: true,
+        });
+        const sMesh = cloneSkinnedPass(o, sMat, 'shadow', 0);
+        sMesh.matrixAutoUpdate = false;
+        shadowScene.add(sMesh);
+        shadowCasters.push([o, sMesh]);
       }
       if (OUTLINE_SCALE > 0 && desc.name in OUTLINED_WIDTH) {
         extraPasses.push([o.parent, createOutlineMesh(o, desc, OUTLINED_WIDTH[desc.name])]);
@@ -617,13 +759,22 @@ export async function loadCharacter(scene, opts = {}) {
   const faceCorr = meta.faceCorrection || null;
   const userMorph = new Map();
 
-  // Temp vectors for per-frame view-space head normal & CampusActorFaceCorrection
+  // Temp vectors/matrices for per-frame view-space head uniforms, FaceCorrection & ActorShadowPass
   const _headPosW = new THREE.Vector3();
   const _headQuatW = new THREE.Quaternion();
   const _camPosW = new THREE.Vector3();
   const _toCamLocal = new THREE.Vector3();
   const _headFrontW = new THREE.Vector3();
+  const _headRightW = new THREE.Vector3();
   const _viewMat3 = new THREE.Matrix3();
+  const _camMat3 = new THREE.Matrix3();
+  const _shadowDirW = new THREE.Vector3();
+  const _shadowEyeW = new THREE.Vector3();
+  const _shadowTargetW = new THREE.Vector3();
+  const _shadowUpW = new THREE.Vector3(0, 1, 0);
+  const _shadowView = new THREE.Matrix4();
+  const _shadowProj = new THREE.Matrix4().makeOrthographic(-0.20, 0.20, 0.20, -0.20, 0.02, 0.72);
+  const _prevClearColor = new THREE.Color();
 
   function syncMorphTargets(corrWeights = null) {
     for (const m of morphMeshes) {
@@ -641,7 +792,7 @@ export async function loadCharacter(scene, opts = {}) {
   }
 
   const char = {
-    root, solver, nodeByIndex, meta, morphMeshes, sharedUniforms,
+    root, solver, nodeByIndex, meta, morphMeshes, sharedUniforms, actorShadowRT,
     setMorph(map) {
       userMorph.clear();
       if (map) {
@@ -649,7 +800,7 @@ export async function loadCharacter(scene, opts = {}) {
       }
       syncMorphTargets();
     },
-    /** Update view-space head uniforms & CampusActorFaceCorrection profile blendshapes. */
+    /** Update view-space head uniforms, shadow matrix & CampusActorFaceCorrection profile blendshapes. */
     update(camera) {
       if (!camera || !headNode) return;
       root.updateMatrixWorld(true);
@@ -657,50 +808,97 @@ export async function loadCharacter(scene, opts = {}) {
 
       headNode.getWorldPosition(_headPosW);
       headNode.getWorldQuaternion(_headQuatW);
-      // In Three.js right-handed converted space, character faces -Z in local Head space
+      // In Three.js right-handed converted space, character faces -Z, character's left/right X is ±X
       _headFrontW.set(0, 0, -1).applyQuaternion(_headQuatW).normalize();
+      _headRightW.set(1, 0, 0).applyQuaternion(_headQuatW).normalize();
 
       _viewMat3.setFromMatrix4(camera.matrixWorldInverse);
       sharedUniforms.uHeadCenterView.value.copy(_headPosW).applyMatrix4(camera.matrixWorldInverse);
       sharedUniforms.uHeadFrontView.value.copy(_headFrontW).applyMatrix3(_viewMat3).normalize();
+      sharedUniforms.uHeadRightView.value.copy(_headRightW).applyMatrix3(_viewMat3).normalize();
+
+      // VL.Rendering.ActorShadowPass: camera-space Euler(+y, -x, 0) ortho light centered on Head
+      _camMat3.setFromMatrix4(camera.matrixWorld);
+      _shadowDirW.copy(viewDirFromAngles(-(shadowAngles.x ?? 10), shadowAngles.y ?? 3))
+        .applyMatrix3(_camMat3).normalize();
+      _shadowTargetW.copy(_headPosW).addScaledVector(_headFrontW, 0.02);
+      _shadowTargetW.y += 0.06;
+      _shadowEyeW.copy(_shadowTargetW).addScaledVector(_shadowDirW, 0.34);
+      _shadowUpW.set(0, 1, 0).applyMatrix3(_camMat3).normalize();
+      _shadowView.lookAt(_shadowEyeW, _shadowTargetW, _shadowUpW).setPosition(_shadowEyeW).invert();
+      sharedUniforms.uActorShadowMatrix.value.multiplyMatrices(_shadowProj, _shadowView);
 
       // CampusActorFaceCorrection: compute camera azimuth/elevation in Head local frame
       if (faceCorr && faceCorr.indices && faceCorr.curves) {
         camera.getWorldPosition(_camPosW);
         _toCamLocal.copy(_camPosW).sub(_headPosW).applyQuaternion(_headQuatW.clone().invert()).normalize();
-        // Forward is -Z, character left is -X, character right is +X?
-        // Wait: in Unity character faces +Z, LeftArm is at -X, RightArm is at +X;
-        // after conv_v (x, y, -z), character faces -Z, LeftArm is at -X, RightArm is at +X!
         const yawDeg = Math.atan2(_toCamLocal.x, -_toCamLocal.z) * (180 / Math.PI);
         const elevDeg = Math.asin(Math.max(-1, Math.min(1, _toCamLocal.y))) * (180 / Math.PI);
         const absYaw = Math.abs(yawDeg);
         const corr = [
-          [faceCorr.indices[0], evalSimpleCurve(faceCorr.curves[0], elevDeg)], // 84: under045
-          [faceCorr.indices[1], evalSimpleCurve(faceCorr.curves[1], absYaw)],  // 85: side090
-          [faceCorr.indices[2], evalSimpleCurve(faceCorr.curves[2], yawDeg)],  // 86: side045r
-          [faceCorr.indices[3], evalSimpleCurve(faceCorr.curves[3], yawDeg)],  // 87: side045l
+          [faceCorr.indices[0], evalSimpleCurve(faceCorr.curves[0], elevDeg)],
+          [faceCorr.indices[1], evalSimpleCurve(faceCorr.curves[1], absYaw)],
+          [faceCorr.indices[2], evalSimpleCurve(faceCorr.curves[2], yawDeg)],
+          [faceCorr.indices[3], evalSimpleCurve(faceCorr.curves[3], yawDeg)],
         ];
         syncMorphTargets(corr);
       }
     },
-    /** Apply VLActorParameter overrides from 3D stage volume if present. */
-    applyActorVolume(ap) {
-      if (!ap) return;
+    /** Render hair caster into _ActorShadowmapTexture before main render pass. */
+    renderShadow(renderer) {
+      if (!renderer || !shadowCasters.length || !root.visible) return;
+      for (const [srcMesh, dstMesh] of shadowCasters) {
+        dstMesh.matrixWorld.copy(srcMesh.matrixWorld);
+        dstMesh.matrix.copy(srcMesh.matrixWorld);
+      }
+      const prevTarget = renderer.getRenderTarget();
+      const prevAlpha = renderer.getClearAlpha();
+      renderer.getClearColor(_prevClearColor);
+      renderer.setRenderTarget(actorShadowRT);
+      renderer.setClearColor(0xffffff, 1.0); // packDepthToRGBA(1.0) -> far depth = unoccluded!
+      renderer.clear(true, true, false);
+      renderer.render(shadowScene, shadowCamera);
+      renderer.setRenderTarget(prevTarget);
+      renderer.setClearColor(_prevClearColor, prevAlpha);
+      sharedUniforms.uActorShadowMap.value = actorShadowRT.texture;
+    },
+    /** Apply VLActorParameter & VLActorShadow overrides from 3D stage or 2D bg volume. */
+    applyActorVolume(volOrParam) {
+      if (!volOrParam) return;
+      const ap = volOrParam.actorParam || volOrParam;
+      const as = volOrParam.actorShadow || null;
       if (ap.mainLightAngle) {
         sharedUniforms.uLightDirView.value.copy(
-          viewDirFromAngles(ap.mainLightAngle.x ?? -10, ap.mainLightAngle.y ?? 28),
+          viewDirFromAngles(ap.mainLightAngle.x ?? -10, ap.mainLightAngle.y ?? 30),
+        );
+      }
+      if (ap.rimAngle) {
+        sharedUniforms.uRimDirView.value.copy(
+          viewDirFromAngles(ap.rimAngle.x ?? 10, ap.rimAngle.y ?? 30),
         );
       }
       if (ap.lightColor) {
         sharedUniforms.uLightColor.value.setRGB(ap.lightColor.r, ap.lightColor.g, ap.lightColor.b);
       }
       if (ap.shadeColorMultiply) {
-        // Soften raw linear multiply slightly to account for indirect stage GI bounce
         sharedUniforms.uShadeMultiply.value.setRGB(
-          0.18 + 0.82 * ap.shadeColorMultiply.r,
-          0.18 + 0.82 * ap.shadeColorMultiply.g,
-          0.18 + 0.82 * ap.shadeColorMultiply.b,
+          0.14 + 0.86 * ap.shadeColorMultiply.r,
+          0.14 + 0.86 * ap.shadeColorMultiply.g,
+          0.14 + 0.86 * ap.shadeColorMultiply.b,
         );
+      }
+      if (typeof ap.rimPower === 'number') sharedUniforms.uRimPower.value = ap.rimPower;
+      if (typeof ap.rimBaseColorRatio === 'number') sharedUniforms.uRimBaseRatio.value = ap.rimBaseColorRatio;
+      if (ap.rimColor) {
+        sharedUniforms.uRimIntensity.value = Math.max(ap.rimColor.r ?? 0.5, ap.rimColor.g ?? 0.5, ap.rimColor.b ?? 0.5);
+      }
+      if (as) {
+        if (as.lightDirectional) {
+          shadowAngles = { x: as.lightDirectional.x ?? 10, y: as.lightDirectional.y ?? 3 };
+        }
+        if (typeof as.shadowStrength === 'number') {
+          sharedUniforms.uShadowStrength.value = as.shadowStrength;
+        }
       }
     },
     reset() { solver.resetPose(); },

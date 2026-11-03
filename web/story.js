@@ -306,50 +306,160 @@ function shakeAt(st, t) {
   return null;
 }
 
-function mixLook(a, b, u) {
-  const L = (k, d = 0) => ((a && a[k]) ?? d) * (1 - u) + ((b && b[k]) ?? d) * u;
+const DEFAULT_LOOK_TARGET = {
+  type: 0, actorId: '', bones: 10, azimuth: 0, elevation: 0,
+  weight: 0, eyesWeight: 0.3, headWeight: 0.6, bodyWeight: 0.1,
+};
+
+const _lookActPosW = new THREE.Vector3();
+const _lookActQuatW = new THREE.Quaternion();
+const _lookActQuatInv = new THREE.Quaternion();
+const _lookTargetA = new THREE.Vector3();
+const _lookTargetB = new THREE.Vector3();
+const _lookBonePosW = new THREE.Vector3();
+const _lookBoneQuatW = new THREE.Quaternion();
+const _lookParentQuatW = new THREE.Quaternion();
+const _lookDesLocal = new THREE.Vector3();
+const _lookCurLocal = new THREE.Vector3();
+const _lookDeltaQuat = new THREE.Quaternion();
+const _lookRotActor = new THREE.Quaternion();
+const _lookRotWorld = new THREE.Quaternion();
+const _lookEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+
+function resolveLookTargetPos(out, target) {
+  const D2R = Math.PI / 180;
+  const tp = target || DEFAULT_LOOK_TARGET;
+  if (tp.type === 1) {
+    camera.getWorldPosition(out);
+    return out;
+  }
+  const az = (tp.azimuth ?? 0) * D2R;
+  const el = (tp.elevation ?? 0) * D2R;
+  const ce = Math.cos(el);
+  out.set(Math.sin(az) * ce, -Math.sin(el), -Math.cos(az) * ce)
+    .applyQuaternion(_lookActQuatW)
+    .multiplyScalar(10)
+    .add(_lookActPosW);
+  out.y += 1.38 * actorGroup.scale.y;
+  return out;
+}
+
+function evalLookState(st, t) {
+  if (!st.looks || !st.looks.length) return null;
+  let activeCue = null;
+  for (const l of st.looks) {
+    if (t < l.start) break;
+    activeCue = l;
+  }
+  if (!activeCue) return null;
+
+  if (activeCue.kind === 'instant') {
+    const tgt = activeCue.target || DEFAULT_LOOK_TARGET;
+    const w = Math.max(0, Math.min(1, tgt.weight ?? 0));
+    if (w <= 1e-4) return null;
+    return {
+      posW: resolveLookTargetPos(_lookTargetA, tgt),
+      headW: w * (tgt.headWeight ?? 0.6),
+      bodyW: w * (tgt.bodyWeight ?? 0.1),
+      eyesW: w * (tgt.eyesWeight ?? 0.3),
+    };
+  }
+
+  const from = activeCue.from || DEFAULT_LOOK_TARGET;
+  const to = activeCue.to || DEFAULT_LOOK_TARGET;
+  const u = activeCue.dur > 0 ? Math.min(1, Math.max(0, (t - activeCue.start) / activeCue.dur)) : 1;
+  const w0 = Math.max(0, Math.min(1, from.weight ?? 0));
+  const w1 = Math.max(0, Math.min(1, to.weight ?? 0));
+
+  // Matches Campus.ADV.ActorLookTargetMixerPlayable$$SetLookAt:
+  // When tweening weight (0->1 or 1->0), keep the higher-weight endpoint's target position
+  // fixed and ramp weights (bodyWeight uses Easing.InCirc).
+  if (Math.abs(w0 - w1) > 1e-4) {
+    const w = w0 + (w1 - w0) * u;
+    if (w <= 1e-4) return null;
+    const dom = w0 < w1 ? to : from;
+    const inCirc = 1 - Math.sqrt(Math.max(0, 1 - w * w));
+    return {
+      posW: resolveLookTargetPos(_lookTargetA, dom),
+      headW: w * (dom.headWeight ?? 0.6),
+      bodyW: inCirc * (dom.bodyWeight ?? 0.1),
+      eyesW: w * (dom.eyesWeight ?? 0.3),
+    };
+  }
+
+  if (w1 <= 1e-4) return null;
+  resolveLookTargetPos(_lookTargetA, from);
+  resolveLookTargetPos(_lookTargetB, to);
+  _lookTargetA.lerp(_lookTargetB, u);
   return {
-    azimuth: L('azimuth'), elevation: L('elevation'), weight: L('weight'),
-    headWeight: L('headWeight', 1), bodyWeight: L('bodyWeight'),
+    posW: _lookTargetA,
+    headW: w1 * (to.headWeight ?? 0.6),
+    bodyW: w1 * (to.bodyWeight ?? 0.1),
+    eyesW: w1 * (to.eyesWeight ?? 0.3),
   };
 }
 
-function lookAtTime(st, t) {
-  let cur = null;
-  for (const l of st.looks) {
-    if (t < l.start) break;
-    const u = l.dur > 0 ? Math.min(1, (t - l.start) / l.dur) : 1;
-    const from = l.from || cur;
-    cur = from ? mixLook(from, l.to, u) : (l.to || null);
-  }
-  return cur;
-}
-
-function rotateBoneWorld(bone, yaw, pitch) {
+function aimBoneAtTarget(solver, bname, targetPosW, weight, maxYawDeg, maxPitchDeg) {
+  if (weight <= 1e-4) return;
+  const bone = solver.nameToNode[bname];
+  if (!bone || !bone.parent) return;
+  const D2R = Math.PI / 180;
   bone.updateWorldMatrix(true, false);
-  const pw = new THREE.Quaternion();
-  bone.parent.getWorldQuaternion(pw);
-  const w = new THREE.Quaternion().setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
-  bone.quaternion.premultiply(pw.clone().invert().multiply(w).multiply(pw));
+  bone.getWorldPosition(_lookBonePosW);
+  bone.getWorldQuaternion(_lookBoneQuatW);
+
+  _lookDesLocal.copy(targetPosW).sub(_lookBonePosW).applyQuaternion(_lookActQuatInv);
+  if (_lookDesLocal.lengthSq() < 1e-8) return;
+  _lookDesLocal.normalize();
+
+  const bindQ = solver.bindQuat3[bname];
+  _lookDeltaQuat.copy(_lookActQuatInv).multiply(_lookBoneQuatW);
+  if (bindQ) _lookDeltaQuat.multiply(_lookParentQuatW.copy(bindQ).invert());
+  _lookCurLocal.set(0, 0, -1).applyQuaternion(_lookDeltaQuat).normalize();
+
+  const desYaw = Math.atan2(-_lookDesLocal.x, -_lookDesLocal.z);
+  const curYaw = Math.atan2(-_lookCurLocal.x, -_lookCurLocal.z);
+  let dYaw = desYaw - curYaw;
+  while (dYaw > Math.PI) dYaw -= Math.PI * 2;
+  while (dYaw < -Math.PI) dYaw += Math.PI * 2;
+
+  const desPitch = Math.asin(Math.max(-1, Math.min(1, _lookDesLocal.y)));
+  const curPitch = Math.asin(Math.max(-1, Math.min(1, _lookCurLocal.y)));
+  const maxYaw = maxYawDeg * D2R;
+  const maxPitch = maxPitchDeg * D2R;
+  const yaw = Math.max(-maxYaw, Math.min(maxYaw, dYaw)) * weight;
+  const pitch = Math.max(-maxPitch, Math.min(maxPitch, desPitch - curPitch)) * weight;
+
+  _lookEuler.set(pitch, yaw, 0, 'YXZ');
+  _lookRotActor.setFromEuler(_lookEuler);
+  _lookRotWorld.copy(_lookActQuatW).multiply(_lookRotActor).multiply(_lookActQuatInv);
+
+  bone.parent.getWorldQuaternion(_lookParentQuatW);
+  _lookDeltaQuat.copy(_lookParentQuatW).invert().multiply(_lookRotWorld).multiply(_lookParentQuatW);
+  bone.quaternion.premultiply(_lookDeltaQuat);
   bone.updateMatrixWorld(true);
 }
 
 function applyLookTarget(char, st, t) {
-  const l = lookAtTime(st, t);
-  if (!char || !l || !(l.weight > 0.001)) return;
-  const head = char.solver.nameToNode.Head;
-  if (!head) return;
-  const D2R = Math.PI / 180;
-  const hw = l.headWeight * l.weight;
-  const pitch = l.elevation * D2R * hw;
-  const yaw = -l.azimuth * D2R * hw;
-  const chest = char.solver.nameToNode.Chest
-    || char.solver.nameToNode.Spine2 || char.solver.nameToNode.Spine1;
-  if (chest && l.bodyWeight > 0) {
-    const bw = l.bodyWeight * l.weight;
-    rotateBoneWorld(chest, -l.azimuth * D2R * bw, l.elevation * D2R * bw);
-  }
-  rotateBoneWorld(head, yaw, pitch);
+  if (!char || !st.actorVisible) return;
+  const { solver } = char;
+  if (!solver.nameToNode.Head) return;
+
+  actorGroup.updateMatrixWorld(true);
+  actorGroup.getWorldPosition(_lookActPosW);
+  actorGroup.getWorldQuaternion(_lookActQuatW);
+  _lookActQuatInv.copy(_lookActQuatW).invert();
+
+  const lk = evalLookState(st, t);
+  if (!lk) return;
+
+  const chestName = solver.nameToNode.Chest ? 'Chest'
+    : (solver.nameToNode.Spine2 ? 'Spine2' : 'Spine1');
+  aimBoneAtTarget(solver, chestName, lk.posW, lk.bodyW, 30, 20);
+  aimBoneAtTarget(solver, 'Head', lk.posW, lk.headW, 50, 35);
+  // Eye bone pivot sits behind the cornea; clamp to realistic ocular excursion
+  aimBoneAtTarget(solver, 'LeftEye', lk.posW, lk.eyesW, 8, 5);
+  aimBoneAtTarget(solver, 'RightEye', lk.posW, lk.eyesW, 8, 5);
 }
 
 function hash01(n) {
@@ -388,7 +498,9 @@ function blendRoot(ra, rb, w) {
     rootQ: nlerpQuat(ra.rootQ, rb.rootQ, w),
     lfT: lerpArr(ra.lfT, rb.lfT, w),
     rfT: lerpArr(ra.rfT, rb.rfT, w),
+    lhT: lerpArr(ra.lhT, rb.lhT, w),
     lhQ: nlerpQuat(ra.lhQ, rb.lhQ, w),
+    rhT: lerpArr(ra.rhT, rb.rhT, w),
     rhQ: nlerpQuat(ra.rhQ, rb.rhQ, w),
   };
 }
@@ -432,10 +544,11 @@ class Player {
 
   stateAt(t) {
     const st = {
-      bgActive: this.defaultBg, bgSet: new Map(), camera: null,
+      bgActive: this.defaultBg, bgSet: new Map(), camera: null, dof: null,
       layout: null, actorVisible: true,
       motion: null, prevMotion: null, facial: null, prevFacial: null,
       overrides: [], additive: [], shakes: [], looks: [], transitions: [],
+      activeVoice: null, actorVoice: null, lineVoice: null,
       message: null, fade: { from: 0, to: 0, t: 0, dur: 0, color: '#000000' },
     };
     for (const c of this.timeline.cues) {
@@ -454,33 +567,81 @@ class Player {
         }
         case 'camerasetting':
           st.camera = p.setting;
+          st.dof = (p.setting && p.setting.dofSetting) || null;
           break;
+        case 'cameratween': {
+          const from = p.from || st.camera;
+          const to = p.to || from;
+          if (from && to) {
+            let u = c.dur > 0 ? Math.min(1, Math.max(0, (t - c.t) / c.dur)) : 1;
+            if (p.ease === 'OutQuad') u = 1 - (1 - u) * (1 - u);
+            const lv3 = (a, b) => ({ x: lerp(a.x, b.x, u), y: lerp(a.y, b.y, u), z: lerp(a.z, b.z, u) });
+            st.camera = {
+              ...to,
+              focalLength: lerp(from.focalLength ?? 30, to.focalLength ?? 30, u),
+              transform: (from.transform && to.transform) ? {
+                position: lv3(from.transform.position, to.transform.position),
+                rotation: lv3(from.transform.rotation, to.transform.rotation),
+                scale: to.transform.scale || { x: 1, y: 1, z: 1 },
+              } : (to.transform || from.transform),
+            };
+            if (to.dofSetting) st.dof = to.dofSetting;
+          }
+          break;
+        }
+        case 'dof': {
+          const s = p.setting || {};
+          const val = (k, fb) => (s[k] && typeof s[k] === 'object' && 'm_Value' in s[k]) ? s[k].m_Value : (s[k] ?? fb);
+          st.dof = {
+            active: true,
+            focalPoint: Number(val('focalPoint', 2.0)),
+            fNumber: Number(val('fNumber', 2.8)),
+            maxBlurSpread: Number(val('maxBlurSpread', 2.0)),
+            foregroundBlurExtrude: Number(val('foregroundBlurExtrude', 1.15)),
+            focalSize: Number(val('focalSize', 1.0)),
+          };
+          break;
+        }
         case 'actorlayoutgroup': {
           const layouts = (c.all.layouts || []).flat();
           const mine = layouts.find((l) => !l.params.id || l.params.id === ACTOR_ID);
           if (mine) {
             st.actorVisible = true;
             if (mine.params.transform) st.layout = mine.params.transform;
-          } else if (layouts.length > 0) {
+          } else {
             st.actorVisible = false;
           }
           break;
         }
         case 'actormotion': {
           if (p.id && p.id !== ACTOR_ID) break;
+          const tr = Number(p.transition ?? 0);
           st.prevMotion = st.motion;
           st.motion = {
             name: p.motion, variant: 'b', start: c.t, clipIn: c.clipIn,
-            transition: Number(p.transition ?? 0),
+            transition: tr,
           };
+          // Campus.ADV.ActorMotionCommand$$BindParameter also binds the embedded _f facial clip
+          // (with DefaultFacialTransitionTime = 0.22s when transition > 0) unless overridden at c.t.
+          if (this.clipOf(p.motion, 'f')
+              && !(st.facial && st.facial.explicit && Math.abs(st.facial.start - c.t) < 1e-4)) {
+            const ftr = p.facialTransition !== undefined ? Number(p.facialTransition) : (tr > 0 ? 0.22 : 0);
+            st.prevFacial = st.facial;
+            st.facial = {
+              name: p.motion, variant: 'f', start: c.t, clipIn: c.clipIn,
+              transition: ftr, explicit: false,
+            };
+          }
           break;
         }
         case 'actorfacialmotion': {
           if (p.id && p.id !== ACTOR_ID) break;
-          st.prevFacial = st.facial;
+          if (!(st.facial && !st.facial.explicit && Math.abs(st.facial.start - c.t) < 1e-4)) {
+            st.prevFacial = st.facial;
+          }
           st.facial = {
             name: p.motion, variant: 'f', start: c.t, clipIn: c.clipIn,
-            transition: Number(p.transition ?? 0),
+            transition: Number(p.transition ?? 0), explicit: true,
           };
           break;
         }
@@ -508,15 +669,47 @@ class Player {
         case 'shake':
           st.shakes.push({ start: c.t, dur: c.dur, setting: p.setting || {} });
           break;
+        case 'actorlooktarget': {
+          if (p.id && p.id !== ACTOR_ID) break;
+          const target = p.target || DEFAULT_LOOK_TARGET;
+          st.looks.push({ kind: 'instant', start: c.t, dur: 0, target, endTarget: target });
+          break;
+        }
         case 'actorlooktargettween': {
           if (p.id && p.id !== ACTOR_ID) break;
-          const prev = st.looks.length ? st.looks[st.looks.length - 1].to : null;
-          st.looks.push({ start: c.t, dur: c.dur || 0.01, from: p.from || prev, to: p.to || null });
+          const prev = st.looks.length ? st.looks[st.looks.length - 1].endTarget : null;
+          const from = p.from || prev || DEFAULT_LOOK_TARGET;
+          const to = p.to || DEFAULT_LOOK_TARGET;
+          st.looks.push({ kind: 'tween', start: c.t, dur: c.dur || 0.01, from, to, endTarget: to });
+          break;
+        }
+        case 'voice': {
+          const cueName = p.voice;
+          if (!cueName) break;
+          const metaDur = (lipsyncDb && lipsyncDb.cues && lipsyncDb.cues[cueName]?.duration) || 0;
+          const dur = Math.max(c.dur || 0, metaDur);
+          const isMine = p.actorId ? p.actorId === ACTOR_ID : String(cueName).includes(`_${ACTOR_ID}-`);
+          const vObj = {
+            voice: cueName,
+            actorId: p.actorId || '',
+            isMine,
+            start: c.t,
+            dur,
+            clipIn: c.clipIn || 0,
+            volume: Number(p.volume ?? 1),
+          };
+          st.lineVoice = vObj;
+          if (t < c.t + dur + 0.35) {
+            st.activeVoice = vObj;
+          }
+          if (isMine && t < c.t + dur + 0.15) {
+            st.actorVoice = vObj;
+          }
           break;
         }
         case 'message':
           if (t < c.t + c.dur) {
-            st.message = { text: p.text, name: p.name, hide: p.hide, start: c.t, narration: false };
+            st.message = { text: p.text, name: p.name, hide: p.hide, start: c.t, dur: c.dur, narration: false };
           }
           break;
         case 'narration':
@@ -544,8 +737,13 @@ class Player {
 
   clipOf(name, variant) {
     if (!name) return null;
-    return (variant && this.clips.get(`${name}_${variant}`))
-      || this.clips.get(name)
+    if (variant === 'f') {
+      return this.clips.get(`${name}_f`) || (name.endsWith('_f') ? this.clips.get(name) : null) || null;
+    }
+    if (variant === 'b') {
+      return this.clips.get(`${name}_b`) || (!name.endsWith('_f') ? this.clips.get(name) : null) || null;
+    }
+    return this.clips.get(name)
       || this.clips.get(`${name}_b`)
       || this.clips.get(`${name}_f`)
       || null;
@@ -591,14 +789,38 @@ class Player {
         muscles[i] = pv * (1 - w) + cv * w;
       }
       root = (pe && w < 1) ? blendRoot(pe.root, ce.root, w) : ce.root;
-      bones.push(...ce.bones);
-
-      // Subtle alive breathing from stand-001_lp delta after a non-looping gesture settles
-      if (base && this.baseRef0 && curM.elapsed > curM.clip.duration) {
-        const settle = Math.min(1, (curM.elapsed - curM.clip.duration) / 0.6) * 0.45;
-        for (let i = 0; i < 95; i++) {
-          muscles[i] += (base.muscles[i] - this.baseRef0.muscles[i]) * settle;
+      if (pe && w < 1 && pe.bones && pe.bones.length) {
+        const pMap = new Map();
+        for (const b of pe.bones) pMap.set(`${b.node}:${b.prop}`, b.value);
+        const seen = new Set();
+        for (const b of ce.bones) {
+          const key = `${b.node}:${b.prop}`;
+          seen.add(key);
+          const pv = pMap.get(key);
+          if (!pv) {
+            bones.push(b);
+          } else {
+            bones.push({
+              node: b.node,
+              prop: b.prop,
+              value: b.prop === 'rotation' ? nlerpQuat(pv, b.value, w) : lerpArr(pv, b.value, w),
+            });
+          }
         }
+        for (const b of pe.bones) {
+          if (!seen.has(`${b.node}:${b.prop}`)) bones.push(b);
+        }
+      } else {
+        bones.push(...ce.bones);
+      }
+
+      // Gentle chest-only breathing (~0.4 deg sagittal inhalation) after a non-looping clip settles;
+      // never inject stand-001_lp leg/hip/head fidget deltas onto a settled pose.
+      if (curM.elapsed > curM.clip.duration) {
+        const settle = Math.min(1, (curM.elapsed - curM.clip.duration) / 0.8);
+        const breath = Math.sin((t - st.motion.start) * 1.75) * 0.010 * settle;
+        muscles[3] += breath;
+        muscles[6] += breath;
       }
     } else if (base) {
       muscles.set(base.muscles);
@@ -668,9 +890,11 @@ class Player {
         morph.set(BLINK_MORPH_INDEX, Math.max(morph.get(BLINK_MORPH_INDEX) || 0, closed));
       }
     }
+    // ---------- Voice-driven 60Hz AIUEO lip-sync ----------
+    const vowels = evalLipSync(t, st, this.hasVoices);
+    if (vowels) applyLipSyncToMorph(morph, vowels);
 
     this.char.setMorph(morph);
-
     const L = st.layout;
     if (L) {
       actorGroup.position.set(L.position.x, L.position.y, -L.position.z);
@@ -689,47 +913,500 @@ const fadeEl = document.getElementById('fade');
 const statusEl = document.getElementById('status');
 const seekEl = document.getElementById('seek');
 const timeEl = document.getElementById('time');
-
+const voiceBtn = document.getElementById('voice');
+const volEl = document.getElementById('vol');
+const voiceReplayBtn = document.getElementById('voice-replay');
 const bgEl = document.getElementById('bg2d');
 const bgImages = new Map();
+const bgTextures = new Map();
+const _bgUvMat = new THREE.Matrix3();
 
+// ---------- Voice Audio & 60Hz AIUEO Formant Lip-Sync ----------
+let lipsyncDb = { fps: 60, cues: {} };
+const CLOSED_EXPR_MOUTHS = [42, 45, 46, 54, 71, 74, 75];
+
+function kanaVowelVec(ch) {
+  if (!ch || /[、。！？…・\s「」（）『』]/.test(ch)) return [0, 0, 0, 0, 0];
+  const code = ch.charCodeAt(0);
+  // Hiragana / Katakana vowel column estimation + kanji hash fallback
+  if ((code >= 0x3041 && code <= 0x3096) || (code >= 0x30A1 && code <= 0x30F6)) {
+    const h = code >= 0x30A1 ? code - 0x60 : code;
+    if (h === 0x3093 || h === 0x3063) return [0, 0, 0.15, 0, 0]; // ん / っ
+    const aCols = 'あかさたなはまやらわがざだばぱぁゃゎ';
+    const iCols = 'いきしちにひみりぎじぢびぴぃ';
+    const uCols = 'うくすつぬふむゆるぐずづぶぷぅゅ';
+    const eCols = 'えけせてねへめれげぜでべぺぇ';
+    const oCols = 'おこそとのほもよろをごぞどぼぽぉょ';
+    const hc = String.fromCharCode(h);
+    if (aCols.includes(hc)) return [0.85, 0, 0, 0.1, 0];
+    if (iCols.includes(hc)) return [0, 0.85, 0, 0.15, 0];
+    if (uCols.includes(hc)) return [0, 0, 0.85, 0, 0.15];
+    if (eCols.includes(hc)) return [0.15, 0.15, 0, 0.75, 0];
+    if (oCols.includes(hc)) return [0.1, 0, 0.15, 0, 0.80];
+  }
+  const pick = Math.floor(hash01(code) * 5);
+  const out = [0.08, 0.08, 0.08, 0.08, 0.08];
+  out[pick] = 0.68;
+  return out;
+}
+
+function evalTextFallbackLipSync(text, elapsed, totalDur) {
+  const clean = stripRuby(text || '').replace(/\s+/g, '');
+  if (!clean || /^[\s…・。、！？?]+$/.test(clean)) return null;
+  const speakDur = Math.min(totalDur * 0.9, Math.max(0.4, clean.length * 0.11));
+  if (elapsed < 0 || elapsed > speakDur) return null;
+  const pos = (elapsed / speakDur) * clean.length;
+  const idx = Math.min(clean.length - 1, Math.floor(pos));
+  const frac = pos - idx;
+  const pulse = Math.sin(Math.PI * Math.min(1, frac * 1.15));
+  const v = kanaVowelVec(clean[idx]);
+  return v.map((x) => x * pulse * 0.85);
+}
+
+function sampleLipSyncEntry(voiceName, lt, dur, msgText) {
+  if (lt < 0 || (dur > 0 && lt > dur + 0.03)) return null;
+  const entry = lipsyncDb && lipsyncDb.cues && lipsyncDb.cues[voiceName];
+  if (entry && entry.frames && entry.frames.length > 0) {
+    const fps = entry.fps || lipsyncDb.fps || 60;
+    const clipDur = dur > 0 ? dur : (entry.duration || entry.frames.length / fps);
+    const f = lt * fps;
+    const i0 = Math.max(0, Math.min(entry.frames.length - 1, Math.floor(f)));
+    const i1 = Math.min(entry.frames.length - 1, i0 + 1);
+    const u = Math.max(0, Math.min(1, f - i0));
+    const a0 = entry.frames[i0];
+    const a1 = entry.frames[i1];
+    const tail = clipDur > 0.08 ? Math.min(1, Math.max(0, (clipDur + 0.02 - lt) / 0.06)) : 1;
+    return [
+      ((a0[0] * (1 - u) + a1[0] * u) / 100) * tail,
+      ((a0[1] * (1 - u) + a1[1] * u) / 100) * tail,
+      ((a0[2] * (1 - u) + a1[2] * u) / 100) * tail,
+      ((a0[3] * (1 - u) + a1[3] * u) / 100) * tail,
+      ((a0[4] * (1 - u) + a1[4] * u) / 100) * tail,
+    ];
+  }
+  if (msgText) return evalTextFallbackLipSync(msgText, lt, dur || 2.5);
+  return null;
+}
+
+function evalLipSync(t, st, hasScriptVoices) {
+  const mv = voiceCtrl && voiceCtrl.getManualActorPlayback();
+  if (mv) {
+    return sampleLipSyncEntry(mv.voice, mv.currentTime, mv.dur, st.message?.text);
+  }
+  const av = st.actorVoice;
+  if (av) {
+    // Lock lip-sync directly to hardware audio playback clock when actively speaking
+    const liveAudioT = (voiceCtrl && voiceCtrl.currentCue === av.voice && voiceCtrl.isSpeaking())
+      ? voiceCtrl.audio.currentTime
+      : ((t - av.start) + (av.clipIn || 0));
+    return sampleLipSyncEntry(av.voice, liveAudioT, av.dur, st.message?.text);
+  }
+  if (!hasScriptVoices && st.message && st.message.name === '麻央' && !st.message.hide) {
+    return evalTextFallbackLipSync(st.message.text, t - st.message.start, st.message.dur || 2.5);
+  }
+  return null;
+}
+
+function applyLipSyncToMorph(morph, vowels) {
+  const [va, vi, vu, ve, vo] = vowels;
+  const openTotal = Math.min(1, va + vi + vu + ve + vo);
+  if (openTotal <= 0.004) return;
+
+  // Determine smiling vs serious/worried mood from active base expression morphs
+  const smile = Math.min(1, Math.max(0, (morph.get(71) || 0) + (morph.get(42) || 0) + (morph.get(75) || 0)));
+  const serious = 1 - smile;
+
+  // Unseal closed-mouth expression morphs proportionally so lips open cleanly and return smoothly on pauses
+  const closedKeep = 1 - Math.min(0.88, openTotal * 0.85);
+  for (const idx of CLOSED_EXPR_MOUTHS) {
+    if (morph.has(idx)) morph.set(idx, morph.get(idx) * closedKeep);
+  }
+
+  const addM = (idx, val) => {
+    if (val > 0.001) morph.set(idx, Math.min(1, (morph.get(idx) || 0) + val));
+  };
+  if (smile > 0.01) {
+    addM(64, va * smile * 0.86);                       // A (あ): warm D-shaped open smile
+    addM(44, (vi + ve * 0.30) * smile * 0.78);         // I (い): smiling horizontal open
+    addM(47, vu * smile * 0.68);                       // U (う): small rounded oval
+    addM(72, ve * smile * 0.66);                       // E (え): medium D-shaped open
+    addM(49, vo * smile * 0.74);                       // O (お): rounded medium open
+  }
+  if (serious > 0.01) {
+    addM(72, va * serious * 0.60);                     // A (あ): neutral medium open
+    addM(53, (vi * 0.68 + ve * 0.42) * serious);       // I/E (い/え): neutral horizontal open
+    addM(47, vu * serious * 0.64);                     // U (う): small rounded
+    addM(48, (vo * 0.72 + va * 0.18 + ve * 0.28) * serious); // O (お): neutral oval
+  }
+}
+
+const VOICE_ASSET_VER = 'hca3';
+
+class VoiceController {
+  constructor() {
+    this.audio = new Audio();
+    this.audio.preload = 'auto';
+    this.blobUrls = new Map();
+    this.muted = params.get('mute') === '1';
+    this.userVolume = Math.max(0, Math.min(1, Number(params.get('vol') ?? 1)));
+    if (volEl) volEl.value = String(Math.round(this.userVolume * 100));
+    this.autoplayBlocked = false;
+    this.currentCue = null;
+    this.manualCue = null;
+    this._pendingPlay = null;
+    this._btnStateKey = '';
+    this.audio.addEventListener('ended', () => {
+      this.manualCue = null;
+      this._updateBtn();
+    });
+    this.audio.addEventListener('pause', () => this._updateBtn());
+    this.audio.addEventListener('play', () => this._updateBtn());
+    this._updateBtn();
+  }
+
+  resolveUrl(cueName) {
+    return this.blobUrls.get(cueName) || `./assets/voices/${cueName}.mp3?v=${VOICE_ASSET_VER}`;
+  }
+
+  async preloadCues(cueNames) {
+    for (const vc of cueNames) {
+      if (this.blobUrls.has(vc)) continue;
+      try {
+        const res = await fetch(`./assets/voices/${vc}.mp3?v=${VOICE_ASSET_VER}`);
+        if (res.ok) {
+          const blob = await res.blob();
+          this.blobUrls.set(vc, URL.createObjectURL(blob));
+        }
+      } catch { /* ignore */ }
+    }
+  }
+
+  isSpeaking() {
+    return !this.audio.paused && !this.audio.ended && !this.muted && this.userVolume > 0;
+  }
+
+  _updateBtn() {
+    const speaking = this.isSpeaking();
+    const mode = (this.muted || this.userVolume <= 0)
+      ? 'off'
+      : (this.autoplayBlocked ? 'blocked' : (speaking ? 'playing' : 'on'));
+    const key = `${mode}:${speaking ? 1 : 0}`;
+    if (this._btnStateKey === key) return;
+    this._btnStateKey = key;
+    if (voiceBtn) {
+      voiceBtn.classList.toggle('speaking', speaking);
+      if (mode === 'off') {
+        voiceBtn.textContent = 'voice: off';
+        voiceBtn.classList.remove('warn');
+      } else if (mode === 'blocked') {
+        voiceBtn.textContent = 'voice: tap to unmute';
+        voiceBtn.classList.add('warn');
+      } else {
+        voiceBtn.textContent = speaking ? 'voice: playing' : 'voice: on';
+        voiceBtn.classList.remove('warn');
+      }
+    }
+    if (voiceReplayBtn) {
+      voiceReplayBtn.classList.toggle('playing', speaking);
+    }
+  }
+
+  setVolume(v01) {
+    this.userVolume = Math.max(0, Math.min(1, Number(v01)));
+    if (volEl) volEl.value = String(Math.round(this.userVolume * 100));
+    if (this.userVolume > 0 && this.muted) this.muted = false;
+    this.audio.volume = Math.max(0, Math.min(1, (this._cueVolume ?? 1) * this.userVolume));
+    this._updateBtn();
+  }
+
+  setMuted(v) {
+    this.muted = !!v;
+    if (this.muted) {
+      this.autoplayBlocked = false;
+      this.manualCue = null;
+      if (!this.audio.paused) this.audio.pause();
+    }
+    this._updateBtn();
+  }
+
+  toggleMute() {
+    if (this.autoplayBlocked && !this.muted) {
+      this.unlock();
+      return;
+    }
+    if (!this.muted && this.userVolume <= 0) {
+      this.setVolume(1);
+      return;
+    }
+    this.setMuted(!this.muted);
+  }
+
+  unlock() {
+    if (this.muted) return;
+    const wasBlocked = this.autoplayBlocked;
+    this.autoplayBlocked = false;
+    this._updateBtn();
+    if (wasBlocked && player) {
+      this.sync(time, player.stateAt(time), playing, speed);
+    }
+  }
+
+  replayLine(vObj) {
+    if (!vObj || !vObj.voice) return;
+    if (this.muted) this.muted = false;
+    if (this.userVolume <= 0) this.setVolume(1);
+    this.autoplayBlocked = false;
+    this.manualCue = vObj;
+    this.currentCue = vObj.voice;
+    this._cueVolume = vObj.volume ?? 1;
+    this.audio.volume = Math.max(0, Math.min(1, this._cueVolume * this.userVolume));
+    this.audio.playbackRate = 1;
+    this.audio.src = this.resolveUrl(vObj.voice);
+    try { this.audio.currentTime = vObj.clipIn || 0; } catch { /* wait metadata */ }
+    this._tryPlay();
+  }
+
+  getManualActorPlayback() {
+    if (!this.manualCue || !this.manualCue.isMine) return null;
+    if (this.audio.paused || this.audio.ended) {
+      if (this.audio.ended) this.manualCue = null;
+      return null;
+    }
+    return {
+      voice: this.manualCue.voice,
+      currentTime: this.audio.currentTime || 0,
+      dur: this.manualCue.dur || this.audio.duration || 0,
+    };
+  }
+
+  sync(t, st, isPlaying, playbackSpeed) {
+    if (isPlaying && this.manualCue) {
+      this.manualCue = null;
+    }
+    if (!isPlaying && this.manualCue) {
+      this._updateBtn();
+      return;
+    }
+
+    const v = st && st.activeVoice;
+    if (!v || !isPlaying || this.muted || this.userVolume <= 0) {
+      if (!this.audio.paused) this.audio.pause();
+      if (!v) this.currentCue = null;
+      this._updateBtn();
+      return;
+    }
+    const wantTime = Math.max(0, (t - v.start) + (v.clipIn || 0));
+    const rate = Math.max(0.25, Math.min(4, playbackSpeed || 1));
+    if (this.audio.playbackRate !== rate) this.audio.playbackRate = rate;
+    this._cueVolume = v.volume ?? 1;
+    const vol = Math.max(0, Math.min(1, this._cueVolume * this.userVolume));
+    if (Math.abs(this.audio.volume - vol) > 0.01) this.audio.volume = vol;
+
+    if (this.currentCue !== v.voice) {
+      // Do not start a cue that has already finished on the timeline
+      if (wantTime >= v.dur - 0.05) {
+        this._updateBtn();
+        return;
+      }
+      this.currentCue = v.voice;
+      this.audio.src = this.resolveUrl(v.voice);
+      const seekAndPlay = () => {
+        if (this.currentCue !== v.voice) return;
+        const liveWant = Math.max(0, (time - v.start) + (v.clipIn || 0));
+        try {
+          if (liveWant > 0.05 && (!Number.isFinite(this.audio.duration) || liveWant < this.audio.duration - 0.05)) {
+            this.audio.currentTime = liveWant;
+          }
+        } catch { /* metadata still loading */ }
+        if (playing && !this.muted && !this.autoplayBlocked) {
+          this._tryPlay();
+        }
+      };
+      if (this.audio.readyState >= 1) seekAndPlay();
+      else this.audio.addEventListener('loadedmetadata', seekAndPlay, { once: true });
+      return;
+    }
+
+    // Let an already-playing clip finish naturally without premature tail cutoff; only re-seek on large user jumps (>0.45s)
+    if (this.audio.ended) {
+      if (wantTime < v.dur - 0.25) {
+        try { this.audio.currentTime = wantTime; } catch { /* ignore */ }
+        if (!this.autoplayBlocked && !this._pendingPlay) this._tryPlay();
+      }
+      this._updateBtn();
+      return;
+    }
+
+    if (this.audio.readyState >= 3 && Math.abs(this.audio.currentTime - wantTime) > 0.45) {
+      if (wantTime < v.dur - 0.08 && (!Number.isFinite(this.audio.duration) || wantTime < this.audio.duration - 0.05)) {
+        try { this.audio.currentTime = wantTime; } catch { /* ignore */ }
+      }
+    }
+    if (this.audio.paused && wantTime < v.dur - 0.08 && !this.autoplayBlocked && !this._pendingPlay) {
+      this._tryPlay();
+    }
+    this._updateBtn();
+  }
+
+  _tryPlay() {
+    const p = this.audio.play();
+    this._pendingPlay = p;
+    if (p && typeof p.then === 'function') {
+      p.then(() => {
+        this._pendingPlay = null;
+        this.autoplayBlocked = false;
+        this._updateBtn();
+      }).catch((err) => {
+        this._pendingPlay = null;
+        if (err && err.name === 'NotAllowedError') {
+          this.autoplayBlocked = true;
+          this._updateBtn();
+        }
+      });
+    } else {
+      this._pendingPlay = null;
+    }
+  }
+}
+
+const voiceCtrl = new VoiceController();
 function stripRuby(s) {
   return String(s || '').replace(/<r=([^>]*)>([^<]*)<\/r>/g, '$2');
+}
+
+let lastVolumeSrc = null;
+
+function getBgTexture(src, img) {
+  let tex = bgTextures.get(src);
+  if (!tex && img && img.complete && img.naturalWidth > 0) {
+    tex = new THREE.Texture(img);
+    tex.flipY = false;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    tex.needsUpdate = true;
+    bgTextures.set(src, tex);
+  }
+  return tex || null;
 }
 
 function applyBackground(t, st, bgMeta) {
   const src = st.bgActive ? (timeline.backgrounds.get(st.bgActive) || {}).src : null;
   const is3d = !!src && src.startsWith('env_3d');
+  const activeDof = st.dof || (st.camera && st.camera.dofSetting) || null;
+  const camFocalMm = (st.camera && st.camera.focalLength) || 30;
+  if (bloom) bloom.setDof(activeDof, camFocalMm, is3d);
+
   envGroup.visible = is3d;
   scene.background = (is3d && skyTexture) ? skyTexture : null;
-  bgEl.style.display = is3d ? 'none' : 'block';
-  if (is3d || !src) return;
+  if (src && src !== lastVolumeSrc && player && player.char) {
+    lastVolumeSrc = src;
+    if (is3d && envInfo && envInfo.meta && envInfo.meta.volumes) {
+      player.char.applyActorVolume(envInfo.meta.volumes);
+    } else if (!is3d && bgMeta[src] && bgMeta[src].volumes) {
+      player.char.applyActorVolume(bgMeta[src].volumes);
+    }
+  }
+  if (is3d || !src) {
+    bgEl.style.display = 'none';
+    bgEl.style.filter = 'none';
+    bgEl.style.transform = 'none';
+    if (bloom) bloom.setBg2D({ active: false });
+    return;
+  }
+  const meta = bgMeta[src] || {};
   let img = bgImages.get(src);
   if (!img) {
-    const meta = bgMeta[src];
     img = document.createElement('img');
-    if (meta) img.src = './assets/' + meta.texture;
+    if (meta.texture) img.src = './assets/' + meta.texture;
     bgEl.appendChild(img);
     bgImages.set(src, img);
   }
-  for (const [k, other] of bgImages) other.style.display = k === src ? 'block' : 'none';
-  img.style.display = 'block';
+
+  const W = innerWidth, H = innerHeight;
   const setting = st.bgSet.get(st.bgActive) || {};
   const pos = setting.position || { x: 0, y: 0 };
   const scale = setting.scale || { x: 1, y: 1 };
   const angle = setting.angle || 0;
-  const k = innerHeight / 1080;
+  const k = H / 1920;
+  const fit = (W <= H ? meta.verticalSetting : meta.horizontalSetting) || meta.verticalSetting;
+
+  const webglTex = bloom ? getBgTexture(src, img) : null;
+  if (bloom && webglTex && fit && fit.baseSize && fit.clippingRect) {
+    bgEl.style.display = 'none';
+    const base = fit.baseSize;
+    const clip = fit.clippingRect;
+    const s0 = Math.max(W / clip.width, H / clip.height);
+    const imgW = base.x * s0;
+    const imgH = base.y * s0;
+    const cx = (clip.x + clip.width * 0.5) * s0;
+    const cy = (base.y - (clip.y + clip.height * 0.5)) * s0;
+    const tx = (pos.x || 0) * k;
+    const ty = -(pos.y || 0) * k;
+    const sx = Math.abs(scale.x || 1) > 1e-4 ? scale.x : 1;
+    const sy = Math.abs(scale.y || 1) > 1e-4 ? scale.y : 1;
+    const rad = ((angle || 0) * Math.PI) / 180;
+    const ca = Math.cos(rad), sa = Math.sin(rad);
+    const ax = W / sx, ay = H / sy;
+    const bx = (-0.5 * W - tx) / sx, by = (-0.5 * H - ty) / sy;
+    _bgUvMat.set(
+      (ca * ax) / imgW, (-sa * ay) / imgW, (ca * bx - sa * by + cx) / imgW,
+      (sa * ax) / imgH, (ca * ay) / imgH, (sa * bx + ca * by + cy) / imgH,
+      0, 0, 1,
+    );
+    bloom.setBg2D({ active: true, texture: webglTex, uvMatrix: _bgUvMat, srcId: src });
+    return;
+  }
+
+  // Fallback DOM background path (when ?bloom=0 or image still decoding)
+  if (bloom) bloom.setBg2D({ active: false });
+  bgEl.style.display = 'block';
+  for (const [k2, other] of bgImages) other.style.display = k2 === src ? 'block' : 'none';
+  img.style.display = 'block';
+  const dofActive = !!(activeDof && activeDof.active);
+  bgEl.style.filter = dofActive ? `blur(${(5.8 * H / 960).toFixed(1)}px)` : 'none';
+  bgEl.style.transform = 'none';
+  if (fit && fit.baseSize && fit.clippingRect) {
+    const base = fit.baseSize;
+    const clip = fit.clippingRect;
+    const s0 = Math.max(W / clip.width, H / clip.height);
+    const cx = (clip.x + clip.width * 0.5) * s0;
+    const cy = (base.y - (clip.y + clip.height * 0.5)) * s0;
+    img.style.inset = 'auto';
+    img.style.objectFit = 'fill';
+    img.style.width = `${base.x * s0}px`;
+    img.style.height = `${base.y * s0}px`;
+    img.style.left = `${W * 0.5 - cx}px`;
+    img.style.top = `${H * 0.5 - cy}px`;
+    img.style.transformOrigin = `${cx}px ${cy}px`;
+  }
   img.style.transform =
     `translate(${pos.x * k}px, ${-pos.y * k}px) scale(${scale.x}, ${scale.y}) rotate(${-angle}deg)`;
 }
 
+function getLineVoiceForMessage(st) {
+  const m = st && st.message;
+  const lv = st && st.lineVoice;
+  if (!m || !lv || m.narration) return null;
+  return Math.abs(lv.start - m.start) <= 0.6 ? lv : null;
+}
+
 function applyMessage(t, st) {
   const m = st.message;
-  if (!m) { msgEl.style.display = 'none'; return; }
+  if (!m) {
+    msgEl.style.display = 'none';
+    if (voiceReplayBtn) voiceReplayBtn.style.display = 'none';
+    return;
+  }
   msgEl.style.display = 'block';
   const name = m.name === '{user}' ? USER_NAME : (m.name || '');
   nameEl.textContent = name;
   nameEl.style.display = (!name || m.narration) ? 'none' : 'block';
+  if (voiceReplayBtn) {
+    voiceReplayBtn.style.display = getLineVoiceForMessage(st) ? 'flex' : 'none';
+  }
   const clean = stripRuby(m.text);
   const shown = Math.max(0, Math.floor((t - m.start) * CHARS_PER_SEC));
   textEl.textContent = clean.slice(0, shown);
@@ -771,16 +1448,17 @@ let cameraLocked = false;
 
 async function boot() {
   statusEl.textContent = 'loading assets…';
-  const [text, char, bgJson, env] = await Promise.all([
+  const [text, char, bgJson, env, lipJson] = await Promise.all([
     fetch(SCRIPT_URL).then((r) => r.text()),
     loadCharacter(scene),
     fetch('./assets/bg.json').then((r) => r.json()).catch(() => ({})),
     loadEnv().catch((e) => { console.warn('env load failed', e?.stack || e); return null; }),
+    fetch(`./assets/voices/lipsync.json?v=${VOICE_ASSET_VER}`).then((r) => r.json()).catch(() => ({ fps: 60, cues: {} })),
   ]);
-  envInfo = env;
   bgMeta = bgJson;
-  if (env && env.meta && env.meta.volumes && env.meta.volumes.actorParam) {
-    char.applyActorVolume(env.meta.volumes.actorParam);
+  lipsyncDb = lipJson || { fps: 60, cues: {} };
+  if (env && env.meta && env.meta.volumes) {
+    char.applyActorVolume(env.meta.volumes);
   }
   char.root.position.set(0, 0, 0);
   actorGroup.add(char.root);
@@ -788,6 +1466,24 @@ async function boot() {
   const events = parseAdv(text);
   timeline = buildTimeline(events);
   player = new Player(timeline, char);
+  const voiceCueNames = [...new Set(
+    timeline.cues.filter((c) => c.type === 'voice' && c.params.voice).map((c) => c.params.voice),
+  )];
+  player.hasVoices = voiceCueNames.length > 0;
+  const bgLoads = [];
+  for (const bg of timeline.backgrounds.values()) {
+    const src = bg && bg.src;
+    if (!src || src.startsWith('env_3d') || bgImages.has(src)) continue;
+    const meta = bgMeta[src];
+    if (!meta || !meta.texture) continue;
+    const img = document.createElement('img');
+    img.src = './assets/' + meta.texture;
+    img.style.display = 'none';
+    bgEl.appendChild(img);
+    bgImages.set(src, img);
+    if (typeof img.decode === 'function') bgLoads.push(img.decode().catch(() => {}));
+  }
+  await Promise.all(bgLoads);
   const pre = await player.preload();
 
   seekEl.max = String(Math.ceil(timeline.duration * 1000));
@@ -797,9 +1493,12 @@ async function boot() {
 
   window.story = {
     timeline, player, camera, scene, char, THREE,
+    voice: voiceCtrl,
     apply(t) { time = t; frame(); },
     get time() { return time; },
     seek(t) { time = t; playing = false; frame(); },
+    play() { playing = true; voiceCtrl.unlock(); frame(); },
+    pause() { playing = false; frame(); },
     lockCamera(v) { cameraLocked = !!v; },
     render() { frame(); },
     renderer,
@@ -810,6 +1509,8 @@ async function boot() {
   };
   frame();
   requestAnimationFrame(loop);
+  // Preload upcoming voice MP3s into in-memory Blob URLs after initial scene & clip boot completes
+  voiceCtrl.preloadCues(voiceCueNames);
 }
 
 let last = performance.now();
@@ -832,12 +1533,16 @@ function frame() {
   if (sk) { camera.rotateY(sk.yaw); camera.rotateX(sk.pitch); }
   player.applyCharacter(time, st);
   applyLookTarget(player.char, st, time);
+  if (st.actorVisible) {
+    player.char.solver.updatePostRig(time);
+  }
   applyBackground(time, st, bgMeta);
   applyMessage(time, st);
   applyFade(time, st);
-
-  // Update character view-space head normal & CampusActorFaceCorrection profile blendshapes
+  voiceCtrl.sync(time, st, playing, speed);
+  // Update character view-space head uniforms, shadow matrix & CampusActorFaceCorrection
   player.char.update(camera);
+  player.char.renderShadow(renderer);
 
   groundShadow.visible = actorGroup.visible && envGroup.visible;
   if (groundShadow.visible) {
@@ -853,20 +1558,76 @@ function frame() {
 }
 
 // ---------- controls ----------
+let seeking = false;
+let seekWasPlaying = false;
 seekEl?.addEventListener('input', () => {
+  if (!seeking) {
+    seeking = true;
+    seekWasPlaying = playing;
+    playing = false;
+  }
+  voiceCtrl.manualCue = null;
   time = Number(seekEl.value) / 1000;
-  playing = false;
+  frame();
 });
-document.getElementById('play')?.addEventListener('click', () => { playing = !playing; });
-document.getElementById('speed')?.addEventListener('change', (e) => { speed = Number(e.target.value); });
+seekEl?.addEventListener('change', () => {
+  if (seeking) {
+    seeking = false;
+    if (seekWasPlaying) {
+      playing = true;
+      voiceCtrl.unlock();
+    }
+    frame();
+  }
+});
+document.getElementById('play')?.addEventListener('click', () => {
+  playing = !playing;
+  if (playing) voiceCtrl.unlock();
+  else voiceCtrl.manualCue = null;
+  frame();
+});
+voiceBtn?.addEventListener('click', (e) => {
+  e.stopPropagation();
+  voiceCtrl.toggleMute();
+  if (player) voiceCtrl.sync(time, player.stateAt(time), playing, speed);
+});
+volEl?.addEventListener('input', (e) => {
+  voiceCtrl.setVolume(Number(e.target.value) / 100);
+  if (player) voiceCtrl.sync(time, player.stateAt(time), playing, speed);
+});
+voiceReplayBtn?.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (!player) return;
+  const st = player.stateAt(time);
+  const lv = getLineVoiceForMessage(st);
+  if (lv) {
+    if (playing) {
+      time = lv.start;
+      voiceCtrl.currentCue = null;
+      voiceCtrl.unlock();
+      frame();
+    } else {
+      voiceCtrl.replayLine(lv);
+    }
+  }
+});
+document.getElementById('speed')?.addEventListener('change', (e) => {
+  speed = Number(e.target.value);
+  if (player) voiceCtrl.sync(time, player.stateAt(time), playing, speed);
+});
 document.getElementById('next')?.addEventListener('click', () => {
+  voiceCtrl.manualCue = null;
+  voiceCtrl.unlock();
   const nextMsg = timeline.cues.find((c) => (c.type === 'message' || c.type === 'narration') && c.t > time + 0.01);
-  if (nextMsg) { time = nextMsg.t; playing = false; frame(); }
+  if (nextMsg) { time = nextMsg.t; frame(); }
 });
+addEventListener('pointerdown', () => { voiceCtrl.unlock(); }, { passive: true });
 addEventListener('keydown', (e) => {
-  if (e.code === 'Space') { playing = !playing; e.preventDefault(); }
-  if (e.code === 'ArrowRight') { time += 1; frame(); }
-  if (e.code === 'ArrowLeft') { time = Math.max(0, time - 1); frame(); }
+  voiceCtrl.unlock();
+  if (e.code === 'Space') { playing = !playing; e.preventDefault(); frame(); }
+  if (e.code === 'KeyM') { voiceCtrl.toggleMute(); frame(); }
+  if (e.code === 'ArrowRight') { voiceCtrl.manualCue = null; time += 1; frame(); }
+  if (e.code === 'ArrowLeft') { voiceCtrl.manualCue = null; time = Math.max(0, time - 1); frame(); }
 });
 
 boot().catch((e) => {

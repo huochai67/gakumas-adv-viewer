@@ -11,10 +11,10 @@ Octo bundles, decrypted by `pipeline/`) — no game process is started.
 ## Run
 
 ```bash
-cd web && python serve.py     # 127.0.0.1:8777, keep-alive
+bun run serve                 # 127.0.0.1:8777, keep-alive (web/serve.ts)
 ```
 
-`serve.py` answers with HTTP/1.1 keep-alive: the page pulls a few hundred files
+`web/serve.ts` answers with HTTP/1.1 keep-alive: the page pulls a few hundred files
 and a per-request-connection server exhausts the Windows ephemeral port range
 (`ERR_ADDRESS_IN_USE` mid-load).
 
@@ -32,21 +32,26 @@ dialogue line, slider scrubs.
 Order matters; every step reads `cache/bundles/` and writes `web/assets/`.
 
 ```bash
-python pipeline/fetch.py mdl_chr_amao-casl-0000_body env_3d_adv_classroom-00-00-noon ...
-python pipeline/export_char.py     # char.glb + char.json (body/face/hair + skeleton)
-python pipeline/export_clips.py    # clips/*.json for every mot_*.bundle in cache
-python pipeline/export_env.py      # env.glb + env.json (static lightmapped stage)
-python pipeline/export_bg.py       # tex/env_2d_*.png + bg.json (2D backgrounds)
+bun pipeline/fetch.ts mdl_chr_amao-casl-0000_body env_3d_adv_classroom-00-00-noon ...
+bun pipeline/export_char.ts      # char.glb + char.json (body/face/hair + skeleton + swing)
+bun pipeline/export_clips.ts     # clips/*.json for every mot_*.bundle in cache
+bun pipeline/export_env.ts       # env.glb + env.json (static lightmapped stage + decals)
+bun pipeline/export_bg.ts        # tex/env_2d_*.png + bg.json (2D backgrounds)
+bun pipeline/export_voices.ts    # voices/*.mp3 + voices/lipsync.json (CRI HCA + 60Hz AIUEO)
+# or run all exporters at once:
+bun run export:all
 ```
 
 Extra bundles are pulled by name from `cache/OctoManifest.json` (or
-`GAKUMAS_OCTO_MANIFEST`); `fetch.py` resolves the dependency closure. MonoBehaviour
-type trees load from `cache/DummyDll/` (or `GAKUMAS_DUMMY_DLL`).
+`GAKUMAS_OCTO_MANIFEST`); `fetch.ts` resolves the dependency closure. All
+`SerializedFile` v22 objects and `MonoBehaviour`s embed complete `TypeTree`
+blobs directly in the bundles — no `DummyDll`, `UnityPy`, or Python installation
+is required.
 
 ### Asset conventions that are easy to get wrong
 
-* Load **all** bundles in one `UnityPy.load(*files)` with the typetree generator
-  so cross-bundle PPtrs resolve.
+* Load **all** bundles into one `AssetEnvironment` (`loadEnv()` in `pipeline/assets.ts`)
+  so cross-bundle `PPtr`s and `.resS` streams resolve.
 * Unity matrices are row-major: transpose and mirror Z to reach glTF/three
   (`p = (x, y, -z)`, `q = (x, y, -z, -w)`), so a Unity yaw of `t` is a three yaw
   of `-t`, and the character faces `-Z`. Texture `UV0` V is flipped (`1 - v`) on
@@ -106,14 +111,14 @@ correction:
   `_DefMap` specular/rim vs `_ShadeMap.a >= 0.5` smooth skin ramp + nose line),
   plus smoothed-normal outlines from `TANGENT.xyz` and `COLOR_0` 12-bit thickness
   encoding (`(COLOR_0.r * 64 + COLOR_0.g) * (63/64)`).
-* **Face skinning & profile correction**: `export_char.py` decodes
+* **Face skinning & profile correction**: `export_char.ts` decodes
   `VLActorFaceModel.boneWeightAndIndices` across all 7 face bones (`Head`,
   `Eye_L/R`, `EyeHighlight_L/R_a/b`) and exports `CampusActorFaceCorrection`
   morph indices (`[84..87]`), which `char.js` drives each frame from head-to-camera
   angle for clean side profiles.
-* **Mecanim humanoid pose & helper bones**: `export_clips.py` shifts Unity
+* **Mecanim humanoid pose & helper bones**: `export_clips.ts` shifts Unity
   humanoid muscle attributes `42..136 -> 0..94` (fixing cubic `StreamedFrames`
-  evaluation in `unity_anim.py`) and exports `RootT/RootQ` + foot IK tracks.
+  evaluation in `unity_anim.ts`) and exports `RootT/RootQ` + foot/hand IK tracks.
   `pose.js` solves exact Unity `zyRoll` muscle Swing-Twist rotations relative to
   `TPOSE_MUSCLES`, anchors `Hips` height from foot sole `lfT/rfT`, curls/spreads
   fingers in local bone frames, and drives `QuartzDriver` helper twist bones.
@@ -143,5 +148,5 @@ character shading/outlines/stencil bangs, Mecanim humanoid solver, 3D lightmappe
 classroom with emissive lamps, skybox, dynamic props and decals, 2D background
 transitions, camera framing, white fades, and dialogue UI.
 
-Not implemented yet: depth of field and audio (`voice`/`bgm`/`se` — audio clips
-are not included in the cached bundles).
+Voice audio (`[voice]`) is decoded from CRI `.acb` / HCA v3.0 containers into MP3s
+with 60 Hz 5-vowel (`A/I/U/E/O`) formant lip-sync envelopes (`voices/lipsync.json`).

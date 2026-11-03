@@ -35,6 +35,18 @@
     border-radius: 999px;
     box-shadow: 0 2px 8px rgba(155,70,160,.35);
   }
+  #msg .voice-replay {
+    position: absolute; right: 3.2%; top: -0.95em; width: 2.0em; height: 2.0em;
+    pointer-events: auto; cursor: pointer; display: none;
+    align-items: center; justify-content: center; padding: 0;
+    color: #fff; font-size: min(2.3vw, 13px); line-height: 1;
+    background: linear-gradient(135deg, #f078b8, #c858be);
+    border: 1.5px solid rgba(255,255,255,.92); border-radius: 999px;
+    box-shadow: 0 2px 8px rgba(155,70,160,.35);
+    transition: transform .12s ease, filter .12s ease;
+  }
+  #msg .voice-replay:hover { transform: scale(1.08); filter: brightness(1.08); }
+  #msg .voice-replay.playing { box-shadow: 0 0 0 3px rgba(240,120,184,.38), 0 2px 8px rgba(155,70,160,.45); }
   #msg .text {
     position: absolute; inset: 17% 5.5% 14% 5.5%; color: #36281e;
     font-size: min(3.3vw, 18px); font-weight: 600; line-height: 1.55; white-space: pre-wrap;
@@ -48,13 +60,23 @@
   @keyframes nextbob { 0%,100% { transform: translateY(0); opacity: .55 }
                        50% { transform: translateY(3px); opacity: 1 } }
   #hud {
-    position: absolute; left: 8px; top: 8px; opacity: .92; color: #9fb; font: 12px monospace;
-    background: rgba(0,0,0,.5); padding: 6px 8px; border-radius: 6px;
-    pointer-events: auto; max-width: 92vw; display: flex; gap: 8px; align-items: center;
+    position: absolute; left: 8px; right: 8px; top: 8px; opacity: .94; color: #9fb; font: 12px monospace;
+    background: rgba(10,14,18,.68); padding: 6px 8px; border-radius: 8px;
+    pointer-events: auto; display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center;
+    backdrop-filter: blur(4px);
   }
-  #hud input[type=range] { width: 40vw; }
-  #time { color: #cfe; min-width: 4.5em; }
-  #status { color: #8ad; }
+  #hud button, #hud select {
+    background: rgba(255,255,255,.12); color: #eef6ff; border: 1px solid rgba(255,255,255,.24);
+    border-radius: 5px; padding: 3px 7px; font: 12px monospace; cursor: pointer; white-space: nowrap;
+  }
+  #hud button:hover, #hud select:hover { background: rgba(255,255,255,.22); }
+  #hud select option { background: #182028; color: #eef6ff; }
+  #hud input#seek { flex: 1 1 130px; min-width: 96px; accent-color: #8cf; }
+  #hud input#vol { width: 48px; accent-color: #9fb; }
+  #hud button.warn { border-color: #fa5; color: #ffdca8; background: rgba(140,75,0,.65); }
+  #hud button.speaking { border-color: #6fe39e; color: #c8ffe0; background: rgba(28,110,64,.55); }
+  #time { color: #cfe; min-width: 4.3em; text-align: right; }
+  #status { color: #8ad; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -63,15 +85,20 @@
 <div id="fade"></div>
 <div id="ui">
   <div id="msg"><div class="window"></div><div class="name"></div>
+    <button class="voice-replay" id="voice-replay" title="Replay voice line">🔊</button>
     <div class="text"></div><div class="next"></div></div>
 </div>
 <div id="hud">
   <button id="play">play/pause</button>
   <button id="next">next msg</button>
+  <button id="voice" title="Toggle voice playback (M)">voice: on</button>
+  <input id="vol" type="range" min="0" max="100" value="100" title="Voice volume">
   <input id="seek" type="range" min="0" max="1000" value="0">
   <span id="time">0.00s</span>
   <select id="speed">
-    <option value="1">1x</option>
+    <option value="2">2x</option>
+    <option value="1.5">1.5x</option>
+    <option value="1" selected>1x</option>
     <option value="0.5">0.5x</option>
     <option value="0.25">0.25x</option>
   </select>
