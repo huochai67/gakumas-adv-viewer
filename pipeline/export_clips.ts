@@ -21,7 +21,7 @@ import {
   skeleton,
   type BundleContainer,
   type SkeletonNode,
-} from "./assets";
+} from "./assets.ts";
 import { ClipSampler, bindingDimension, crc32 } from "./core/unity_anim.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -253,4 +253,4 @@ function main(): void {
   console.log("clips", total);
 }
 
-main();
+if (import.meta.main) main();

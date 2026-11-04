@@ -1,7 +1,7 @@
 /**
  * Shared HTTP middleware for serving `/cache/*` raw game packages, `/api/catalog`,
  * and `/api/ensure` on-demand Octo bundle downloading in both Vite (`vite dev` /
- * `vite preview`) and the standalone server (`bun run serve`).
+ * `vite preview`) and the standalone server (`pnpm serve`).
  */
 import {
   closeSync,
@@ -65,10 +65,12 @@ export function statOrNull(target: string) {
 }
 
 class ByteReader {
+  readonly buf: Uint8Array;
   readonly view: DataView;
   pos = 0;
 
-  constructor(readonly buf: Uint8Array) {
+  constructor(buf: Uint8Array) {
+    this.buf = buf;
     this.view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   }
 

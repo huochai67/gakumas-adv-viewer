@@ -30,7 +30,7 @@ import {
   type AssetEnvironment,
   type BundleContainer,
   type SkeletonNode,
-} from "./assets";
+} from "./assets.ts";
 import { Glb } from "./core/gltf.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -851,4 +851,4 @@ function main(): void {
   console.log("missing humanoid", exp.meta.missingHumanoid);
 }
 
-main();
+if (import.meta.main) main();

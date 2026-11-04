@@ -13,7 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { type OctoManifest, download, loadManifest } from "./fetch.ts";
+import { type OctoManifest, download, ensureManifest } from "./fetch.ts";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(MODULE_DIR, "..");
@@ -33,18 +33,6 @@ function alignUp(v: number, a: number): number {
 function roundN(v: number, digits: number): number {
   const f = 10 ** digits;
   return Math.round(v * f) / f;
-}
-
-function findBunExecutable(): string {
-  if ((process.versions as { bun?: string }).bun) return process.execPath;
-  const exe = process.platform === "win32" ? "bun.exe" : "bun";
-  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
-    if (!dir) continue;
-    const candidate = path.join(dir, exe);
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  const fallback = path.join(os.homedir(), ".bun", "bin", exe);
-  return fs.existsSync(fallback) ? fallback : "bun";
 }
 
 export function parseUtf(buf: Uint8Array, base = 0): UtfRow[] {
@@ -454,7 +442,7 @@ export async function batchDecodeAndExport(
   fs.mkdirSync(OUT_VOICES, { recursive: true });
   if (cueToHca.size === 0) return {};
 
-  const bunBin = findBunExecutable();
+  const nodeBin = process.execPath;
   const decoderMjs = path.join(MODULE_DIR, "decode_hca.mjs");
   const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), "gakumas_hca_"));
 
@@ -472,7 +460,7 @@ export async function batchDecodeAndExport(
     const metaJson = path.join(tmpdir, "meta.json");
     fs.writeFileSync(jobsJson, JSON.stringify(jobs), "utf8");
 
-    const procDec = spawnSync(bunBin, [decoderMjs, jobsJson, metaJson], { encoding: "utf8" });
+    const procDec = spawnSync(nodeBin, [decoderMjs, jobsJson, metaJson], { encoding: "utf8" });
     if (procDec.status !== 0) {
       throw new Error(`clHCA batch decode failed: ${procDec.stderr ?? ""}`);
     }
@@ -545,7 +533,7 @@ export async function main(): Promise<void> {
     : fs.readdirSync(assetsDir).filter((f) => f.endsWith(".txt")).sort()
       .map((f) => path.join(assetsDir, f));
   const sheets = collectVoiceCues(scripts);
-  const manifest = await loadManifest();
+  const manifest = await ensureManifest();
 
   const lipsyncPath = path.join(OUT_VOICES, "lipsync.json");
   let lipsyncDb: Record<string, any> = {};

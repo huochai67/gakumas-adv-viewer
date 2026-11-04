@@ -11,9 +11,9 @@ with zero pre-exported `.glb`, `.png`, or `.mp3` files required.
 ## Run (React + Vite Studio UI)
 
 ```bash
-bun run dev                   # Vite dev server on http://127.0.0.1:8777
-bun run build                 # Production build into web/dist
-bun run serve                 # Serve production build on http://127.0.0.1:8777
+pnpm run dev                  # Vite dev server on http://127.0.0.1:8777
+pnpm run build                # Production build into web/dist
+pnpm run serve                # Serve production build on http://127.0.0.1:8777
 ```
 
 The React + Vite frontend (`web/src/`) provides a top multi-tab navigation bar
@@ -40,7 +40,7 @@ gakumas-adv-viewer/
 │   └── clhca.rs                  # CRI HCA v3.0 audio decoder + 60 Hz AIUEO lip-sync FFT
 ├── pipeline/                     # CLI asset fetcher & offline exporter tools
 │   ├── fetch.ts                  # Octo manifest loader & bundle dependency downloader
-│   ├── assets.ts                 # Node/Bun Unity bundle environment
+│   ├── assets.ts                 # Node Unity bundle environment
 │   ├── export_{char,clips,env,bg,voices}.ts
 │   ├── decode_hca.mjs
 │   ├── clhca/                    # C HCA reference decoder
@@ -100,12 +100,12 @@ At runtime, the web app loads raw bundles and `.acb` cue sheets directly from
 To rebuild `web/wasm/gakumas_core.wasm` or fetch/export offline assets via CLI:
 
 ```bash
-bun run build:wasm               # compile wasm/lib.rs -> web/wasm/gakumas_core.wasm
-bun run fetch:all                # download ALL bundles (26k+) + resources (22k+) concurrently
-bun run fetch:adv                # download all ADV viewer assets (chars, motions, envs, scripts, voices)
-bun run fetch:scripts            # download all 3,900+ ADV .txt scripts into cache/resources/
-bun pipeline/fetch.ts "mdl_chr_hski-*" "adv_dear_hski_*.txt" -j 12
-bun run export:all               # optional CLI export of .glb / .png / .mp3 / .json
+pnpm run build:wasm           # compile wasm/lib.rs -> web/wasm/gakumas_core.wasm
+pnpm run fetch:all            # download ALL bundles (26k+) + resources (22k+) concurrently
+pnpm run fetch:adv            # download all ADV viewer assets (chars, motions, envs, scripts, voices)
+pnpm run fetch:scripts        # download all 3,900+ ADV .txt scripts into cache/resources/
+pnpm run fetch "mdl_chr_hski-*" "adv_dear_hski_*.txt" -j 12
+pnpm run export:all           # optional CLI export of .glb / .png / .mp3 / .json
 ```
 Extra bundles are pulled by name from `cache/OctoManifest.json` (or
 `GAKUMAS_OCTO_MANIFEST`); `fetch.ts` resolves the dependency closure. All
