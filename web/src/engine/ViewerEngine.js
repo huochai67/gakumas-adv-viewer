@@ -229,7 +229,7 @@ class VoiceController {
 
   async preloadCues(cueNames) {
     for (const vc of cueNames) {
-      if (this.blobUrls.has(vc)) continue;
+      if (this.blobUrls.has(vc) || (this.lipsyncDb?.cues?.[vc] && this.muted)) continue;
       try {
         const info = await loadVoiceCueFromAcb(vc);
         if (!info) continue;
@@ -404,13 +404,21 @@ class VoiceController {
 }
 
 class StoryPlayer {
-  constructor(timeline, char, actorId, lipsyncDb, voiceCtrl, actorGroup) {
+  constructor(timeline, char, actorId, lipsyncDb, voiceCtrl, actorGroup, actorEntries = null) {
     this.timeline = timeline;
     this.char = char;
     this.actorId = actorId || DEFAULT_ACTOR_ID;
     this.lipsyncDb = lipsyncDb;
     this.voiceCtrl = voiceCtrl;
     this.actorGroup = actorGroup;
+    this.actorEntries =
+      actorEntries ||
+      new Map([
+        [
+          this.actorId,
+          { actorId: this.actorId, char: this.char, group: this.actorGroup, groundShadow: null },
+        ],
+      ]);
     this.clips = new Map();
     this.baseClip = null;
     this.baseTime = 0;
@@ -426,7 +434,9 @@ class StoryPlayer {
         c.type === 'actorfacialmotion' ||
         c.type === 'actoradditivemotion'
       ) {
-        if (c.params.id && c.params.id !== this.actorId) continue;
+        if (c.params.id && !this.actorEntries.has(c.params.id) && c.params.id !== this.actorId) {
+          continue;
+        }
         if (c.params.motion) names.add(c.params.motion);
       }
     }
@@ -470,11 +480,27 @@ class StoryPlayer {
   }
 
   stateAt(t) {
+    const actors = new Map();
+    for (const aid of this.actorEntries.keys()) {
+      actors.set(aid, {
+        visible: aid === this.actorId,
+        layout: null,
+        motion: null,
+        prevMotion: null,
+        facial: null,
+        prevFacial: null,
+        overrides: [],
+        additive: [],
+        looks: [],
+        actorVoice: null,
+      });
+    }
     const st = {
       bgActive: this.defaultBg,
       bgSet: new Map(),
       camera: null,
       dof: null,
+      actors,
       layout: null,
       actorVisible: true,
       motion: null,
@@ -492,6 +518,8 @@ class StoryPlayer {
       message: null,
       fade: { from: 0, to: 0, t: 0, dur: 0, color: '#000000' },
     };
+    const resolveActor = (id) => st.actors.get(id || this.actorId) || null;
+
     for (const c of this.timeline.cues) {
       if (c.t > t) break;
       const p = c.params;
@@ -553,20 +581,52 @@ class StoryPlayer {
         }
         case 'actorlayoutgroup': {
           const layouts = (c.all.layouts || []).flat();
-          const mine = layouts.find((l) => !l.params.id || l.params.id === this.actorId);
-          if (mine) {
-            st.actorVisible = true;
-            if (mine.params.transform) st.layout = mine.params.transform;
-          } else {
-            st.actorVisible = false;
+          for (const [aid, aSt] of st.actors) {
+            const mine = layouts.find(
+              (l) => l.params.id === aid || (!l.params.id && aid === this.actorId),
+            );
+            if (mine) {
+              aSt.visible = true;
+              if (mine.params.transform) aSt.layout = mine.params.transform;
+            } else {
+              aSt.visible = false;
+            }
+          }
+          break;
+        }
+        case 'actortween': {
+          const aSt = resolveActor(p.id);
+          if (!aSt) break;
+          const from = p.from || aSt.layout;
+          const to = p.to || from;
+          if (from && to) {
+            let u = c.dur > 0 ? Math.min(1, Math.max(0, (t - c.t) / c.dur)) : 1;
+            if (p.ease === 'OutQuad') u = 1 - (1 - u) * (1 - u);
+            const lv3 = (a, b) => ({
+              x: lerp(a.x, b.x, u),
+              y: lerp(a.y, b.y, u),
+              z: lerp(a.z, b.z, u),
+            });
+            aSt.layout = {
+              position:
+                from.position && to.position
+                  ? lv3(from.position, to.position)
+                  : to.position || from.position,
+              rotation:
+                from.rotation && to.rotation
+                  ? lv3(from.rotation, to.rotation)
+                  : to.rotation || from.rotation,
+              scale: to.scale || from.scale || { x: 1, y: 1, z: 1 },
+            };
           }
           break;
         }
         case 'actormotion': {
-          if (p.id && p.id !== this.actorId) break;
+          const aSt = resolveActor(p.id);
+          if (!aSt) break;
           const tr = Number(p.transition ?? 0);
-          st.prevMotion = st.motion;
-          st.motion = {
+          aSt.prevMotion = aSt.motion;
+          aSt.motion = {
             name: p.motion,
             variant: 'b',
             start: c.t,
@@ -575,7 +635,7 @@ class StoryPlayer {
           };
           if (
             this.clipOf(p.motion, 'f') &&
-            !(st.facial && st.facial.explicit && Math.abs(st.facial.start - c.t) < 1e-4)
+            !(aSt.facial && aSt.facial.explicit && Math.abs(aSt.facial.start - c.t) < 1e-4)
           ) {
             const ftr =
               p.facialTransition !== undefined
@@ -583,8 +643,8 @@ class StoryPlayer {
                 : tr > 0
                   ? 0.22
                   : 0;
-            st.prevFacial = st.facial;
-            st.facial = {
+            aSt.prevFacial = aSt.facial;
+            aSt.facial = {
               name: p.motion,
               variant: 'f',
               start: c.t,
@@ -596,11 +656,12 @@ class StoryPlayer {
           break;
         }
         case 'actorfacialmotion': {
-          if (p.id && p.id !== this.actorId) break;
-          if (!(st.facial && !st.facial.explicit && Math.abs(st.facial.start - c.t) < 1e-4)) {
-            st.prevFacial = st.facial;
+          const aSt = resolveActor(p.id);
+          if (!aSt) break;
+          if (!(aSt.facial && !aSt.facial.explicit && Math.abs(aSt.facial.start - c.t) < 1e-4)) {
+            aSt.prevFacial = aSt.facial;
           }
-          st.facial = {
+          aSt.facial = {
             name: p.motion,
             variant: 'f',
             start: c.t,
@@ -611,10 +672,11 @@ class StoryPlayer {
           break;
         }
         case 'actorfacialoverridemotion': {
-          if (p.id && p.id !== this.actorId) break;
+          const aSt = resolveActor(p.id);
+          if (!aSt) break;
           const models = (p.setting && p.setting.faceModels) || [];
           const clipMeta = p.clip || {};
-          st.overrides.push({
+          aSt.overrides.push({
             start: c.t,
             dur: c.dur,
             easeIn: Number(clipMeta._easeInDuration ?? 0),
@@ -624,8 +686,9 @@ class StoryPlayer {
           break;
         }
         case 'actoradditivemotion': {
-          if (p.id && p.id !== this.actorId) break;
-          st.additive.push({ name: p.motion, start: c.t, clipIn: c.clipIn });
+          const aSt = resolveActor(p.id);
+          if (!aSt) break;
+          aSt.additive.push({ name: p.motion, start: c.t, clipIn: c.clipIn });
           break;
         }
         case 'transition':
@@ -635,17 +698,19 @@ class StoryPlayer {
           st.shakes.push({ start: c.t, dur: c.dur, setting: p.setting || {} });
           break;
         case 'actorlooktarget': {
-          if (p.id && p.id !== this.actorId) break;
+          const aSt = resolveActor(p.id);
+          if (!aSt) break;
           const target = p.target || DEFAULT_LOOK_TARGET;
-          st.looks.push({ kind: 'instant', start: c.t, dur: 0, target, endTarget: target });
+          aSt.looks.push({ kind: 'instant', start: c.t, dur: 0, target, endTarget: target });
           break;
         }
         case 'actorlooktargettween': {
-          if (p.id && p.id !== this.actorId) break;
-          const prev = st.looks.length ? st.looks[st.looks.length - 1].endTarget : null;
+          const aSt = resolveActor(p.id);
+          if (!aSt) break;
+          const prev = aSt.looks.length ? aSt.looks[aSt.looks.length - 1].endTarget : null;
           const from = p.from || prev || DEFAULT_LOOK_TARGET;
           const to = p.to || DEFAULT_LOOK_TARGET;
-          st.looks.push({ kind: 'tween', start: c.t, dur: c.dur || 0.01, from, to, endTarget: to });
+          aSt.looks.push({ kind: 'tween', start: c.t, dur: c.dur || 0.01, from, to, endTarget: to });
           break;
         }
         case 'voice': {
@@ -668,7 +733,14 @@ class StoryPlayer {
           };
           st.lineVoice = vObj;
           if (t < c.t + dur + 0.35) st.activeVoice = vObj;
-          if (isMine && t < c.t + dur + 0.15) st.actorVoice = vObj;
+          for (const [aid, aSt] of st.actors) {
+            const isActorMatch = p.actorId
+              ? p.actorId === aid
+              : String(cueName).includes(`_${aid}-`);
+            if (isActorMatch && t < c.t + dur + 0.15) {
+              aSt.actorVoice = { ...vObj, isMine: true };
+            }
+          }
           break;
         }
         case 'message':
@@ -703,6 +775,20 @@ class StoryPlayer {
           break;
       }
     }
+
+    const prim = st.actors.get(this.actorId);
+    if (prim) {
+      st.actorVisible = prim.visible;
+      st.layout = prim.layout;
+      st.motion = prim.motion;
+      st.prevMotion = prim.prevMotion;
+      st.facial = prim.facial;
+      st.prevFacial = prim.prevFacial;
+      st.overrides = prim.overrides;
+      st.additive = prim.additive;
+      st.looks = prim.looks;
+      st.actorVoice = prim.actorVoice;
+    }
     return st;
   }
 
@@ -731,12 +817,14 @@ class StoryPlayer {
     return null;
   }
 
-  evalLipSync(t, st) {
-    const mv = this.voiceCtrl && this.voiceCtrl.getManualActorPlayback();
-    if (mv) {
-      return this.sampleLipSyncEntry(mv.voice, mv.currentTime, mv.dur, st.message?.text);
+  evalLipSyncForActor(t, st, aSt, aid) {
+    if (aid === this.actorId) {
+      const mv = this.voiceCtrl && this.voiceCtrl.getManualActorPlayback();
+      if (mv) {
+        return this.sampleLipSyncEntry(mv.voice, mv.currentTime, mv.dur, st.message?.text);
+      }
     }
-    const av = st.actorVoice;
+    const av = aSt?.actorVoice;
     if (av) {
       const liveAudioT =
         this.voiceCtrl && this.voiceCtrl.currentCue === av.voice && this.voiceCtrl.isSpeaking()
@@ -744,17 +832,31 @@ class StoryPlayer {
           : t - av.start + (av.clipIn || 0);
       return this.sampleLipSyncEntry(av.voice, liveAudioT, av.dur, st.message?.text);
     }
-    if (!this.hasVoices && st.message && st.message.name === '麻央' && !st.message.hide) {
+    if (
+      !this.hasVoices &&
+      st.message &&
+      !st.message.narration &&
+      !st.message.hide &&
+      st.message.name &&
+      st.message.name !== '{user}' &&
+      st.message.name !== USER_NAME &&
+      aid === this.actorId
+    ) {
       return evalTextFallbackLipSync(st.message.text, t - st.message.start, st.message.dur || 2.5);
     }
     return null;
   }
 
-  applyCharacter(t, st) {
-    this.actorGroup.visible = st.actorVisible;
-    if (!st.actorVisible) return;
+  evalLipSync(t, st) {
+    return this.evalLipSyncForActor(t, st, st.actors?.get(this.actorId) || st, this.actorId);
+  }
 
-    const { solver } = this.char;
+  applySingleActor(t, st, aid, entry, aSt) {
+    if (!entry || !entry.char || !entry.group || !aSt) return;
+    entry.group.visible = aSt.visible;
+    if (!aSt.visible) return;
+
+    const { solver } = entry.char;
     const evalOf = (m) => {
       if (!m) return null;
       const clip = this.clipOf(m.name, m.variant);
@@ -770,11 +872,11 @@ class StoryPlayer {
       ? evalClip(this.baseClip, this.baseTime > 0 ? t % this.baseTime : 0)
       : null;
 
-    const curM = evalOf(st.motion);
-    const prevM = evalOf(st.prevMotion);
+    const curM = evalOf(aSt.motion);
+    const prevM = evalOf(aSt.prevMotion);
     let w = 1;
-    if (curM && st.motion.transition > 0) {
-      const u = Math.min(1, Math.max(0, (t - st.motion.start) / st.motion.transition));
+    if (curM && aSt.motion.transition > 0) {
+      const u = Math.min(1, Math.max(0, (t - aSt.motion.start) / aSt.motion.transition));
       w = u * u * (3 - 2 * u);
     }
 
@@ -793,10 +895,10 @@ class StoryPlayer {
       root = pe && w < 1 ? blendRoot(pe.root, ce.root, w) : ce.root;
       if (pe && w < 1 && pe.bones && pe.bones.length) {
         const pMap = new Map();
-        for (const b of pe.bones) pMap.set(`${b.node}:${b.prop}`, b.value);
+        for (const b of pe.bones) pMap.set(`${b.boneName || b.node}:${b.prop}`, b.value);
         const seen = new Set();
         for (const b of ce.bones) {
-          const key = `${b.node}:${b.prop}`;
+          const key = `${b.boneName || b.node}:${b.prop}`;
           seen.add(key);
           const pv = pMap.get(key);
           if (!pv) {
@@ -804,13 +906,14 @@ class StoryPlayer {
           } else {
             bones.push({
               node: b.node,
+              boneName: b.boneName,
               prop: b.prop,
               value: b.prop === 'rotation' ? nlerpQuat(pv, b.value, w) : lerpArr(pv, b.value, w),
             });
           }
         }
         for (const b of pe.bones) {
-          if (!seen.has(`${b.node}:${b.prop}`)) bones.push(b);
+          if (!seen.has(`${b.boneName || b.node}:${b.prop}`)) bones.push(b);
         }
       } else {
         bones.push(...ce.bones);
@@ -818,7 +921,7 @@ class StoryPlayer {
 
       if (curM.elapsed > curM.clip.duration) {
         const settle = Math.min(1, (curM.elapsed - curM.clip.duration) / 0.8);
-        const breath = Math.sin((t - st.motion.start) * 1.75) * 0.01 * settle;
+        const breath = Math.sin((t - aSt.motion.start) * 1.75) * 0.01 * settle;
         muscles[3] += breath;
         muscles[6] += breath;
       }
@@ -830,7 +933,7 @@ class StoryPlayer {
       muscles.set(TPOSE_MUSCLES);
     }
 
-    for (const a of st.additive) {
+    for (const a of aSt.additive) {
       const clip = this.clipOf(a.name, 'b');
       if (!clip) continue;
       const lt = t - a.start + (a.clipIn || 0);
@@ -847,14 +950,14 @@ class StoryPlayer {
     solver.applyPose(null, solver.poseFrom(muscles, bones, root), 1);
 
     const morph = new Map();
-    const curF = evalOf(st.facial);
-    const prevF = evalOf(st.prevFacial);
-    const fallbackF = !curF && st.motion ? evalOf({ ...st.motion, variant: 'f' }) : null;
+    const curF = evalOf(aSt.facial);
+    const prevF = evalOf(aSt.prevFacial);
+    const fallbackF = !curF && aSt.motion ? evalOf({ ...aSt.motion, variant: 'f' }) : null;
     const activeF = curF || fallbackF;
     if (activeF) {
       const fw =
-        curF && prevF && st.facial.transition > 0
-          ? Math.min(1, Math.max(0, (t - st.facial.start) / st.facial.transition))
+        curF && prevF && aSt.facial.transition > 0
+          ? Math.min(1, Math.max(0, (t - aSt.facial.start) / aSt.facial.transition))
           : 1;
       if (prevF && fw < 1) {
         for (const [i, v] of prevF.ev.morph) morph.set(i, v * (1 - fw));
@@ -864,7 +967,7 @@ class StoryPlayer {
       }
     }
 
-    for (const o of st.overrides) {
+    for (const o of aSt.overrides) {
       if (t < o.start || t > o.start + o.dur) continue;
       let ow = 1;
       if (o.easeIn > 0) ow = Math.min(ow, (t - o.start) / o.easeIn);
@@ -880,7 +983,7 @@ class StoryPlayer {
     let eyeBusy = 0;
     for (let ei = 20; ei <= 38; ei++) eyeBusy += morph.get(ei) || 0;
     if (eyeBusy < 0.12) {
-      const period = 3.6 + 0.9 * hash01(Math.floor(t / 3.6));
+      const period = 3.6 + 0.9 * hash01(Math.floor(t / 3.6) + aid.charCodeAt(0));
       const x = t % period;
       if (x > 1.4 && x < 1.53) {
         const closed = Math.sin(((x - 1.4) / 0.13) * Math.PI);
@@ -888,16 +991,23 @@ class StoryPlayer {
       }
     }
 
-    const vowels = this.evalLipSync(t, st);
+    const vowels = this.evalLipSyncForActor(t, st, aSt, aid);
     if (vowels) applyLipSyncToMorph(morph, vowels);
 
-    this.char.setMorph(morph);
-    const L = st.layout;
+    entry.char.setMorph(morph);
+    const L = aSt.layout;
     if (L) {
-      this.actorGroup.position.set(L.position.x, L.position.y, -L.position.z);
-      this.actorGroup.quaternion.copy(unityEulerQuat(L.rotation.x, L.rotation.y, L.rotation.z));
+      entry.group.position.set(L.position.x, L.position.y, -L.position.z);
+      entry.group.quaternion.copy(unityEulerQuat(L.rotation.x, L.rotation.y, L.rotation.z));
       const s = L.scale || { x: 1, y: 1, z: 1 };
-      this.actorGroup.scale.set(s.x, s.y, s.z);
+      entry.group.scale.set(s.x, s.y, s.z);
+    }
+  }
+
+  applyCharacter(t, st) {
+    for (const [aid, entry] of this.actorEntries) {
+      const aSt = st.actors ? st.actors.get(aid) : null;
+      if (aSt) this.applySingleActor(t, st, aid, entry, aSt);
     }
   }
 }
@@ -926,10 +1036,12 @@ export class ViewerEngine {
     this.skyTexture = null;
     this.envInfo = null;
     this.envLoaded = false;
+    this.env3dCache = new Map();
+    this.activeEnv3dName = null;
 
     this.char = null;
     this.currentParts = { ...DEFAULT_PARTS };
-
+    this.extraStoryActors = new Map();
     // Asset Browser state
     this.assetPlaying = true;
     this.assetLoop = true;
@@ -1108,24 +1220,9 @@ export class ViewerEngine {
     scene.add(stageHemi);
     this.stageHemi = stageHemi;
 
-    const groundShadow = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.68, 0.52),
-      new THREE.MeshBasicMaterial({
-        map: blobTexture(),
-        transparent: true,
-        depthWrite: false,
-        opacity: 0.72,
-        polygonOffset: true,
-        polygonOffsetFactor: -1,
-        polygonOffsetUnits: -1,
-      }),
-    );
-    groundShadow.rotation.x = -Math.PI / 2;
-    groundShadow.position.y = 0.004;
-    groundShadow.renderOrder = 4;
+    const groundShadow = this._createGroundShadow();
     scene.add(groundShadow);
     this.groundShadow = groundShadow;
-
     const actorGroup = new THREE.Group();
     scene.add(actorGroup);
     this.actorGroup = actorGroup;
@@ -1145,22 +1242,65 @@ export class ViewerEngine {
     });
   }
 
+  _createGroundShadow() {
+    const groundShadow = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.68, 0.52),
+      new THREE.MeshBasicMaterial({
+        map: blobTexture(),
+        transparent: true,
+        depthWrite: false,
+        opacity: 0.72,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
+      }),
+    );
+    groundShadow.rotation.x = -Math.PI / 2;
+    groundShadow.position.y = 0.004;
+    groundShadow.renderOrder = 4;
+    return groundShadow;
+  }
+
+  setViewportSize(w, h, pixelRatio = null) {
+    if (!this.renderer || !this.camera) return;
+    const width = Math.max(1, Math.floor(w));
+    const height = Math.max(1, Math.floor(h));
+    this.viewportWidth = width;
+    this.viewportHeight = height;
+    if (pixelRatio !== null) {
+      this.renderer.setPixelRatio(pixelRatio);
+    }
+    this.renderer.setSize(width, height);
+    this.camera.aspect = width / height;
+    this.camera.updateProjectionMatrix();
+    if (this.bloom) this.bloom.setSize(width, height);
+  }
+
   resize() {
     if (!this.container || !this.renderer || !this.camera) return;
     const rect = this.container.getBoundingClientRect();
     const w = Math.max(1, Math.floor(rect.width));
     const h = Math.max(1, Math.floor(rect.height));
-    this.viewportWidth = w;
-    this.viewportHeight = h;
-    this.renderer.setSize(w, h);
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
-    if (this.bloom) this.bloom.setSize(w, h);
+    this.setViewportSize(w, h);
     this.renderFrame();
   }
 
   async _bootInitial() {
     try {
+      const isHeadless =
+        typeof location !== 'undefined' &&
+        new URLSearchParams(location.search).get('headless') === '1';
+      if (isHeadless) {
+        this.mode = 'story';
+        this.voiceCtrl.muted = true;
+        await getBrowserEnv();
+        this.loading = false;
+        this.loadingText = '';
+        this._setupWindowHooks();
+        this._emit();
+        return;
+      }
+
       this.loading = true;
       this.loadingText = '正在通过 WASM 解密并构建角色与 3D 教室资产…';
       this._emit();
@@ -1203,10 +1343,15 @@ export class ViewerEngine {
     }
   }
 
-  async _loadEnv3d() {
-    if (this.envLoaded && this.envInfo) return this.envInfo;
+  async _loadEnv3d(sceneName = 'env_3d_adv_classroom-00-00-noon') {
+    if (this.env3dCache.has(sceneName)) {
+      return this._activateEnv3d(sceneName);
+    }
     const env = await getBrowserEnv();
-    const { glbBytes, meta, textures } = await buildEnv3dFromBundles(env);
+    if (!env.hasBundle(sceneName)) {
+      await this.ensureBundlesOnServer([sceneName, 't_sky_noon-00']).catch(() => {});
+    }
+    const { glbBytes, meta, textures } = await buildEnv3dFromBundles(env, sceneName);
     const gltf = await new GLTFLoader().parseAsync(
       glbBytes.buffer.slice(glbBytes.byteOffset, glbBytes.byteOffset + glbBytes.byteLength),
       '',
@@ -1248,6 +1393,7 @@ export class ViewerEngine {
       }
     }
 
+    let stageSkyTexture = null;
     if (meta.skybox) {
       const skyEntry = textures.get(meta.skybox);
       if (skyEntry) {
@@ -1261,28 +1407,9 @@ export class ViewerEngine {
         eqTex.generateMipmaps = false;
         eqTex.needsUpdate = true;
         const pmrem = new THREE.PMREMGenerator(this.renderer);
-        this.skyTexture = pmrem.fromEquirectangular(eqTex).texture;
+        stageSkyTexture = pmrem.fromEquirectangular(eqTex).texture;
         pmrem.dispose();
         eqTex.dispose();
-      }
-    }
-
-    if (meta.renderSettings) {
-      const rs = meta.renderSettings;
-      if (rs.ambientSkyColor) this.stageHemi.color.setRGB(...rs.ambientSkyColor);
-      if (rs.ambientGroundColor) this.stageHemi.groundColor.setRGB(...rs.ambientGroundColor);
-      this.stageHemi.intensity = 1.55;
-    }
-    if (Array.isArray(meta.lights)) {
-      const dirL = meta.lights.find((l) => l.type === 1);
-      if (dirL && dirL.direction) {
-        this.sunLight.color.setRGB(...dirL.color);
-        this.sunLight.position.set(
-          -dirL.direction[0] * 10,
-          -dirL.direction[1] * 10,
-          -dirL.direction[2] * 10,
-        );
-        this.sunLight.intensity = 2.0;
       }
     }
 
@@ -1344,7 +1471,7 @@ export class ViewerEngine {
           color: tint,
           roughness: 0.68,
           metalness: 0.04,
-          envMap: isGlass ? null : this.skyTexture || null,
+          envMap: isGlass ? null : stageSkyTexture || this.skyTexture || null,
           envMapIntensity: isGlass ? 0.0 : 0.4,
           side,
           transparent: isBlend,
@@ -1373,7 +1500,10 @@ export class ViewerEngine {
       if (isBlend) o.renderOrder = 2;
       o.material = mat;
     });
-    this.envGroup.add(gltf.scene);
+
+    const stageGroup = new THREE.Group();
+    stageGroup.name = sceneName;
+    stageGroup.add(gltf.scene);
 
     for (const d of meta.decals || []) {
       if (!d.map || !d.positions || d.fade <= 0.005) continue;
@@ -1396,24 +1526,78 @@ export class ViewerEngine {
       });
       const dm = new THREE.Mesh(geo, dmat);
       dm.renderOrder = (d.isShadow ? 1 : 3) + (d.priority || 0);
-      this.envGroup.add(dm);
+      stageGroup.add(dm);
     }
 
+    this.envGroup.add(stageGroup);
+    const entry = {
+      sceneName,
+      meta,
+      group: stageGroup,
+      skyTexture: stageSkyTexture,
+    };
+    this.env3dCache.set(sceneName, entry);
     this.envLoaded = true;
-    return { meta, group: gltf.scene };
+    return this._activateEnv3d(sceneName);
   }
 
-  async ensureBundlesOnServer(bundleNames) {
+  _activateEnv3d(sceneName) {
+    const targetName =
+      sceneName && this.env3dCache.has(sceneName)
+        ? sceneName
+        : this.env3dCache.keys().next().value || null;
+    if (!targetName) return null;
+    const entry = this.env3dCache.get(targetName);
+    if (!entry) return null;
+    for (const [k, e] of this.env3dCache) {
+      e.group.visible = k === targetName;
+    }
+    if (this.activeEnv3dName !== targetName) {
+      this.activeEnv3dName = targetName;
+      this.envInfo = entry;
+      if (entry.skyTexture) this.skyTexture = entry.skyTexture;
+      const { meta } = entry;
+      if (meta.renderSettings) {
+        const rs = meta.renderSettings;
+        if (rs.ambientSkyColor) this.stageHemi.color.setRGB(...rs.ambientSkyColor);
+        if (rs.ambientGroundColor) this.stageHemi.groundColor.setRGB(...rs.ambientGroundColor);
+        this.stageHemi.intensity = 1.55;
+      }
+      if (Array.isArray(meta.lights)) {
+        const dirL = meta.lights.find((l) => l.type === 1);
+        if (dirL && dirL.direction) {
+          this.sunLight.color.setRGB(...dirL.color);
+          this.sunLight.position.set(
+            -dirL.direction[0] * 10,
+            -dirL.direction[1] * 10,
+            -dirL.direction[2] * 10,
+          );
+          this.sunLight.intensity = 2.0;
+        }
+      }
+    }
+    return entry;
+  }
+
+  async ensureAssetsOnServer(bundleNames = [], resourceNames = []) {
     const env = await getBrowserEnv();
-    const missing = bundleNames.filter((n) => n && !env.hasBundle(n));
-    if (missing.length === 0) return null;
+    const missingBundles = [...new Set(bundleNames.filter((n) => n && !env.hasBundle(n)))];
+    const cachedResources = new Set(
+      (env.index && Array.isArray(env.index.resources) ? env.index.resources : []).map((r) =>
+        String(r),
+      ),
+    );
+    const missingResources = [
+      ...new Set(resourceNames.filter((r) => r && !cachedResources.has(r))),
+    ];
+    if (missingBundles.length === 0 && missingResources.length === 0) return null;
     this.loading = true;
-    this.loadingText = `正在从 Octo 清单拉取并解密数据包 (${missing.join(', ')})…`;
+    this.loadingText = `正在从 Octo 清单拉取并补齐资源 (${missingBundles.length} bundles, ${missingResources.length} resources)…`;
     this._emit();
     const resp = await fetch('/api/ensure', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bundles: missing }),
+      body: JSON.stringify({ bundles: missingBundles, resources: missingResources }),
     });
     if (!resp.ok) {
       const errData = await resp.json().catch(() => ({}));
@@ -1422,6 +1606,10 @@ export class ViewerEngine {
     const data = await resp.json();
     if (data.index) env.updateIndex(data.index);
     return data.catalog || null;
+  }
+
+  async ensureBundlesOnServer(bundleNames) {
+    return this.ensureAssetsOnServer(bundleNames, []);
   }
 
   // -------------------- Mode Switching --------------------
@@ -1668,6 +1856,17 @@ export class ViewerEngine {
     await this.loadStoryFromText(text, this.storyScriptLabel, autoPlay);
   }
 
+  _disposeExtraStoryActors() {
+    for (const entry of this.extraStoryActors.values()) {
+      if (entry.char) entry.char.dispose();
+      if (entry.group && entry.group.parent) entry.group.parent.remove(entry.group);
+      if (entry.groundShadow && entry.groundShadow.parent) {
+        entry.groundShadow.parent.remove(entry.groundShadow);
+      }
+    }
+    this.extraStoryActors.clear();
+  }
+
   async loadStoryFromText(text, label = 'custom.txt', autoPlay = false) {
     try {
       this.loading = true;
@@ -1678,10 +1877,131 @@ export class ViewerEngine {
       const events = parseAdv(text);
       const timeline = buildTimeline(events);
 
+      // Collect all required bundles and voice .acb resources from the script
+      const neededBundles = new Set([STAND_MOTION]);
+      for (const [, parts] of timeline.actors) {
+        if (parts.body) neededBundles.add(parts.body);
+        if (parts.face) {
+          neededBundles.add(parts.face);
+          const m = /^mdl_chr_([a-z0-9]+)-/i.exec(parts.face);
+          if (m) neededBundles.add(`t_chr_${m[1]}-base-0000`);
+        }
+        if (parts.hair) neededBundles.add(parts.hair);
+      }
+      for (const bg of timeline.backgrounds.values()) {
+        if (bg && bg.src) {
+          neededBundles.add(bg.src);
+          if (bg.src.startsWith('env_3d')) neededBundles.add('t_sky_noon-00');
+        }
+      }
+      for (const c of timeline.cues) {
+        if (
+          c.type === 'actormotion' ||
+          c.type === 'actorfacialmotion' ||
+          c.type === 'actoradditivemotion'
+        ) {
+          const m = c.params.motion;
+          if (m) {
+            const stem = m.replace(/_[bf]$/, '');
+            neededBundles.add(stem);
+            neededBundles.add(m);
+          }
+        }
+      }
+
+      const voiceCueNames = [
+        ...new Set(
+          timeline.cues
+            .filter((c) => c.type === 'voice' && c.params.voice)
+            .map((c) => c.params.voice),
+        ),
+      ];
+      const neededResources = new Set();
+      for (const cueName of voiceCueNames) {
+        const sheet = String(cueName).replace(/_[a-z0-9]+-\d+$/, '');
+        if (sheet) neededResources.add(`${sheet}.acb`);
+      }
+
+      await this.ensureAssetsOnServer([...neededBundles], [...neededResources]).catch((e) =>
+        console.warn('auto-ensure warning:', e),
+      );
+
       // Extract primary actor ID from script's [actorgroup] if present
       let scriptActorId = DEFAULT_ACTOR_ID;
-      if (timeline.actors.size > 0 && !timeline.actors.has(DEFAULT_ACTOR_ID)) {
-        scriptActorId = [...timeline.actors.keys()][0];
+      if (timeline.actors.size > 0) {
+        scriptActorId = timeline.actors.has(DEFAULT_ACTOR_ID)
+          ? DEFAULT_ACTOR_ID
+          : [...timeline.actors.keys()][0];
+      }
+
+      // Load primary character if not yet loaded or if its parts differ from currentParts
+      const primaryParts = timeline.actors.get(scriptActorId);
+      const wantParts =
+        primaryParts && primaryParts.body && primaryParts.face && primaryParts.hair
+          ? primaryParts
+          : this.currentParts;
+      if (
+        !this.char ||
+        wantParts.body !== this.currentParts.body ||
+        wantParts.face !== this.currentParts.face ||
+        wantParts.hair !== this.currentParts.hair
+      ) {
+        this.loadingText = `正在加载角色模型 (${scriptActorId})…`;
+        this._emit();
+        const newChar = await loadCharacter(null, wantParts);
+        if (this.char) this.char.dispose();
+        this.char = newChar;
+        this.currentParts = { ...wantParts };
+        setClipCharMeta(newChar.meta);
+        if (this.envInfo?.meta?.volumes) {
+          newChar.applyActorVolume(this.envInfo.meta.volumes);
+        }
+        newChar.root.position.set(0, 0, 0);
+        this.actorGroup.add(newChar.root);
+      }
+
+      // Load any additional actors in multi-character scripts
+      this._disposeExtraStoryActors();
+      const actorEntries = new Map([
+        [
+          scriptActorId,
+          {
+            actorId: scriptActorId,
+            char: this.char,
+            group: this.actorGroup,
+            groundShadow: this.groundShadow,
+          },
+        ],
+      ]);
+      for (const [aid, parts] of timeline.actors) {
+        if (aid === scriptActorId || !parts.body || !parts.face || !parts.hair) continue;
+        try {
+          this.loadingText = `正在加载同场角色模型 (${aid})…`;
+          this._emit();
+          const extraChar = await loadCharacter(null, parts);
+          if (this.envInfo?.meta?.volumes) {
+            extraChar.applyActorVolume(this.envInfo.meta.volumes);
+          }
+          const extraGroup = new THREE.Group();
+          extraGroup.visible = false;
+          extraChar.root.position.set(0, 0, 0);
+          extraGroup.add(extraChar.root);
+          this.scene.add(extraGroup);
+          const extraShadow = this._createGroundShadow();
+          extraShadow.visible = false;
+          this.scene.add(extraShadow);
+          const entry = {
+            actorId: aid,
+            parts: { ...parts },
+            char: extraChar,
+            group: extraGroup,
+            groundShadow: extraShadow,
+          };
+          this.extraStoryActors.set(aid, entry);
+          actorEntries.set(aid, entry);
+        } catch (e) {
+          console.warn(`extra actor load failed (${aid}):`, e);
+        }
       }
 
       const player = new StoryPlayer(
@@ -1691,22 +2011,24 @@ export class ViewerEngine {
         this.lipsyncDb,
         this.voiceCtrl,
         this.actorGroup,
+        actorEntries,
       );
-
-      const voiceCueNames = [
-        ...new Set(
-          timeline.cues
-            .filter((c) => c.type === 'voice' && c.params.voice)
-            .map((c) => c.params.voice),
-        ),
-      ];
       player.hasVoices = voiceCueNames.length > 0;
 
-      // Load 2D backgrounds referenced by timeline
+      // Load 3D stages and 2D backgrounds referenced by timeline
       const bgLoads = [];
       for (const bg of timeline.backgrounds.values()) {
         const src = bg && bg.src;
-        if (!src || src.startsWith('env_3d') || this.bgMeta[src]) continue;
+        if (!src) continue;
+        if (src.startsWith('env_3d')) {
+          if (!this.env3dCache.has(src)) {
+            bgLoads.push(
+              this._loadEnv3d(src).catch((e) => console.warn(`3d stage load failed ${src}`, e)),
+            );
+          }
+          continue;
+        }
+        if (this.bgMeta[src]) continue;
         bgLoads.push(
           (async () => {
             if (!env.hasBundle(src)) {
@@ -1758,7 +2080,6 @@ export class ViewerEngine {
                 ? USER_NAME
                 : c.params.name || '';
           const cleanText = stripRuby(c.params.text || '');
-          // Find matching voice cue near c.t
           let voiceCue = null;
           for (const vc of timeline.cues) {
             if (vc.type === 'voice' && vc.params.voice && Math.abs(vc.t - c.t) <= 0.65) {
@@ -1779,6 +2100,7 @@ export class ViewerEngine {
         }
       }
 
+      this._lastVolumeSrc = null;
       this.storyTimeline = timeline;
       this.storyPlayer = player;
       this.storyScriptLabel = label;
@@ -1826,6 +2148,9 @@ export class ViewerEngine {
     }
     this.voiceCtrl.manualCue = null;
     if (this.char) this.char.solver.resetSwing();
+    for (const entry of this.extraStoryActors.values()) {
+      if (entry.char) entry.char.solver.resetSwing();
+    }
     this.renderFrame();
     this._emit();
   }
@@ -1921,7 +2246,12 @@ export class ViewerEngine {
   }
 
   _renderAssetFrame() {
+    for (const entry of this.extraStoryActors.values()) {
+      if (entry.group) entry.group.visible = false;
+      if (entry.groundShadow) entry.groundShadow.visible = false;
+    }
     const showClassroom = this.assetStageMode === 'classroom' && this.envLoaded;
+    if (showClassroom) this._activateEnv3d('env_3d_adv_classroom-00-00-noon');
     this.envGroup.visible = showClassroom;
     this.scene.background = showClassroom && this.skyTexture ? this.skyTexture : new THREE.Color(0x111520);
     if (this.bgEl) this.bgEl.style.display = 'none';
@@ -1994,24 +2324,28 @@ export class ViewerEngine {
       this.camera.rotateX(sk.pitch);
     }
 
-    this.storyPlayer.applyCharacter(t, st);
-    this._applyLookTarget(st, t);
-    if (st.actorVisible) {
-      this.char.solver.updatePostRig(t);
-    }
-
     this._applyStoryBackground(t, st);
     this._updateStoryOverlayState(t, st);
     this.voiceCtrl.sync(t, st, this.storyPlaying, this.storySpeed, () => this.storyTime);
 
-    this.char.update(this.camera);
-    this.char.renderShadow(this.renderer);
-
-    this.groundShadow.visible = this.actorGroup.visible && this.envGroup.visible;
-    if (this.groundShadow.visible) {
-      const hips = this.char.solver.nameToNode.Hips;
-      const hp = hips ? hips.getWorldPosition(new THREE.Vector3()) : this.actorGroup.position;
-      this.groundShadow.position.set(hp.x, this.actorGroup.position.y + 0.004, hp.z);
+    this.storyPlayer.applyCharacter(t, st);
+    for (const [aid, entry] of this.storyPlayer.actorEntries) {
+      const aSt = st.actors ? st.actors.get(aid) : st;
+      if (!entry.char || !entry.group) continue;
+      if (aSt && aSt.visible) {
+        this._applyLookTargetForActor(entry, aSt, t);
+        entry.char.solver.updatePostRig(t);
+        entry.char.update(this.camera);
+        entry.char.renderShadow(this.renderer);
+      }
+      if (entry.groundShadow) {
+        entry.groundShadow.visible = entry.group.visible && this.envGroup.visible;
+        if (entry.groundShadow.visible) {
+          const hips = entry.char.solver.nameToNode.Hips;
+          const hp = hips ? hips.getWorldPosition(new THREE.Vector3()) : entry.group.position;
+          entry.groundShadow.position.set(hp.x, entry.group.position.y + 0.004, hp.z);
+        }
+      }
     }
 
     if (this.bloom && this.useBloom) this.bloom.render(this.scene, this.camera);
@@ -2034,7 +2368,7 @@ export class ViewerEngine {
     return null;
   }
 
-  _resolveLookTargetPos(out, target) {
+  _resolveLookTargetPos(out, target, groupScaleY = 1) {
     const D2R = Math.PI / 180;
     const tp = target || DEFAULT_LOOK_TARGET;
     if (tp.type === 1) {
@@ -2049,11 +2383,11 @@ export class ViewerEngine {
       .applyQuaternion(this._lookActQuatW)
       .multiplyScalar(10)
       .add(this._lookActPosW);
-    out.y += 1.38 * this.actorGroup.scale.y;
+    out.y += 1.38 * groupScaleY;
     return out;
   }
 
-  _evalLookState(st, t) {
+  _evalLookState(st, t, groupScaleY = 1) {
     if (!st.looks || !st.looks.length) return null;
     let activeCue = null;
     for (const l of st.looks) {
@@ -2066,7 +2400,7 @@ export class ViewerEngine {
       const w = Math.max(0, Math.min(1, tgt.weight ?? 0));
       if (w <= 1e-4) return null;
       return {
-        posW: this._resolveLookTargetPos(this._lookTargetA, tgt),
+        posW: this._resolveLookTargetPos(this._lookTargetA, tgt, groupScaleY),
         headW: w * (tgt.headWeight ?? 0.6),
         bodyW: w * (tgt.bodyWeight ?? 0.1),
         eyesW: w * (tgt.eyesWeight ?? 0.3),
@@ -2084,15 +2418,15 @@ export class ViewerEngine {
       const dom = w0 < w1 ? to : from;
       const inCirc = 1 - Math.sqrt(Math.max(0, 1 - w * w));
       return {
-        posW: this._resolveLookTargetPos(this._lookTargetA, dom),
+        posW: this._resolveLookTargetPos(this._lookTargetA, dom, groupScaleY),
         headW: w * (dom.headWeight ?? 0.6),
         bodyW: inCirc * (dom.bodyWeight ?? 0.1),
         eyesW: w * (dom.eyesWeight ?? 0.3),
       };
     }
     if (w1 <= 1e-4) return null;
-    this._resolveLookTargetPos(this._lookTargetA, from);
-    this._resolveLookTargetPos(this._lookTargetB, to);
+    this._resolveLookTargetPos(this._lookTargetA, from, groupScaleY);
+    this._resolveLookTargetPos(this._lookTargetB, to, groupScaleY);
     this._lookTargetA.lerp(this._lookTargetB, u);
     return {
       posW: this._lookTargetA,
@@ -2150,17 +2484,17 @@ export class ViewerEngine {
     bone.updateMatrixWorld(true);
   }
 
-  _applyLookTarget(st, t) {
-    if (!this.char || !st.actorVisible) return;
-    const { solver } = this.char;
+  _applyLookTargetForActor(entry, aSt, t) {
+    if (!entry || !entry.char || !entry.group || !aSt.visible) return;
+    const { solver } = entry.char;
     if (!solver.nameToNode.Head) return;
 
-    this.actorGroup.updateMatrixWorld(true);
-    this.actorGroup.getWorldPosition(this._lookActPosW);
-    this.actorGroup.getWorldQuaternion(this._lookActQuatW);
+    entry.group.updateMatrixWorld(true);
+    entry.group.getWorldPosition(this._lookActPosW);
+    entry.group.getWorldQuaternion(this._lookActQuatW);
     this._lookActQuatInv.copy(this._lookActQuatW).invert();
 
-    const lk = this._evalLookState(st, t);
+    const lk = this._evalLookState(aSt, t, entry.group.scale.y);
     if (!lk) return;
 
     const chestName = solver.nameToNode.Chest
@@ -2174,6 +2508,22 @@ export class ViewerEngine {
     this._aimBoneAtTarget(solver, 'RightEye', lk.posW, lk.eyesW, 8, 5);
   }
 
+  _applyLookTarget(st, t) {
+    this._applyLookTargetForActor(
+      { char: this.char, group: this.actorGroup },
+      { visible: st.actorVisible, looks: st.looks },
+      t,
+    );
+  }
+
+  _applyVolumeToAllStoryChars(vol) {
+    if (!vol) return;
+    if (this.char) this.char.applyActorVolume(vol);
+    for (const entry of this.extraStoryActors.values()) {
+      if (entry.char) entry.char.applyActorVolume(vol);
+    }
+  }
+
   _applyStoryBackground(t, st) {
     const src = st.bgActive ? (this.storyTimeline.backgrounds.get(st.bgActive) || {}).src : null;
     const is3d = !!src && src.startsWith('env_3d');
@@ -2181,14 +2531,17 @@ export class ViewerEngine {
     const camFocalMm = (st.camera && st.camera.focalLength) || 30;
     if (this.bloom) this.bloom.setDof(activeDof, camFocalMm, is3d);
 
+    if (is3d) {
+      this._activateEnv3d(src);
+    }
     this.envGroup.visible = is3d;
     this.scene.background = is3d && this.skyTexture ? this.skyTexture : null;
-    if (src && src !== this._lastVolumeSrc && this.char) {
+    if (src && src !== this._lastVolumeSrc) {
       this._lastVolumeSrc = src;
       if (is3d && this.envInfo?.meta?.volumes) {
-        this.char.applyActorVolume(this.envInfo.meta.volumes);
+        this._applyVolumeToAllStoryChars(this.envInfo.meta.volumes);
       } else if (!is3d && this.bgMeta[src]?.volumes) {
-        this.char.applyActorVolume(this.bgMeta[src].volumes);
+        this._applyVolumeToAllStoryChars(this.bgMeta[src].volumes);
       }
     }
     if (is3d || !src) {
@@ -2213,37 +2566,41 @@ export class ViewerEngine {
       (W <= H ? meta.verticalSetting : meta.horizontalSetting) || meta.verticalSetting;
 
     const webglTex = this.bgTextures.get(src) || null;
-    if (this.bloom && this.useBloom && webglTex && fit && fit.baseSize && fit.clippingRect) {
+    if (this.bloom && this.useBloom && webglTex) {
       if (this.bgEl) this.bgEl.style.display = 'none';
-      const base = fit.baseSize;
-      const clip = fit.clippingRect;
-      const s0 = Math.max(W / clip.width, H / clip.height);
-      const imgW = base.x * s0;
-      const imgH = base.y * s0;
-      const cx = (clip.x + clip.width * 0.5) * s0;
-      const cy = (base.y - (clip.y + clip.height * 0.5)) * s0;
-      const tx = (pos.x || 0) * k;
-      const ty = -(pos.y || 0) * k;
-      const sx = Math.abs(scale.x || 1) > 1e-4 ? scale.x : 1;
-      const sy = Math.abs(scale.y || 1) > 1e-4 ? scale.y : 1;
-      const rad = ((angle || 0) * Math.PI) / 180;
-      const ca = Math.cos(rad);
-      const sa = Math.sin(rad);
-      const ax = W / sx;
-      const ay = H / sy;
-      const bx = (-0.5 * W - tx) / sx;
-      const by = (-0.5 * H - ty) / sy;
-      this._bgUvMat.set(
-        (ca * ax) / imgW,
-        (-sa * ay) / imgW,
-        (ca * bx - sa * by + cx) / imgW,
-        (sa * ax) / imgH,
-        (ca * ay) / imgH,
-        (sa * bx + ca * by + cy) / imgH,
-        0,
-        0,
-        1,
-      );
+      if (fit && fit.baseSize && fit.clippingRect) {
+        const base = fit.baseSize;
+        const clip = fit.clippingRect;
+        const s0 = Math.max(W / clip.width, H / clip.height);
+        const imgW = base.x * s0;
+        const imgH = base.y * s0;
+        const cx = (clip.x + clip.width * 0.5) * s0;
+        const cy = (base.y - (clip.y + clip.height * 0.5)) * s0;
+        const tx = (pos.x || 0) * k;
+        const ty = -(pos.y || 0) * k;
+        const sx = Math.abs(scale.x || 1) > 1e-4 ? scale.x : 1;
+        const sy = Math.abs(scale.y || 1) > 1e-4 ? scale.y : 1;
+        const rad = ((angle || 0) * Math.PI) / 180;
+        const ca = Math.cos(rad);
+        const sa = Math.sin(rad);
+        const ax = W / sx;
+        const ay = H / sy;
+        const bx = (-0.5 * W - tx) / sx;
+        const by = (-0.5 * H - ty) / sy;
+        this._bgUvMat.set(
+          (ca * ax) / imgW,
+          (-sa * ay) / imgW,
+          (ca * bx - sa * by + cx) / imgW,
+          (sa * ax) / imgH,
+          (ca * ay) / imgH,
+          (sa * bx + ca * by + cy) / imgH,
+          0,
+          0,
+          1,
+        );
+      } else {
+        this._bgUvMat.identity();
+      }
       this.bloom.setBg2D({ active: true, texture: webglTex, uvMatrix: this._bgUvMat, srcId: src });
       return;
     }
@@ -2290,6 +2647,127 @@ export class ViewerEngine {
     } else {
       this.storyFade = { color: f.color || '#000000', opacity: fadeA };
     }
+  }
+
+  compositeStoryFrameToCanvas(targetCanvas, includeUi = true) {
+    const ctx = targetCanvas.getContext('2d');
+    if (!ctx || !this.renderer) return;
+    const W = targetCanvas.width;
+    const H = targetCanvas.height;
+
+    ctx.fillStyle = '#090c12';
+    ctx.fillRect(0, 0, W, H);
+    ctx.drawImage(this.renderer.domElement, 0, 0, W, H);
+
+    const fade = this.storyFade;
+    if (fade && fade.opacity > 0.001) {
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, Math.min(1, fade.opacity));
+      ctx.fillStyle = fade.color || '#000000';
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
+
+    const msg = this.storyActiveMessage;
+    if (!includeUi || !msg) return;
+
+    const s = H / 720;
+    const bx = Math.round(W * 0.06);
+    const bw = Math.round(W * 0.88);
+    const bh = Math.round(136 * s);
+    const by = Math.round(H - bh - 30 * s);
+    const br = Math.round(16 * s);
+    const fontStack =
+      '"Droid Sans Japanese", "Droid Sans Fallback", "Noto Sans CJK JP", "Hiragino Sans", sans-serif';
+
+    ctx.save();
+    // Window background & shadow
+    ctx.shadowColor = 'rgba(25, 16, 22, 0.28)';
+    ctx.shadowBlur = 24 * s;
+    ctx.shadowOffsetY = 8 * s;
+    const winGrad = ctx.createLinearGradient(bx, by, bx + bw, by + bh);
+    winGrad.addColorStop(0, 'rgba(255, 254, 252, 0.955)');
+    winGrad.addColorStop(0.45, 'rgba(255, 246, 240, 0.945)');
+    winGrad.addColorStop(1, 'rgba(255, 228, 212, 0.935)');
+    ctx.fillStyle = winGrad;
+    ctx.beginPath();
+    ctx.roundRect(bx, by, bw, bh, br);
+    ctx.fill();
+
+    ctx.shadowColor = 'transparent';
+    ctx.lineWidth = Math.max(1, 1.5 * s);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+    ctx.stroke();
+
+    // Speaker pill badge
+    if (!msg.narration && msg.speaker) {
+      const spkFontPx = Math.max(11, Math.round(14 * s));
+      ctx.font = `700 ${spkFontPx}px ${fontStack}`;
+      const textW = ctx.measureText(msg.speaker).width;
+      const padX = Math.round(18 * s);
+      const pillW = Math.ceil(textW + padX * 2);
+      const pillH = Math.round(27 * s);
+      const pillX = bx + Math.round(28 * s);
+      const pillY = by - Math.round(13 * s);
+
+      const isProducer = msg.speaker === USER_NAME;
+      const pillGrad = ctx.createLinearGradient(pillX, pillY, pillX + pillW, pillY);
+      if (isProducer) {
+        pillGrad.addColorStop(0, '#3b88e8');
+        pillGrad.addColorStop(1, '#5ca0f2');
+      } else {
+        pillGrad.addColorStop(0, '#b858be');
+        pillGrad.addColorStop(1, '#d46ad0');
+      }
+      ctx.fillStyle = pillGrad;
+      ctx.beginPath();
+      ctx.roundRect(pillX, pillY, pillW, pillH, pillH / 2);
+      ctx.fill();
+
+      ctx.fillStyle = '#ffffff';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(msg.speaker, pillX + padX, pillY + pillH / 2 + 0.5 * s);
+    }
+
+    // Dialogue body text with wrapping
+    const bodyFontPx = Math.max(12, Math.round(18 * s));
+    const lineHeight = Math.round(bodyFontPx * 1.58);
+    ctx.font = `600 ${bodyFontPx}px ${fontStack}`;
+    ctx.fillStyle = '#36281e';
+    ctx.textBaseline = 'top';
+    const textX = bx + Math.round(32 * s);
+    let textY = by + Math.round(24 * s);
+    const maxTextW = bw - Math.round(64 * s);
+    const rawLines = String(msg.shownText || '').split(/\r?\n/);
+    for (const rawLine of rawLines) {
+      let cur = '';
+      for (const ch of rawLine) {
+        const test = cur + ch;
+        if (cur && ctx.measureText(test).width > maxTextW) {
+          ctx.fillText(cur, textX, textY);
+          textY += lineHeight;
+          cur = ch;
+        } else {
+          cur = test;
+        }
+      }
+      ctx.fillText(cur, textX, textY);
+      textY += lineHeight;
+    }
+
+    // Next indicator triangle
+    const bob = Math.sin((this.storyTime || 0) * 3.5) * 2 * s;
+    const tx = bx + bw - Math.round(26 * s);
+    const ty = by + bh - Math.round(18 * s) + bob;
+    ctx.fillStyle = '#c864b8';
+    ctx.beginPath();
+    ctx.moveTo(tx - 6 * s, ty - 4 * s);
+    ctx.lineTo(tx + 6 * s, ty - 4 * s);
+    ctx.lineTo(tx, ty + 4 * s);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.restore();
   }
 
   _setupWindowHooks() {

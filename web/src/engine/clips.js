@@ -89,7 +89,12 @@ export function evalClip(clip, time) {
     } else if (t.kind === 'root') {
       root[t.prop] = sample(t, time);
     } else if (t.kind === 'bone') {
-      bones.push({ node: t.node, prop: t.prop, value: sample(t, time) });
+      bones.push({
+        node: t.node,
+        boneName: t.path ? String(t.path).split('/').pop() : null,
+        prop: t.prop,
+        value: sample(t, time),
+      });
     } else if (t.kind === 'blend') {
       morph.push([t.index, sample(t, time)[0] / 100]);
     }

@@ -235,18 +235,22 @@ export function getCacheIndex(): CacheIndex {
 export const ACTOR_NAMES: Record<string, { ja: string; zh: string; color: string }> = {
   amao: { ja: "有村 麻央", zh: "有村 麻央", color: "#b858be" },
   hski: { ja: "花海 咲季", zh: "花海 咲季", color: "#e84858" },
-  temr: { ja: "月村 手毬", zh: "月村 手毬", color: "#3b88e8" },
+  ttmr: { ja: "月村 手毬", zh: "月村 手毬", color: "#3b88e8" },
   fktn: { ja: "藤田 ことね", zh: "藤田 琴音", color: "#f2b824" },
   hmsz: { ja: "秦谷 美鈴", zh: "秦谷 美铃", color: "#7888d8" },
   ssmk: { ja: "紫雲 清夏", zh: "紫云 清夏", color: "#7ed448" },
   kcna: { ja: "倉本 千奈", zh: "仓本 千奈", color: "#f48234" },
-  cljs: { ja: "葛城 リーリヤ", zh: "葛城 莉莉娅", color: "#68c8e8" },
+  kllj: { ja: "葛城 リーリヤ", zh: "葛城 莉莉娅", color: "#68c8e8" },
   shro: { ja: "篠澤 広", zh: "筱泽 广", color: "#44b4b8" },
   hrnm: { ja: "姫崎 莉波", zh: "姬崎 莉波", color: "#f088aa" },
   hume: { ja: "花海 佑芽", zh: "花海 佑芽", color: "#e86448" },
-  atbm: { ja: "十王 星南", zh: "十王 星南", color: "#d8a848" },
+  jsna: { ja: "十王 星南", zh: "十王 星南", color: "#d8a848" },
   nasr: { ja: "根緒 亜紗里", zh: "根绪 亚纱里", color: "#68b888" },
-  trbm: { ja: "雨夜 燕", zh: "雨夜 燕", color: "#7c64d8" },
+  atbm: { ja: "雨夜 燕", zh: "雨夜 燕", color: "#7c64d8" },
+  trvo: { ja: "Vo 训练员", zh: "Vo 训练员", color: "#93354d" },
+  trda: { ja: "Da 训练员", zh: "Da 训练员", color: "#316296" },
+  trvi: { ja: "Vi 训练员", zh: "Vi 训练员", color: "#926e20" },
+  krnh: { ja: "賀陽 燐羽", zh: "贺阳燐羽", color: "#8f6c95" },
 };
 
 const COSTUME_CATEGORY_LABELS: Record<string, string> = {
@@ -373,13 +377,19 @@ function summarizeScriptFile(
 }
 
 let manifestBundlesCache: OctoBundle[] | null = null;
+let manifestBundleSetCache: Set<string> | null = null;
+let manifestResourceSetCache: Set<string> | null = null;
 function getManifestBundles(): OctoBundle[] {
   if (manifestBundlesCache !== null) return manifestBundlesCache;
   try {
     const m = load_manifest();
     manifestBundlesCache = m.assetBundleList ?? [];
+    manifestBundleSetCache = new Set(manifestBundlesCache.map((b) => b.name));
+    manifestResourceSetCache = new Set((m.resourceList ?? []).map((r) => r.name));
   } catch {
     manifestBundlesCache = [];
+    manifestBundleSetCache = new Set();
+    manifestResourceSetCache = new Set();
   }
   return manifestBundlesCache;
 }
@@ -641,12 +651,21 @@ export async function handleApiAndCacheRequest(
   if (pathname === "/api/ensure" && method === "POST") {
     try {
       const body = await readJsonBody(req);
-      const bundles: string[] = Array.isArray(body?.bundles)
+      getManifestBundles();
+      const rawBundles: string[] = Array.isArray(body?.bundles)
         ? body.bundles.map((x: unknown) => String(x).replace(/\.bundle$/, "")).filter(Boolean)
         : [];
-      const resources: string[] = Array.isArray(body?.resources)
+      const rawResources: string[] = Array.isArray(body?.resources)
         ? body.resources.map((x: unknown) => String(x)).filter(Boolean)
         : [];
+      const bundles =
+        manifestBundleSetCache && manifestBundleSetCache.size > 0
+          ? rawBundles.filter((b) => manifestBundleSetCache!.has(b))
+          : rawBundles;
+      const resources =
+        manifestResourceSetCache && manifestResourceSetCache.size > 0
+          ? rawResources.filter((r) => manifestResourceSetCache!.has(r))
+          : rawResources;
       if (bundles.length > 0) {
         await ensure_bundles(bundles, true, true);
         invalidateCacheIndex();

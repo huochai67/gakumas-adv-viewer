@@ -281,6 +281,8 @@ class CharExporter {
     this.meta.boneNodes[String(idx)] = node.name;
     if (!this.meta.nodeByPathId) this.meta.nodeByPathId = {};
     this.meta.nodeByPathId[pkey(node.path_id)] = idx;
+    if (!this.meta.nodeByName) this.meta.nodeByName = {};
+    if (!(node.name in this.meta.nodeByName)) this.meta.nodeByName[node.name] = idx;
     for (const c of node.children) this.emit_tree(c, idx);
     return idx;
   }
@@ -1818,10 +1820,12 @@ async function ensureClipTables(env, charMeta) {
   }
 
   const byPath = charMeta?.nodeByPathId ?? null;
+  const byName = charMeta?.nodeByName ?? null;
   if (byPath && env._clipCharPaths !== byPath) {
     const paths = new Map();
     for (const [h, v] of env._clipPathTable) {
-      const raw = byPath[String(v[0])];
+      const bname = String(v[1] || '').split('/').pop();
+      const raw = byPath[String(v[0])] ?? (bname && byName ? byName[bname] : undefined);
       paths.set(h, [raw === undefined ? -1 : Math.trunc(Number(raw)), v[1]]);
     }
     env._clipCharPaths = byPath;
@@ -1857,21 +1861,19 @@ function exportClipsFromBundle(env, bundleName, paths, blends) {
         if (info === undefined) {
           unresolved += 1;
         } else if (!String(a.m_Name).includes('facial')) {
-          const node_id = Number(info[0]) >= 0 ? Number(info[0]) : null;
-          if (node_id !== null) {
-            const vals = [];
-            for (const t of times) {
-              for (let k = 0; k < dim; k++) vals.push(round5(s.value(slot + k, t)));
-            }
-            tracks.push({
-              kind: 'bone',
-              node: node_id,
-              prop: TRANSFORM_PROPS[gb.attribute],
-              values: vals,
-              dim,
-              path: info[1],
-            });
+          const node_id = Number(info[0]) >= 0 ? Number(info[0]) : -1;
+          const vals = [];
+          for (const t of times) {
+            for (let k = 0; k < dim; k++) vals.push(round5(s.value(slot + k, t)));
           }
+          tracks.push({
+            kind: 'bone',
+            node: node_id,
+            prop: TRANSFORM_PROPS[gb.attribute],
+            values: vals,
+            dim,
+            path: info[1],
+          });
         }
       } else if (gb.typeID === 95 && gb.customType === 8) {
         const attr = Math.trunc(gb.attribute);

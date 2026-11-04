@@ -517,7 +517,7 @@ export class PoseSolver {
 
     // ---------- Secondary Transform bone tracks (hair/skirt/bust physics baked in clips) ----------
     for (const t of boneTracks) {
-      const obj = this.nodes.get(t.node);
+      const obj = (t.boneName && this.nameToNode[t.boneName]) || this.nodes.get(t.node);
       if (!obj) continue;
       // Do not let generic bone tracks clobber solved humanoid joints
       const sname = obj.userData?.skeletonName;

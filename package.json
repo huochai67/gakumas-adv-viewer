@@ -20,7 +20,8 @@
     "export:env": "node pipeline/export_env.ts",
     "export:bg": "node pipeline/export_bg.ts",
     "export:voices": "node pipeline/export_voices.ts",
-    "export:all": "pnpm export:char && pnpm export:clips && pnpm export:env && pnpm export:bg && pnpm export:voices"
+    "export:all": "pnpm export:char && pnpm export:clips && pnpm export:env && pnpm export:bg && pnpm export:voices",
+    "render": "node pipeline/render_video.ts"
   },
   "dependencies": {
     "react": "^19.3.1",
