@@ -186,9 +186,36 @@ correction:
   evaluation in `unity_anim.ts`) and exports `RootT/RootQ` + foot/hand IK tracks.
   `pose.js` solves exact Unity `zyRoll` muscle Swing-Twist rotations relative to
   `TPOSE_MUSCLES`, anchors `Hips` height from foot sole `lfT/rfT`, curls/spreads
-  fingers in local bone frames, and drives `QuartzDriver` helper twist bones.
+  fingers in local bone frames, and applies IK correction before clothing drivers.
   Full-body `actormotion` cues cross-fade directly over `transition` seconds,
   while `actoradditivemotion` subtracts its `t = 0` reference pose (`add(t) - add(0)`).
+* **QuartzDriver clothing pose**: `quartz.js` and `quartz_math.js` execute the
+  serialized Rotation, Frill, Skirt, Hair, HumanoidHand/Sleeve/UpLeg/Arm, Waist,
+  Furisode and Poncho jobs after IK and before ActorSwing. Browser loading and
+  CLI export resolve their reference **GameObject** PPtrs to skeleton nodes;
+  assembled Head/Neck references are injected into hair jobs as in the game.
+  Native axis orders, decomposition, coefficients, limits and setting coordinate
+  conversions replace the former fixed-name helper rules. Animation snapshots
+  prevent helper feedback during paused renders, blending and seeking. This fixes
+  the sideways sleeves on `fktn-cstm-0063` / `mot_all_chr_fktn_kime-002_in`;
+  increasing physics collider sizes is not a substitute for these pose drivers.
+  The JavaScript port preserves the native formulas, not bit-identical Unity
+  floating-point results or a guarantee of no clipping in every outfit/motion.
+* **ActorSwing secondary motion**: `actor_swing.js` replaces the approximate
+  solver with the native dynamic swing/slide, capsule collision, chain-net
+  smoothing, angular/reference limits, root compensation and stabilization
+  paths. `swing_breast.js` ports paired breast motion, weighted curves and arm
+  correction; the serialized breast collider is not used by the native job.
+  Both browser loading and CLI export retain the serialized modeling poses and
+  physics parameters without stiffness remapping. Capsule axes are X/Y/Z =
+  0/1/2, and their center-line half-length is `height / 2 - radiusA`.
+  Animation snapshots feed a 60 Hz accumulator; each native integration tick
+  uses `0.01667`, including reset-count stabilization (default count: 5).
+  Paused renders do not advance physics; seeking, looping backwards, changing
+  modes and toggling physics reset the state. This is a JavaScript/Three.js
+  port, not a claim of bit-identical Unity floating-point or AnimationStream
+  behavior. The viewer supplies neutral wind and standing defaults; the solver
+  also exposes wind and seated-correction parameters to its caller.
 
 ## Timeline
 

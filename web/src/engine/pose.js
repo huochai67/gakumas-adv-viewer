@@ -1,14 +1,16 @@
-// Exact Unity Mecanim Humanoid solver + ActorAnimationQuartzDriver helper twists.
+// Unity Mecanim Humanoid solver + serialized ActorAnimationQuartzDriver pass.
 //
 // Verified to <3mm against ground-truth Foot/Hand IK goals across Gakumas motion
 // clips. Computes joint rotations in Unity's exact ZYRoll2Quat muscle space
 // (with piecewise [min, max] limits and m_tpose neutral offsets), converts into
 // Three.js right-handed world space via the exact reflection homomorphism
 // conv_q(x, y, z, w) = (x, y, -z, -w), anchors Hips world position so feet lock
-// to the y=0 floor plane during hip sway, and applies QuartzDriver counter-twists
-// on shoulder/forearm/thigh helper bones.
+// to the y=0 floor plane. Post-rig IK and serialized QuartzDriver clothing
+// helpers run before the ActorSwing secondary-motion pass.
 
 import * as THREE from 'three';
+import { ActorSwing } from './actor_swing.js';
+import { QuartzDriver } from './quartz.js';
 
 const D2R = Math.PI / 180;
 const HUMAN_SCALE = 0.91611;
@@ -224,6 +226,7 @@ export class PoseSolver {
       }
     }
 
+    this.muscles = new Float32Array(TPOSE_MUSCLES);
     this._initSwingAndIK();
   }
 
@@ -277,7 +280,6 @@ export class PoseSolver {
     // ---------- Arms (37..54): Exact PreQ / PostQ Muscle-Center Quaternion Conjugation ----------
     // ForeArm bends at elbow with 0% axial twist; ForeArm_Roll_H (50%), Hand_H (90%) & Hand (100%)
     // distribute forearm pronation/supination smoothly from elbow to cuff without candy-wrapper twist.
-    const lArmTwDeg = -pw(m[41], -ARM_TW, ARM_TW);
     const lFaTwDeg = -pw(m[43], -FA_TW, FA_TW);
     const dLSh = mirrorX(qmul(qmul(Q_PRE_SH_R, zyUnity(0, pw(m[38], SH_FB_N, SH_FB_P), pw(m[37], SH_DU_N, SH_DU_P))), Q_PRE_SH_R_INV));
     const qLSh = qmul(qTorso, dLSh);
@@ -293,7 +295,6 @@ export class PoseSolver {
     worldDeltaU.LeftForeArm = qLFa;
     worldDeltaU.LeftHand = qLHd;
 
-    const rArmTwDeg = -pw(m[50], -ARM_TW, ARM_TW);
     const rFaTwDeg = -pw(m[52], -FA_TW, FA_TW);
     const dRSh = qmul(qmul(Q_PRE_SH_R, zyUnity(0, pw(m[47], SH_FB_N, SH_FB_P), pw(m[46], SH_DU_N, SH_DU_P))), Q_PRE_SH_R_INV);
     const qRSh = qmul(qTorso, dRSh);
@@ -442,33 +443,6 @@ export class PoseSolver {
       }
     }
 
-    // ---------- All 18 QuartzDriver twist/bend/waist helper bones ----------
-    const applyTwistHelper = (bname, axisU, deg) => {
-      const obj = this.nameToNode[bname];
-      if (!obj || !obj.userData?.bindTRS) return;
-      const ql3 = obj.userData.bindTRS.q.clone().multiply(convQ(qaxis(axisU, deg)));
-      out.set(obj, { q: ql3 });
-    };
-    // HumanoidArmBone: Left & Right BOTH have worldX = [+1, 0, 0] -> same negative counter-twist sign!
-    applyTwistHelper('LeftArm_H', 0, -0.8 * lArmTwDeg);
-    applyTwistHelper('LeftArm_Roll_H', 0, -0.3 * lArmTwDeg);
-    applyTwistHelper('RightArm_H', 0, -0.8 * rArmTwDeg);
-    applyTwistHelper('RightArm_Roll_H', 0, -0.3 * rArmTwDeg);
-    // HumanoidHandBone: distributes forearm pronation/supination 50% mid-forearm, 90% cuff
-    applyTwistHelper('LeftForeArm_Roll_H', 0, 0.5 * lFaTwDeg);
-    applyTwistHelper('LeftHand_H', 0, 0.9 * lFaTwDeg);
-    applyTwistHelper('RightForeArm_Roll_H', 0, 0.5 * rFaTwDeg);
-    applyTwistHelper('RightHand_H', 0, 0.9 * rFaTwDeg);
-    // HumanoidUpLegBone: LeftUpLeg_H has worldX=+Y, RightUpLeg_H has worldX=-Y
-    applyTwistHelper('LeftUpLeg_H', 0, -1.0 * lUlTwDeg);
-    applyTwistHelper('LeftUpLeg_Roll_H', 0, -0.6 * lUlTwDeg);
-    applyTwistHelper('RightUpLeg_H', 0, 1.0 * rUlTwDeg);
-    applyTwistHelper('RightUpLeg_Roll_H', 0, 0.6 * rUlTwDeg);
-    // RotationBone: knee bend helpers (-0.5 on Leg bend; elbow helpers also updated post-IK)
-    const lKneeBend = -uDeg(m[24], -llSt, llSt, 0.9991);
-    const rKneeBend = -uDeg(m[32], -llSt, llSt, 0.9991);
-    applyTwistHelper('LeftLeg_H', 2, -0.5 * lKneeBend);
-    applyTwistHelper('RightLeg_H', 2, 0.5 * rKneeBend);
     // ---------- Hips World Position (RootT + Foot Sole Ground Anchor) ----------
     const hipsObj = this.nameToNode.Hips;
     const bp = this.bindPosU;
@@ -528,11 +502,20 @@ export class PoseSolver {
       else if (t.prop === 'scale') e.s = [t.value[0], t.value[1], t.value[2]];
       else if (t.prop === 'rotation') e.q = new THREE.Quaternion(t.value[0], t.value[1], -t.value[2], -t.value[3]);
     }
+    out.muscles = m;
     return out;
   }
 
   /** Write a pose to the rig, optionally blending from another pose (w=1 -> b). */
   applyPose(a, b, w = 1) {
+    this.swing.restorePose();
+    this.quartz.restorePose();
+    const am = a?.muscles, bm = b?.muscles;
+    if (am && bm) {
+      for (let i = 0; i < this.muscles.length; i++) this.muscles[i] = am[i] + (bm[i] - am[i]) * w;
+    } else {
+      this.muscles.set(bm || am || TPOSE_MUSCLES);
+    }
     const objs = new Set();
     if (a) for (const o of a.keys()) objs.add(o);
     if (b) for (const o of b.keys()) objs.add(o);
@@ -569,6 +552,9 @@ export class PoseSolver {
   }
 
   resetPose() {
+    this.swing.restorePose();
+    this.quartz.restorePose();
+    this.muscles.set(TPOSE_MUSCLES);
     for (const n of this.nodes.values()) {
       if (n.userData.bindTRS) {
         n.position.copy(n.userData.bindTRS.p);
@@ -578,201 +564,33 @@ export class PoseSolver {
     }
   }
 
-  // ---------------- Post-FK Rig Pass: IKCorrection + Elbow Quartz + ActorSwing ----------------
+  // ---------------- Post-FK Rig Pass: IKCorrection + QuartzDriver + ActorSwing ----------------
   _initSwingAndIK() {
-    const swing = this.meta.swing || {};
-    this.ikColliders = (this.meta.ikCorrection && this.meta.ikCorrection.colliders) || [];
-    this.ikGoals = (this.meta.ikCorrection && this.meta.ikCorrection.goals) || [];
-    this.staticColliderDefs = swing.staticColliders || [];
-    this.swingParticles = new Map(); // Object3D -> { pos: Vector3, vel: Vector3 }
-    this._lastSimTime = null;
-    this._lastHipsW = new THREE.Vector3();
-    this._lastRootPosW = new THREE.Vector3();
+    this.ikColliders = this.meta.ikCorrection?.colliders || [];
+    this.ikGoals = this.meta.ikCorrection?.goals || [];
     this.enableIK = true;
     this.enableSwing = true;
-    this._lastRootQuatW = new THREE.Quaternion();
-    this._hasLastRoot = false;
-
-    // Build ordered dynamic bone chains: root (parent not in dynSet) -> child -> ... -> _End
-    const dynByObj = new Map();
-    for (const db of (swing.dynamicBones || [])) {
-      const obj = this.nodes.get(db.node);
-      if (obj) dynByObj.set(obj, db);
-    }
-    this.swingChains = [];
-    this.maxSwingDepth = 0;
-    // Map glTF node index -> work slot index at depth d (where childEntry = chain[d + 1])
-    const childSlotByNode = new Map();
-    this._swingDepthSlots = [];
-
-    for (const [obj] of dynByObj) {
-      if (dynByObj.has(obj.parent)) continue; // only start at chain roots
-      const chain = [];
-      let cur = obj;
-      while (cur && dynByObj.has(cur)) {
-        const cfg = dynByObj.get(cur);
-        chain.push({ obj: cur, cfg, node: cfg.node });
-        cur = (cur.children || []).find((c) => dynByObj.has(c)) || null;
-      }
-      if (chain.length >= 2) {
-        this.swingChains.push(chain);
-        if (chain.length - 1 > this.maxSwingDepth) {
-          this.maxSwingDepth = chain.length - 1;
-        }
-      }
-    }
-
-    for (let d = 0; d < this.maxSwingDepth; d++) {
-      const slots = [];
-      for (const chain of this.swingChains) {
-        if (d + 1 >= chain.length) continue;
-        const slot = {
-          parentEntry: chain[d],
-          childEntry: chain[d + 1],
-          pivotW: new THREE.Vector3(),
-          animChildW: new THREE.Vector3(),
-          eqChildW: new THREE.Vector3(),
-          targetW: new THREE.Vector3(),
-          smoothW: new THREE.Vector3(),
-          segLen: 0,
-          valid: false,
-        };
-        slots.push(slot);
-        childSlotByNode.set(chain[d + 1].node, { depth: d, slot });
-      }
-      this._swingDepthSlots.push(slots);
-    }
-
-    // Build ActorSwingChain lateral capsule-net layers indexed by depth d (Layer d+1)
-    this.chainNetByDepth = Array.from({ length: this.maxSwingDepth }, () => []);
-    for (const net of (swing.chains || [])) {
-      const layers = net.layers || [];
-      for (let li = 0; li < layers.length; li++) {
-        const ly = layers[li];
-        if (!ly.active || !ly.nodes || ly.nodes.length < 2) continue;
-        const slotList = [];
-        let targetDepth = -1;
-        for (const nid of ly.nodes) {
-          const found = childSlotByNode.get(nid);
-          if (found) {
-            if (targetDepth === -1) targetDepth = found.depth;
-            if (found.depth === targetDepth) slotList.push(found.slot);
-          }
-        }
-        if (targetDepth >= 0 && targetDepth < this.maxSwingDepth && slotList.length >= 2) {
-          this.chainNetByDepth[targetDepth].push({
-            part: net.part || 'body',
-            around: Boolean(ly.around),
-            radius: ly.radius ?? 0.015,
-            smoothing: ly.smoothing ?? 0,
-            slots: slotList,
-          });
-        }
-      }
-    }
-
-    // Pre-allocate scratch math objects for 0-GC hot simulation
-    this._swScratch = {
-      uv: [0, 0],
-      d1: new THREE.Vector3(),
-      d2: new THREE.Vector3(),
-      r: new THREE.Vector3(),
-      cP: new THREE.Vector3(),
-      cQ: new THREE.Vector3(),
-      animCP: new THREE.Vector3(),
-      animCQ: new THREE.Vector3(),
-      diff: new THREE.Vector3(),
-      ab: new THREE.Vector3(),
-      ap: new THREE.Vector3(),
-      targetPt: new THREE.Vector3(),
-      projPt: new THREE.Vector3(),
-      pushDelta: new THREE.Vector3(),
-      dirA: new THREE.Vector3(),
-      dirB: new THREE.Vector3(),
-      qParentW: new THREE.Quaternion(),
-      qCurW: new THREE.Quaternion(),
-      qNewLocal: new THREE.Quaternion(),
-      qSwingW: new THREE.Quaternion(),
-      dq3: new THREE.Quaternion(),
-      qU3: new THREE.Quaternion(),
-      dqClamped3: new THREE.Quaternion(),
-      eulU: new THREE.Euler(0, 0, 0, 'YXZ'),
-      hipsW: new THREE.Vector3(),
-      hipsDelta: new THREE.Vector3(),
-      stepHipsDelta: new THREE.Vector3(),
-      rootPosW: new THREE.Vector3(),
-      rootQuatW: new THREE.Quaternion(),
-    };
+    this.quartz = new QuartzDriver(this.nodes, this.meta);
+    this.swing = new ActorSwing(this.nodes, this.meta, this.nameToNode.Hips);
   }
 
   resetSwing() {
-    this._lastSimTime = null;
-    this._hasLastRoot = false;
-    this.swingParticles.clear();
+    this.swing.reset();
   }
 
   /**
-   * Run post-FK / post-LookTarget torso anti-clipping 2-bone arm IK, elbow/waist Quartz
-   * helpers, and ActorSwing + ActorSwingChain cloth/hair capsule-net physics.
+   * Run post-FK / post-LookTarget arm IK, serialized QuartzDriver rules, then
+   * ActorSwing cloth/hair physics, matching the native animation job order.
    */
   updatePostRig(simTime = 0) {
     const hips = this.nameToNode.Hips;
     if (!hips) return;
-    let dt = 0;
-    if (this._lastSimTime !== null) {
-      dt = simTime - this._lastSimTime;
-    }
-    this._lastSimTime = simTime;
-
-    // Ensure world matrices are fresh before IK & collider evaluation
-    let rootObj = hips;
-    while (rootObj.parent) rootObj = rootObj.parent;
-    rootObj.updateMatrixWorld(true);
-
+    let root = hips;
+    while (root.parent) root = root.parent;
+    root.updateMatrixWorld(true);
     if (this.enableIK !== false) this._applyArmIKCorrection();
-    this._updateElbowAndWaistHelpers();
-    if (this.enableSwing === false) return;
-    const sc = this._swScratch;
-    hips.getWorldPosition(sc.hipsW);
-    const stageNode = hips.parent || rootObj;
-    stageNode.getWorldPosition(sc.rootPosW);
-    stageNode.getWorldQuaternion(sc.rootQuatW);
-
-    let isCut = !this._hasLastRoot;
-    if (this._hasLastRoot) {
-      const rootJumpSq = sc.rootPosW.distanceToSquared(this._lastRootPosW);
-      const rootRotDiff = 1 - Math.abs(sc.rootQuatW.dot(this._lastRootQuatW));
-      if (rootJumpSq > 0.01 || rootRotDiff > 0.01) isCut = true;
-    }
-    const isSeek = isCut || dt <= 0 || dt > 1.0 || !Number.isFinite(dt);
-    const colliders = this._buildWorldStaticColliders();
-
-    if (isSeek) {
-      sc.hipsDelta.set(0, 0, 0);
-      this._updateActorSwing(0, true, sc.hipsDelta, false, colliders);
-      // Pre-converge cloth/hair spring & ActorSwingChain capsule net (IsAlreadyStable equivalent)
-      const fixedDt = 1 / 60;
-      for (let s = 0; s < 6; s++) {
-        this._updateActorSwing(fixedDt, false, sc.hipsDelta, true, colliders);
-      }
-    } else {
-      sc.hipsDelta.subVectors(sc.hipsW, this._lastHipsW);
-      const clampedDt = Math.min(dt, 0.05);
-      const steps = Math.min(3, Math.max(1, Math.round(clampedDt * 60)));
-      const subDt = clampedDt / steps;
-      sc.stepHipsDelta.copy(sc.hipsDelta).multiplyScalar(1 / steps);
-      for (let s = 0; s < steps; s++) {
-        this._updateActorSwing(subDt, false, sc.stepHipsDelta, false, colliders);
-      }
-    }
-    for (let ci = 0; ci < this.swingChains.length; ci++) {
-      this.swingChains[ci][0].obj.updateMatrixWorld(true);
-    }
-
-    this._lastHipsW.copy(sc.hipsW);
-    this._lastRootPosW.copy(sc.rootPosW);
-    this._lastRootQuatW.copy(sc.rootQuatW);
-    this._hasLastRoot = true;
+    this.quartz.update(this.muscles);
+    this.swing.update(simTime, this.enableSwing !== false);
   }
 
   _applyArmIKCorrection() {
@@ -977,424 +795,5 @@ export class PoseSolver {
     handBone.updateMatrixWorld(true);
   }
 
-  _updateElbowAndWaistHelpers() {
-    // ActorAnimationQuartzDriverRotationBone on LeftForeArm_H & RightForeArm_H (coeff.y = -0.4)
-    const eul = new THREE.Euler(0, 0, 0, 'YXZ');
-    for (const [faName, hName] of [
-      ['LeftForeArm', 'LeftForeArm_H'],
-      ['RightForeArm', 'RightForeArm_H'],
-    ]) {
-      const fa = this.nameToNode[faName];
-      const h = this.nameToNode[hName];
-      if (!fa || !h || !fa.userData?.bindTRS || !h.userData?.bindTRS) continue;
-      const dq = fa.userData.bindTRS.q.clone().invert().multiply(fa.quaternion);
-      if (dq.w < 0) dq.set(-dq.x, -dq.y, -dq.z, -dq.w);
-      eul.setFromQuaternion(dq, 'YXZ');
-      const counterQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), eul.y * -0.4);
-      h.quaternion.copy(h.userData.bindTRS.q).multiply(counterQ);
-      h.updateMatrixWorld(false);
-    }
-  }
 
-  _buildWorldStaticColliders() {
-    if (!this._worldColPool) {
-      this._worldColPool = this.staticColliderDefs.map(() => ({
-        mask: 0,
-        isHead: false,
-        p1: new THREE.Vector3(),
-        p2: new THREE.Vector3(),
-        r1: 0,
-        r2: 0,
-        isSphere: false,
-      }));
-      this._colScratch = {
-        p: new THREE.Vector3(),
-        q: new THREE.Quaternion(),
-        cA: new THREE.Vector3(),
-        axisV: new THREE.Vector3(),
-      };
-    }
-    if (!this._activeWorldCols) this._activeWorldCols = [];
-    const list = this._activeWorldCols;
-    list.length = 0;
-    const cs = this._colScratch;
-    for (let i = 0; i < this.staticColliderDefs.length; i++) {
-      const sc = this.staticColliderDefs[i];
-      const node = this.nodes.get(sc.node) || this.nameToNode[sc.name];
-      if (!node) continue;
-      const entry = this._worldColPool[i];
-      node.getWorldPosition(cs.p);
-      node.getWorldQuaternion(cs.q);
-      cs.cA.set(sc.vA[0], sc.vA[1], -sc.vA[2]).applyQuaternion(cs.q).add(cs.p);
-      entry.mask = sc.mask;
-      entry.isHead = sc.part === 'face' || sc.name === 'Head_Face';
-      entry.r1 = sc.rA;
-      if (sc.type === 0) {
-        entry.p1.copy(cs.cA);
-        entry.p2.copy(cs.cA);
-        entry.r2 = sc.rA;
-        entry.isSphere = true;
-        list.push(entry);
-      } else if (sc.type === 1) {
-        // Campus ActorSwingCollider capsule axis: 0 = Y-axis (vertical), 1 = Z-axis, 2 = X-axis
-        const axIdx = Math.round(sc.vB[0]);
-        if (axIdx === 2) cs.axisV.set(1, 0, 0);
-        else if (axIdx === 1) cs.axisV.set(0, 0, 1);
-        else cs.axisV.set(0, 1, 0);
-        cs.axisV.applyQuaternion(cs.q).multiplyScalar(0.5 * (sc.vB[1] || 0));
-        entry.p1.copy(cs.cA).sub(cs.axisV);
-        entry.p2.copy(cs.cA).add(cs.axisV);
-        entry.r2 = sc.rB || sc.rA;
-        entry.isSphere = false;
-        list.push(entry);
-      } else if (sc.type === 2 && node.parent) {
-        entry.p1.copy(cs.cA);
-        node.parent.getWorldPosition(entry.p2);
-        let r1 = Math.max(0, sc.rA);
-        let r2 = Math.max(0, sc.rB || sc.rA);
-        entry.r1 = r1;
-        entry.r2 = r2;
-        // UpdateCollider (0x1809CF102): inset ConnectedCapsule endpoints by r1 & r2 so hemisphere caps terminate at joints
-        cs.axisV.subVectors(entry.p2, entry.p1);
-        const len = cs.axisV.length();
-        if (len > 1e-6) {
-          cs.axisV.multiplyScalar(1 / len);
-          if (r1 + r2 > len) {
-            const excess = r1 + r2 - len;
-            const sum = r1 + r2;
-            const d1 = (excess * r1) / sum;
-            r1 = Math.max(0, r1 - d1);
-            r2 = Math.max(0, r2 - (excess * r2) / Math.max(1e-6, r2 + r1));
-          }
-          entry.p1.addScaledVector(cs.axisV, r1);
-          entry.p2.addScaledVector(cs.axisV, -r2);
-        }
-        entry.isSphere = false;
-        list.push(entry);
-      }
-    }
-    return list;
-  }
-
-  /**
-   * Exact segment-segment closest parameter solver matching
-   * ActorSwingCollisionUtility::CollisionCapsuleCapsule (0x1809D05E0).
-   */
-  _closestSegmentParams(p1, p2, q1, q2, outUV) {
-    const sc = this._swScratch;
-    const d1 = sc.d1.subVectors(p2, p1);
-    const d2 = sc.d2.subVectors(q2, q1);
-    const r = sc.r.subVectors(p1, q1);
-    const a = d1.lengthSq();
-    const e = d2.lengthSq();
-    const f = d2.dot(r);
-    let s = 0;
-    let t = 0;
-    if (a <= 1e-8 && e <= 1e-8) {
-      s = 0;
-      t = 0;
-    } else if (a <= 1e-8) {
-      s = 0;
-      t = Math.max(0, Math.min(1, f / e));
-    } else {
-      const c = d1.dot(r);
-      if (e <= 1e-8) {
-        t = 0;
-        s = Math.max(0, Math.min(1, -c / a));
-      } else {
-        const b = d1.dot(d2);
-        const denom = a * e - b * b;
-        if (denom > 1e-8) {
-          s = Math.max(0, Math.min(1, (b * f - c * e) / denom));
-        } else {
-          s = 0;
-        }
-        t = (b * s + f) / e;
-        if (t < 0) {
-          t = 0;
-          s = Math.max(0, Math.min(1, -c / a));
-        } else if (t > 1) {
-          t = 1;
-          s = Math.max(0, Math.min(1, (b - c) / a));
-        }
-      }
-    }
-    outUV[0] = s;
-    outUV[1] = t;
-  }
-
-  /**
-   * ActorAnimationSwingJobSkeleton::ProcessChainBoneCollider (0x1809C5C10 + 0x1809B45D0):
-   * Collide lateral capsule segments across adjacent cloth/hair chains against static colliders.
-   */
-  _solveChainNetCollider(netLayer, colliders) {
-    const sc = this._swScratch;
-    const slots = netLayer.slots;
-    const n = slots.length;
-    const segCount = netLayer.around ? n : n - 1;
-    const rChain = netLayer.radius;
-    const isHairNet = netLayer.part === 'hair';
-
-    for (let sweep = 0; sweep < 2; sweep++) {
-      let anyHit = false;
-      for (let k = 0; k < segCount; k++) {
-        const sA = slots[k];
-        const sB = slots[(k + 1) % n];
-        if (!sA.valid || !sB.valid) continue;
-        const mA = sA.childEntry.cfg.mask ?? 0;
-        const mB = sB.childEntry.cfg.mask ?? 0;
-        if (mA === 0 || mA === -1 || mB === 0 || mB === -1) continue;
-        const segMask = mA & mB;
-        if (segMask === 0) continue;
-
-        for (let ci = 0; ci < colliders.length; ci++) {
-          const col = colliders[ci];
-          if ((col.mask & segMask) === 0) continue;
-
-          this._closestSegmentParams(sA.targetW, sB.targetW, col.p1, col.p2, sc.uv);
-          const u = sc.uv[0];
-          const v = sc.uv[1];
-          sc.cP.copy(sA.targetW).lerp(sB.targetW, u);
-          sc.cQ.copy(col.p1).lerp(col.p2, v);
-          const rCol = col.r1 * (1 - v) + col.r2 * v;
-
-          let rReq;
-          if (isHairNet && col.isHead) {
-            this._closestSegmentParams(sA.animChildW, sB.animChildW, col.p1, col.p2, sc.uv);
-            sc.animCP.copy(sA.animChildW).lerp(sB.animChildW, sc.uv[0]);
-            sc.animCQ.copy(col.p1).lerp(col.p2, sc.uv[1]);
-            rReq = Math.min(rCol + 0.001, sc.animCP.distanceTo(sc.animCQ));
-          } else {
-            rReq = rCol + rChain + 0.0015;
-          }
-
-          sc.diff.subVectors(sc.cP, sc.cQ);
-          const dist = sc.diff.length();
-          if (dist < rReq && dist > 1e-6) {
-            sc.targetPt.copy(sc.cQ).addScaledVector(sc.diff, rReq / dist);
-            sc.ab.subVectors(sB.targetW, sA.targetW);
-            const abLenSq = sc.ab.lengthSq();
-            if (abLenSq > 1e-8) {
-              const projS = sc.ap.subVectors(sc.targetPt, sA.targetW).dot(sc.ab) / abLenSq;
-              sc.projPt.copy(sA.targetW).addScaledVector(sc.ab, projS);
-              sc.pushDelta.subVectors(sc.targetPt, sc.projPt);
-            } else {
-              sc.pushDelta.subVectors(sc.targetPt, sA.targetW);
-            }
-            // Apply lateral capsule pushout + UpdateSpringPosition (0x1809B6220) to both endpoints
-            sA.targetW.add(sc.pushDelta).sub(sA.pivotW).normalize().multiplyScalar(sA.segLen).add(sA.pivotW);
-            sB.targetW.add(sc.pushDelta).sub(sB.pivotW).normalize().multiplyScalar(sB.segLen).add(sB.pivotW);
-            anyHit = true;
-          }
-        }
-      }
-      if (!anyHit) break;
-    }
-  }
-
-  /**
-   * Layer-by-layer ActorAnimationSwingJobSkeleton::ProcessDynamicBones (0x1809C7E80)
-   * + ProcessDynamicBoneLayer (0x1809C7B40) + ProcessChainBone (0x1809C79C0).
-   */
-  _updateActorSwing(dt, resetState, stepHipsDelta, isPrewarm = false, collidersIn = null) {
-    if (!this.swingChains.length) return;
-    const colliders = collidersIn || this._buildWorldStaticColliders();
-    const sc = this._swScratch;
-    const scale60 = dt > 0 ? Math.min(1.5, dt * 60) : 1.0;
-
-    // Solve synchronously layer-by-layer (depth 0 -> maxSwingDepth - 1) across all chains
-    for (let d = 0; d < this.maxSwingDepth; d++) {
-      const slots = this._swingDepthSlots[d];
-
-      // Phase 1: Per-bone spring/gravity integration & individual dynamicCollider pushout
-      for (let si = 0; si < slots.length; si++) {
-        const slot = slots[si];
-        const pObj = slot.parentEntry.obj;
-        const cObj = slot.childEntry.obj;
-        const cCfg = slot.childEntry.cfg;
-
-        if (pObj.userData?.bindTRS) pObj.quaternion.copy(pObj.userData.bindTRS.q);
-        pObj.updateWorldMatrix(false, false);
-        if (cObj.userData?.bindTRS) cObj.quaternion.copy(cObj.userData.bindTRS.q);
-        cObj.updateWorldMatrix(false, false);
-        pObj.getWorldPosition(slot.pivotW);
-        cObj.getWorldPosition(slot.animChildW);
-        const segLen = slot.pivotW.distanceTo(slot.animChildW);
-        slot.segLen = segLen;
-        if (segLen < 1e-5) {
-          slot.valid = false;
-          continue;
-        }
-        slot.valid = true;
-
-        slot.eqChildW.copy(slot.animChildW);
-        if ((cCfg.mass ?? 0) > 0.01) {
-          const gScale = cCfg.part === 'hair'
-            ? 0.65
-            : Math.min(2.5, (0.01 / Math.max(0.005, cCfg.stiffness ?? 0.05)) * (1 / Math.max(0.04, segLen)) * 0.35);
-          slot.eqChildW.y -= segLen * (cCfg.mass ?? 0.5) * gScale;
-          slot.eqChildW.sub(slot.pivotW).normalize().multiplyScalar(segLen).add(slot.pivotW);
-        }
-
-        let st = this.swingParticles.get(cObj);
-        if (!st || resetState) {
-          st = { pos: slot.eqChildW.clone(), vel: new THREE.Vector3() };
-          this.swingParticles.set(cObj, st);
-        }
-
-        if (dt > 0) {
-          // GetRootCorrectionCancelPosition: cancel rootWeight fraction of Hips translation
-          if (!isPrewarm && stepHipsDelta) {
-            st.pos.addScaledVector(stepHipsDelta, cCfg.rootWeight ?? 0.3);
-          }
-          const baseDamp = Math.max(0.05, Math.min(0.60, (1.0 - (cCfg.damping ?? 0.5)) * 0.65));
-          const baseStiff = Math.max(0.28, Math.min(0.88, (cCfg.stiffness ?? 0.05) * 4.5 + 0.30));
-          const damp = isPrewarm ? 0 : ( baseDamp * scale60 );
-          const stiff = 1 - Math.pow(1 - baseStiff, scale60);
-          slot.targetW.copy(st.pos).addScaledVector(st.vel, damp);
-          if (cCfg.part !== 'hair') {
-            slot.targetW.y -= (cCfg.pendulum ?? 0) * 0.30 * scale60;
-          }
-          slot.targetW.lerp(slot.eqChildW, stiff);
-        } else {
-          slot.targetW.copy(slot.eqChildW);
-        }
-        slot.targetW.sub(slot.pivotW).normalize().multiplyScalar(segLen).add(slot.pivotW);
-
-        const cMask = cCfg.mask ?? 0;
-        const colType = cCfg.colType ?? 0;
-        const cRad = Math.max(0.004, cCfg.radius ?? 0.01);
-        if (colType !== 4 && cMask !== 0 && cMask !== -1) {
-          const isConnCap = colType === 2;
-          const cRadSub = Math.max(0.004, cCfg.radiusSub || cRad);
-          for (let iter = 0; iter < 2; iter++) {
-            let pushed = false;
-            for (let ci = 0; ci < colliders.length; ci++) {
-              const col = colliders[ci];
-              if ((col.mask & cMask) === 0) continue;
-              let rCol;
-              let rDyn = cRad;
-              if (isConnCap) {
-                this._closestSegmentParams(slot.targetW, slot.pivotW, col.p1, col.p2, sc.uv);
-                const u = sc.uv[0];
-                const v = sc.uv[1];
-                if (u > 0.98) continue;
-                sc.cP.copy(slot.targetW).lerp(slot.pivotW, u);
-                sc.cQ.copy(col.p1).lerp(col.p2, v);
-                rCol = col.r1 * (1 - v) + col.r2 * v;
-                rDyn = cRad * (1 - u) + cRadSub * u;
-              } else if (col.isSphere) {
-                sc.cP.copy(slot.targetW);
-                sc.cQ.copy(col.p1);
-                rCol = col.r1;
-              } else {
-                sc.ab.subVectors(col.p2, col.p1);
-                const lsq = sc.ab.lengthSq();
-                const v = lsq > 1e-8
-                  ? Math.max(0, Math.min(1, sc.ap.subVectors(slot.targetW, col.p1).dot(sc.ab) / lsq))
-                  : 0;
-                sc.cP.copy(slot.targetW);
-                sc.cQ.copy(col.p1).addScaledVector(sc.ab, v);
-                rCol = col.r1 * (1 - v) + col.r2 * v;
-              }
-              const isHairHead = col.isHead && cCfg.part === 'hair';
-              const rMin = isHairHead
-                ? Math.min(rCol + 0.001, slot.animChildW.distanceTo(sc.cQ))
-                : (rCol + rDyn + 0.0015);
-              sc.diff.subVectors(sc.cP, sc.cQ);
-              const dist = sc.diff.length();
-              if (dist < rMin && dist > 1e-6) {
-                slot.targetW.addScaledVector(sc.diff, (rMin - dist) / dist);
-                pushed = true;
-              }
-            }
-            if (!pushed) break;
-            slot.targetW.sub(slot.pivotW).normalize().multiplyScalar(segLen).add(slot.pivotW);
-          }
-        }
-      }
-
-      // Phase 2: ActorSwingChain lateral capsule-net collision & optional chain smoothing
-      const nets = this.chainNetByDepth[d];
-      for (let ni = 0; ni < nets.length; ni++) {
-        const netLayer = nets[ni];
-        this._solveChainNetCollider(netLayer, colliders);
-        if (netLayer.smoothing > 1e-5) {
-          const nSlots = netLayer.slots;
-          const nLen = nSlots.length;
-          const startK = netLayer.around ? 0 : 1;
-          const endK = netLayer.around ? nLen : nLen - 1;
-          for (let k = startK; k < endK; k++) {
-            const prevS = nSlots[(k - 1 + nLen) % nLen];
-            const curS = nSlots[k];
-            const nextS = nSlots[(k + 1) % nLen];
-            if (!prevS.valid || !curS.valid || !nextS.valid) continue;
-            curS.smoothW.addVectors(prevS.targetW, nextS.targetW).multiplyScalar(0.5);
-          }
-          for (let k = startK; k < endK; k++) {
-            const prevS = nSlots[(k - 1 + nLen) % nLen];
-            const curS = nSlots[k];
-            const nextS = nSlots[(k + 1) % nLen];
-            if (!prevS.valid || !curS.valid || !nextS.valid) continue;
-            curS.targetW.lerp(curS.smoothW, netLayer.smoothing);
-            curS.targetW.sub(curS.pivotW).normalize().multiplyScalar(curS.segLen).add(curS.pivotW);
-          }
-          this._solveChainNetCollider(netLayer, colliders);
-        }
-      }
-
-      // Phase 3: Solve parent bone rotations, enforce local YXZ Euler limits, and commit particle state
-      for (let si = 0; si < slots.length; si++) {
-        const slot = slots[si];
-        if (!slot.valid) continue;
-        const pObj = slot.parentEntry.obj;
-        const cObj = slot.childEntry.obj;
-        const pCfg = slot.parentEntry.cfg;
-
-        sc.dirA.subVectors(slot.animChildW, slot.pivotW).normalize();
-        sc.dirB.subVectors(slot.targetW, slot.pivotW).normalize();
-        if (sc.dirA.distanceToSquared(sc.dirB) > 1e-8) {
-          sc.qSwingW.setFromUnitVectors(sc.dirA, sc.dirB);
-          pObj.getWorldQuaternion(sc.qCurW);
-          if (pObj.parent) pObj.parent.getWorldQuaternion(sc.qParentW);
-          else sc.qParentW.identity();
-          sc.qNewLocal.copy(sc.qParentW).invert().multiply(sc.qSwingW.multiply(sc.qCurW));
-
-          if (pCfg.useLimit && pObj.userData?.bindTRS) {
-            const bindQ = pObj.userData.bindTRS.q;
-            sc.dq3.copy(bindQ).invert().multiply(sc.qNewLocal);
-            if (sc.dq3.w < 0) sc.dq3.set(-sc.dq3.x, -sc.dq3.y, -sc.dq3.z, -sc.dq3.w);
-            // Convert Three.js local delta to Unity local delta via convQ^-1: (-x, -y, +z, +w)
-            sc.qU3.set(-sc.dq3.x, -sc.dq3.y, sc.dq3.z, sc.dq3.w);
-            sc.eulU.setFromQuaternion(sc.qU3, 'YXZ');
-            const clampDeg = (rad, lim) => {
-              const deg = rad / D2R;
-              return Math.max(lim[0], Math.min(lim[1], deg)) * D2R;
-            };
-            sc.eulU.x = clampDeg(sc.eulU.x, pCfg.limitX);
-            sc.eulU.y = clampDeg(sc.eulU.y, pCfg.limitY);
-            sc.eulU.z = clampDeg(sc.eulU.z, pCfg.limitZ);
-            sc.qU3.setFromEuler(sc.eulU);
-            sc.dqClamped3.set(-sc.qU3.x, -sc.qU3.y, sc.qU3.z, sc.qU3.w);
-            pObj.quaternion.copy(bindQ).multiply(sc.dqClamped3);
-          } else {
-            pObj.quaternion.copy(sc.qNewLocal);
-          }
-          pObj.updateWorldMatrix(false, false);
-          cObj.updateWorldMatrix(false, false);
-        }
-
-        cObj.getWorldPosition(slot.targetW);
-        const st = this.swingParticles.get(cObj);
-        if (st) {
-          if (dt > 0 && !isPrewarm) {
-            st.vel.subVectors(slot.targetW, st.pos);
-          } else {
-            st.vel.set(0, 0, 0);
-          }
-          st.pos.copy(slot.targetW);
-        }
-      }
-    }
-  }
 }

@@ -559,8 +559,7 @@ export async function buildCharFromBundles(env, parts = PARTS) {
     );
   }
 
-  // Export ActorAnimationQuartzDriver* twist/helper bone rules from body
-  const qdrivers = [];
+  // Export body IK correction settings; Quartz waits until all part nodes exist.
   const ik_colliders = [];
   const ik_goals = [];
   for (const o of env.objectsOf(body_bundle, 'MonoBehaviour')) {
@@ -578,16 +577,7 @@ export async function buildCharFromBundles(env, parts = PARTS) {
     const node_idx = exp.node_of_go.get(pkey(go_pid));
     if (node_idx === undefined || node_idx === null) continue;
     const bname = exp.meta.boneNodes[String(node_idx)] ?? '';
-    if (tt.setting !== undefined && cls_name.includes('QuartzDriver')) {
-      const st = { ...tt.setting };
-      for (const ref_key of ['referenceBone', 'referenceWaistOffsetBone', 'referenceThighOffsetBone']) {
-        if (ref_key in st && st[ref_key] !== null && typeof st[ref_key] === 'object') {
-          const rpid = st[ref_key].m_PathID ?? 0;
-          st[ref_key] = exp.node_of_t.get(pkey(rpid)) ?? -1;
-        }
-      }
-      qdrivers.push({ node: node_idx, name: bname, type: cls_name, setting: st });
-    } else if (cls_name === 'ActorAnimationIKCorrectionCollider') {
+    if (cls_name === 'ActorAnimationIKCorrectionCollider') {
       const off = tt.offset || {};
       const rot = tt.rotation || {};
       ik_colliders.push({
@@ -614,7 +604,6 @@ export async function buildCharFromBundles(env, parts = PARTS) {
       });
     }
   }
-  exp.meta.quartzDrivers = qdrivers;
   exp.meta.ikCorrection = { colliders: ik_colliders, goals: ik_goals };
   const head_bone = exp.node_by_name.get('Head');
   if (head_bone === undefined) throw new Error('Head bone not found');
@@ -737,8 +726,48 @@ export async function buildCharFromBundles(env, parts = PARTS) {
       `hair_geo${i}`,
     );
   }
+  // Native Quartz references are GameObject PPtrs, not Transform PPtrs.
+  const qdrivers = [];
+  for (const [part, bundle] of [['body', body_bundle], ['face', face_bundle], ['hair', hair_bundle]]) {
+    for (const o of env.objectsOf(bundle, 'MonoBehaviour')) {
+      const mb = o.read();
+      const script = env.readPPtr(o.assetsFile, mb.m_Script);
+      const type = String(script?.m_ClassName ?? '');
+      if (!/^ActorAnimationQuartzDriver(?:Rotation|Frill|Skirt|Hair|HumanoidHand|HumanoidSleeve|HumanoidUpLeg|HumanoidArm|Waist|Furisode|Poncho)Bone$/.test(type) || mb.setting === undefined) continue;
+      const node = exp.node_of_go.get(pkey(mb.m_GameObject.m_PathID));
+      if (node === undefined) continue;
+      const setting = { ...mb.setting };
+      for (const [key, value] of Object.entries(setting)) {
+        if (value !== null && typeof value === 'object' && 'm_PathID' in value) {
+          setting[key] = exp.node_of_go.get(pkey(value.m_PathID)) ?? -1;
+        }
+      }
+      qdrivers.push({ node, name: exp.meta.boneNodes[String(node)] ?? '', type,
+        part, enabled: Boolean(mb.m_Enabled ?? true), setting });
+    }
+  }
+  exp.meta.quartzDrivers = qdrivers;
+
 
   // ---------------- ActorSwing colliders & dynamic spring bones ----------------
+  // Keep serialized modeling poses in Unity coordinates; solvers convert on initialization.
+  // Defaults follow native .ctors: DynamicBone 0x1809B3430, BreastBone 0x1809B24C0,
+  // Collider 0x1809CF8A0, ChainLayerInfo 0x1809B3FF0; uninitialized poses stay zero.
+  const swingVector = (v) => [Number(v?.x ?? 0), Number(v?.y ?? 0), Number(v?.z ?? 0)];
+  const swingQuaternion = (rotation) => {
+    const q = rotation?.value ?? rotation;
+    return [Number(q?.x ?? 0), Number(q?.y ?? 0), Number(q?.z ?? 0), Number(q?.w ?? 0)];
+  };
+  const swingModelingTransform = (t) => ({
+    localPosition: swingVector(t?.localPosition),
+    localRotation: swingQuaternion(t?.localRotation),
+    position: swingVector(t?.position),
+    rotation: swingQuaternion(t?.rotation),
+  });
+  const swingCurve = (curve) =>
+    curve == null ? null : (curve.m_Curve ?? []).map((key) =>
+      Object.fromEntries(Object.entries(key).map(([name, value]) => [name, Number(value)])),
+    );
   const static_cols = [];
   const dyn_bones = [];
   const breast_bones = [];
@@ -781,12 +810,14 @@ export async function buildCharFromBundles(env, parts = PARTS) {
           node: node_idx,
           name: bname,
           part: part_tag,
-          type: Math.trunc(sc.type ?? 0),
-          mask: Math.trunc(sc.collisionMask ?? 0),
+          enabled: Boolean(tt.m_Enabled ?? true),
+          type: Math.trunc(Number(sc.type ?? 0)),
+          mask: Math.trunc(Number(sc.collisionMask ?? -1)),
+          ignoreMask: Math.trunc(Number(sc.seatDynamicCorrectionDisableCollisionMask ?? 0)),
           vA: [Number(va.x ?? 0.0), Number(va.y ?? 0.0), Number(va.z ?? 0.0)],
           vB: [Number(vb.x ?? 0.0), Number(vb.y ?? 0.0), Number(vb.z ?? 0.0)],
-          rA: Number(sc.float_A ?? 0.0),
-          rB: Number(sc.float_B ?? 0.0),
+          rA: Number(sc.float_A ?? 0.05),
+          rB: Number(sc.float_B ?? 0.05),
         });
       } else if (cls_name === 'ActorSwingDynamicBone') {
         const dc = tt.dynamicCollider || {};
@@ -796,45 +827,104 @@ export async function buildCharFromBundles(env, parts = PARTS) {
         const lx = lim.axisX || {};
         const ly = lim.axisY || {};
         const lz = lim.axisZ || {};
+        const reference = tt.referenceLimitInfo;
+        const referenceKey = pkey(reference?.bone?.m_PathID ?? 0);
         dyn_bones.push({
           node: node_idx,
           name: bname,
           part: part_tag,
-          dynamicType: Math.trunc(tt.dynamicType ?? 0),
+          enabled: Boolean(tt.m_Enabled ?? true),
+          resetType: Math.trunc(Number(tt.resetType ?? 0)),
+          dynamicType: Math.trunc(Number(tt.dynamicType ?? 0)),
           damping: Number(tt.damping ?? 0.5),
-          stiffness: Number(tt.stiffness ?? 0.1),
+          stiffness: Number(tt.stiffness ?? 0.05),
           spring: Number(tt.spring ?? 0.0),
           pendulum: Number(tt.pendulum ?? 0.0),
           pendulumRange: Number(tt.pendulumRange ?? 1.0),
           mass: Number(tt.mass ?? 0.0),
-          rootWeight: Number(tt.rootWeight ?? 0.3),
-          colType: Math.trunc(dc.type ?? 0),
-          mask: Math.trunc(dc.collisionMask ?? 0),
+          rootWeight: Number(tt.rootWeight ?? 1.0),
+          axisAddXToY: Number(tt.axisAddXToY ?? 0),
+          axisAddXToZ: Number(tt.axisAddXToZ ?? 0),
+          wind: Number(tt.wind ?? 1),
+          useWindGlobalForce: Boolean(tt.useWindGlobalForce ?? true),
+          seatDynamicCorrection: Number(tt.seatDynamicCorrection ?? 0),
+          colType: Math.trunc(Number(dc.type ?? 0)),
+          mask: Math.trunc(Number(dc.collisionMask ?? -1)),
           offset: [Number(va.x ?? 0.0), Number(va.y ?? 0.0), Number(va.z ?? 0.0)],
           vB: [Number(vb.x ?? 0.0), Number(vb.y ?? 0.0), Number(vb.z ?? 0.0)],
-          radius: Number(dc.float_A ?? 0.0),
-          radiusSub: Number(dc.float_B ?? 0.0),
-          useLimit: Math.trunc(lim.useLimit ?? 0),
+          radius: Number(dc.float_A ?? 0.05),
+          radiusSub: Number(dc.float_B ?? 0.05),
+          useLimit: Math.trunc(Number(lim.useLimit ?? 0)),
           limitX: [Number(lx.x ?? -180), Number(lx.y ?? 180)],
           limitY: [Number(ly.x ?? -180), Number(ly.y ?? 180)],
           limitZ: [Number(lz.x ?? -180), Number(lz.y ?? 180)],
+          referenceLimit: {
+            node: mb_to_node.get(referenceKey) ?? exp.node_of_t.get(referenceKey) ?? -1,
+            lower: {
+              x: Boolean(reference?.min?.x ?? false),
+              y: Boolean(reference?.min?.y ?? false),
+              z: Boolean(reference?.min?.z ?? false),
+            },
+            upper: {
+              x: Boolean(reference?.max?.x ?? false),
+              y: Boolean(reference?.max?.y ?? false),
+              z: Boolean(reference?.max?.z ?? false),
+            },
+          },
+          modelingTransform: swingModelingTransform(tt.modelingTransform),
         });
       } else if (cls_name === 'ActorSwingBreastBone') {
         const bc = tt.breastCollider || {};
+        const lim = tt.limitInfo || {};
+        const lx = lim.axisX || {};
+        const ly = lim.axisY || {};
+        const lz = lim.axisZ || {};
         breast_bones.push({
           node: node_idx,
           name: bname,
+          part: part_tag,
+          enabled: Boolean(tt.m_Enabled ?? true),
+          colType: Math.trunc(Number(bc.type ?? 0)),
+          offset: swingVector(bc.vector3_A),
+          vB: swingVector(bc.vector3_B),
+          radiusSub: Number(bc.float_B ?? 0.05),
+          ignoreMask: Math.trunc(Number(bc.seatDynamicCorrectionDisableCollisionMask ?? 0)),
           radius: Number(bc.float_A ?? 0.05),
-          mask: Math.trunc(bc.collisionMask ?? -1),
-          damping: Number(tt.damping ?? 0.24),
-          stiffness: Number(tt.stiffness ?? 0.08),
-          spring: Number(tt.spring ?? 1.0),
+          mask: Math.trunc(Number(bc.collisionMask ?? -1)),
+          damping: Number(tt.damping ?? 0.5),
+          stiffness: Number(tt.stiffness ?? 0.05),
+          spring: Number(tt.spring ?? 0),
+          pendulum: Number(tt.pendulum ?? 0),
+          pendulumRange: Number(tt.pendulumRange ?? 0),
+          average: Number(tt.average ?? 0),
+          useLimit: Math.trunc(Number(lim.useLimit ?? 0)),
+          limitX: [Number(lx.x ?? -180), Number(lx.y ?? 180)],
+          limitY: [Number(ly.x ?? -180), Number(ly.y ?? 180)],
+          limitZ: [Number(lz.x ?? -180), Number(lz.y ?? 180)],
+          rootWeight: Number(tt.rootWeight ?? 1),
+          useArmCorrection: Boolean(tt.useArmCorrection ?? true),
           leftLowerArm: exp.node_of_t.get(pkey((tt.leftLowerArm || {}).m_PathID ?? 0)) ?? -1,
           rightLowerArm: exp.node_of_t.get(pkey((tt.rightLowerArm || {}).m_PathID ?? 0)) ?? -1,
           leftBreast: exp.node_of_t.get(pkey((tt.leftBreast || {}).m_PathID ?? 0)) ?? -1,
           rightBreast: exp.node_of_t.get(pkey((tt.rightBreast || {}).m_PathID ?? 0)) ?? -1,
           leftBreastEnd: exp.node_of_t.get(pkey((tt.leftBreastEnd || {}).m_PathID ?? 0)) ?? -1,
           rightBreastEnd: exp.node_of_t.get(pkey((tt.rightBreastEnd || {}).m_PathID ?? 0)) ?? -1,
+          modelingLeftTransform: swingModelingTransform(tt.modelingLeftTransform),
+          modelingRightTransform: swingModelingTransform(tt.modelingRightTransform),
+          modelingLeftEndTransform: swingModelingTransform(tt.modelingLeftEndTransform),
+          modelingRightEndTransform: swingModelingTransform(tt.modelingRightEndTransform),
+          upCurve: swingCurve(tt.upCurve),
+          sideCurve: swingCurve(tt.sideCurve),
+          ...(tt.upCurve && {
+            upCurvePreInfinity: Number(tt.upCurve.m_PreInfinity),
+            upCurvePostInfinity: Number(tt.upCurve.m_PostInfinity),
+            upCurveRotationOrder: Number(tt.upCurve.m_RotationOrder),
+          }),
+          ...(tt.sideCurve && {
+            sideCurvePreInfinity: Number(tt.sideCurve.m_PreInfinity),
+            sideCurvePostInfinity: Number(tt.sideCurve.m_PostInfinity),
+            sideCurveRotationOrder: Number(tt.sideCurve.m_RotationOrder),
+          }),
         });
       } else if (cls_name === 'ActorSwingChain') {
         const root_nodes = [];
@@ -850,9 +940,9 @@ export async function buildCharFromBundles(env, parts = PARTS) {
             if (idx !== undefined) lnodes.push(idx);
           }
           layers.push({
-            active: Math.trunc(ly.active ?? 0),
-            around: Math.trunc(ly.around ?? 0),
-            radius: Number(ly.radius ?? 0.015),
+            active: Math.trunc(Number(ly.active ?? 0)),
+            around: Math.trunc(Number(ly.around ?? 0)),
+            radius: Number(ly.radius ?? 0.05),
             smoothing: Number(ly.smoothing ?? 0.0),
             nodes: lnodes,
           });
@@ -861,6 +951,7 @@ export async function buildCharFromBundles(env, parts = PARTS) {
           node: node_idx,
           name: bname,
           part: part_tag,
+          enabled: Boolean(tt.m_Enabled ?? true),
           rootNodes: root_nodes,
           layers,
         });

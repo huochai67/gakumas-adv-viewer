@@ -1615,6 +1615,8 @@ export class ViewerEngine {
   // -------------------- Mode Switching --------------------
   setMode(newMode) {
     if (this.mode === newMode) return;
+    this.char?.solver.resetSwing();
+    for (const entry of this.extraStoryActors.values()) entry.char?.solver.resetSwing();
     this.mode = newMode;
     if (newMode === 'asset') {
       this.storyPlaying = false;
@@ -1784,6 +1786,7 @@ export class ViewerEngine {
 
   setAssetTime(t) {
     this.assetTime = Math.max(0, Math.min(this.assetDuration, Number(t) || 0));
+    this.char?.solver.resetSwing();
     this.renderFrame();
     this._emit();
   }
@@ -1800,7 +1803,7 @@ export class ViewerEngine {
     if (this.char) {
       this.char.solver.enableIK = this.assetEnableIK;
       this.char.solver.enableSwing = this.assetEnableSwing;
-      if (!this.assetEnableSwing) this.char.solver.resetSwing();
+      if (enableSwing !== undefined) this.char.solver.resetSwing();
     }
     this._emit();
     this.renderFrame();
