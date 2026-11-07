@@ -23,6 +23,7 @@ import {
   type SkeletonNode,
 } from "./assets.ts";
 import { ClipSampler, bindingDimension, crc32 } from "./core/unity_anim.ts";
+import { ANIMATION_MANAGE_DEFAULTS } from "../web/src/engine/animation_manage.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
@@ -38,7 +39,9 @@ const ROOT_PROPS: Array<[string, number, number]> = [
   ["rootT", 7, 3],
   ["rootQ", 10, 4],
   ["lfT", 14, 3],
+  ["lfQ", 17, 4],
   ["rfT", 21, 3],
+  ["rfQ", 24, 4],
   ["lhT", 28, 3],
   ["lhQ", 31, 4],
   ["rhT", 35, 3],
@@ -50,6 +53,8 @@ const TRANSFORM_PROPS: Record<number, string> = {
   3: "scale",
   4: "euler",
 };
+const MANAGE_PROPS = new Map<number, string>(Object.keys(ANIMATION_MANAGE_DEFAULTS).map((key) =>
+  [crc32(`propertyData.${key}`) >>> 0, key]));
 
 function round5(v: number): number {
   return Math.round(v * 1e5) / 1e5;
@@ -175,6 +180,13 @@ function exportClip(
           }
         }
       } else if (gb.typeID === 114) {
+        const manage = MANAGE_PROPS.get(gb.attribute >>> 0);
+        if (manage !== undefined) {
+          const values = times.map((t) => round5(s.value(slot, t)));
+          tracks.push({ kind: "manage", prop: manage, values });
+          slot += dim;
+          continue;
+        }
         const info = blends.get(gb.attribute >>> 0);
         if (info !== undefined) {
           const vals: number[] = [];

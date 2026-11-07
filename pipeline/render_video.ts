@@ -1220,20 +1220,15 @@ async function main(): Promise<void> {
             compositeCanvas.width = job.width;
             compositeCanvas.height = job.height;
 
-            // Reset physics state before frame 0
-            if (eng.char) eng.char.solver.resetSwing();
-            if (eng.extraStoryActors) {
-              for (const entry of eng.extraStoryActors.values()) {
-                if (entry.char) entry.char.solver.resetSwing();
-              }
-            }
+            // Seed the independent simulation clock and reset all actors once.
+            eng.seekStory(job.startTime, false);
 
             await log('Rendering ' + job.totalFrames + ' frames (' + job.width + 'x' + job.height + ' @ ' + job.fps + 'fps)...');
 
             for (let f = 0; f < job.totalFrames; f++) {
               const t = job.startTime + f / job.fps;
               eng.storyTime = t;
-              eng._renderStoryFrame();
+              eng.renderFrame(f === 0 ? 0 : 1 / job.fps);
               eng.compositeStoryFrameToCanvas(compositeCanvas, job.includeUi);
 
               const blob = await new Promise((resolve) =>

@@ -7,7 +7,7 @@ import { createBloom } from './bloom.js';
 import { applyCameraSetting, unityEulerQuat } from './camera.js';
 import { loadCharacter } from './char.js';
 import { getClip, evalClip, setClipCharMeta } from './clips.js';
-import { TPOSE_MUSCLES } from './pose.js';
+import { applyAnimationManage, blendAnimationManage } from './animation_manage.js';
 import { getBrowserEnv } from '../runtime/bundle_env.js';
 import {
   PARTS as DEFAULT_PARTS,
@@ -76,7 +76,9 @@ function blendRoot(ra, rb, w) {
     rootT: lerpArr(ra.rootT, rb.rootT, w),
     rootQ: nlerpQuat(ra.rootQ, rb.rootQ, w),
     lfT: lerpArr(ra.lfT, rb.lfT, w),
+    lfQ: nlerpQuat(ra.lfQ, rb.lfQ, w),
     rfT: lerpArr(ra.rfT, rb.rfT, w),
+    rfQ: nlerpQuat(ra.rfQ, rb.rfQ, w),
     lhT: lerpArr(ra.lhT, rb.lhT, w),
     lhQ: nlerpQuat(ra.lhQ, rb.lhQ, w),
     rhT: lerpArr(ra.rhT, rb.rhT, w),
@@ -423,6 +425,7 @@ class StoryPlayer {
     this.baseClip = null;
     this.baseTime = 0;
     this.defaultBg = [...timeline.backgrounds.keys()][0] || null;
+    this.animationManageProperties = null;
     this.hasVoices = false;
   }
 
@@ -888,7 +891,7 @@ class StoryPlayer {
       const ce = curM.ev;
       const pe = prevM ? prevM.ev : base;
       for (let i = 0; i < 95; i++) {
-        const cv = ce.hasMuscle[i] ? ce.muscles[i] : base ? base.muscles[i] : TPOSE_MUSCLES[i];
+        const cv = ce.hasMuscle[i] ? ce.muscles[i] : base?.hasMuscle[i] ? base.muscles[i] : solver.tposeMuscles[i];
         const pv = pe && pe.hasMuscle[i] ? pe.muscles[i] : cv;
         muscles[i] = pv * (1 - w) + cv * w;
       }
@@ -926,11 +929,11 @@ class StoryPlayer {
         muscles[6] += breath;
       }
     } else if (base) {
-      muscles.set(base.muscles);
+      for (let i = 0; i < 95; i++) muscles[i] = base.hasMuscle[i] ? base.muscles[i] : solver.tposeMuscles[i];
       root = base.root;
       bones.push(...base.bones);
     } else {
-      muscles.set(TPOSE_MUSCLES);
+      muscles.set(solver.tposeMuscles);
     }
 
     for (const a of aSt.additive) {
@@ -947,6 +950,9 @@ class StoryPlayer {
       }
     }
 
+    const manage = curM ? blendAnimationManage(prevM?.ev.manage || base?.manage, curM.ev.manage, w,
+      this.animationManageProperties, this.animationManageVolume) : base?.manage;
+    applyAnimationManage(solver.swing, this.animationManageProperties, manage, this.animationManageVolume);
     solver.applyPose(null, solver.poseFrom(muscles, bones, root), 1);
 
     const morph = new Map();
@@ -1055,6 +1061,7 @@ export class ViewerEngine {
     this.assetStageMode = 'studio'; // 'studio' | 'classroom'
     this.assetEnableIK = true;
     this.assetEnableSwing = true;
+    this.animationManageProperties = null;
     this.assetManualMorphs = new Map();
 
     // Story Browser state
@@ -1098,6 +1105,10 @@ export class ViewerEngine {
     this._lookRotActor = new THREE.Quaternion();
     this._lookRotWorld = new THREE.Quaternion();
     this._lookEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+
+    // Monotonic simulation time between explicit resets, independent of clip
+    // wrap, playback speed and held end poses. UI-only renders do not advance it.
+    this.physicsTime = 0;
 
     this._lastEmitTs = 0;
     this._rafId = 0;
@@ -1613,10 +1624,15 @@ export class ViewerEngine {
   }
 
   // -------------------- Mode Switching --------------------
-  setMode(newMode) {
-    if (this.mode === newMode) return;
+  _resetPhysics(time) {
+    this.physicsTime = time;
     this.char?.solver.resetSwing();
     for (const entry of this.extraStoryActors.values()) entry.char?.solver.resetSwing();
+  }
+
+  setMode(newMode) {
+    if (this.mode === newMode) return;
+    this._resetPhysics(newMode === 'asset' ? this.assetTime : this.storyTime);
     this.mode = newMode;
     if (newMode === 'asset') {
       this.storyPlaying = false;
@@ -1726,7 +1742,7 @@ export class ViewerEngine {
         this.assetBodyClip = clip;
         this.assetDuration = Math.max(0.05, clip.duration || 4);
         this.assetTime = 0;
-        if (this.char) this.char.solver.resetSwing();
+        this._resetPhysics(this.mode === 'asset' ? this.assetTime : this.storyTime);
         this._emit();
         this.renderFrame();
       }
@@ -1786,7 +1802,7 @@ export class ViewerEngine {
 
   setAssetTime(t) {
     this.assetTime = Math.max(0, Math.min(this.assetDuration, Number(t) || 0));
-    this.char?.solver.resetSwing();
+    this._resetPhysics(this.assetTime);
     this.renderFrame();
     this._emit();
   }
@@ -1803,9 +1819,15 @@ export class ViewerEngine {
     if (this.char) {
       this.char.solver.enableIK = this.assetEnableIK;
       this.char.solver.enableSwing = this.assetEnableSwing;
-      if (enableSwing !== undefined) this.char.solver.resetSwing();
+      if (enableSwing !== undefined) this._resetPhysics(this.mode === 'asset' ? this.assetTime : this.storyTime);
     }
     this._emit();
+    this.renderFrame();
+  }
+
+  setAnimationManageProperties(properties) {
+    this.animationManageProperties = properties || null;
+    if (this.storyPlayer) this.storyPlayer.animationManageProperties = this.animationManageProperties;
     this.renderFrame();
   }
 
@@ -2110,6 +2132,7 @@ export class ViewerEngine {
       this.storyDuration = timeline.duration;
       this.storyTime = 0;
       this.storyPlaying = !!autoPlay;
+      this._resetPhysics(this.mode === 'story' ? this.storyTime : this.assetTime);
       this.storyDialogueList = dialogues;
       this.storyStatus =
         `${events.length} cues · ${timeline.duration.toFixed(1)}s · clips ${pre.total - pre.missing.length}/${pre.total}` +
@@ -2150,10 +2173,7 @@ export class ViewerEngine {
       this.voiceCtrl.audio.pause();
     }
     this.voiceCtrl.manualCue = null;
-    if (this.char) this.char.solver.resetSwing();
-    for (const entry of this.extraStoryActors.values()) {
-      if (entry.char) entry.char.solver.resetSwing();
-    }
+    this._resetPhysics(this.storyTime);
     this.renderFrame();
     this._emit();
   }
@@ -2165,6 +2185,7 @@ export class ViewerEngine {
     );
     if (next) {
       this.storyTime = next.t + 0.01;
+      this._resetPhysics(this.storyTime);
       if (this.storyPlaying) this.voiceCtrl.unlock();
       this.renderFrame();
       this._emit();
@@ -2180,6 +2201,7 @@ export class ViewerEngine {
     if (!vObj) return;
     if (this.storyPlaying) {
       this.storyTime = vObj.start;
+      this._resetPhysics(this.storyTime);
       this.voiceCtrl.currentCue = null;
       this.voiceCtrl.unlock();
       this.renderFrame();
@@ -2216,10 +2238,11 @@ export class ViewerEngine {
         this.assetTime += rawDt * this.assetSpeed;
         if (this.assetTime >= this.assetDuration) {
           this.assetTime = this.assetLoop ? this.assetTime % this.assetDuration : this.assetDuration;
-          if (!this.assetLoop) this.assetPlaying = false;
+          // Hold the final pose while physics continues; only an explicit
+          // pause freezes the transport, including hair/cloth settling.
         }
       }
-      this.renderFrame();
+      this.renderFrame(this.assetPlaying ? rawDt : 0);
       if (now - this._lastEmitTs > 80) {
         this._lastEmitTs = now;
         this._emit();
@@ -2231,7 +2254,7 @@ export class ViewerEngine {
           this.storyTime = 0;
         }
       }
-      this.renderFrame();
+      this.renderFrame(this.storyPlaying ? rawDt : 0);
       if (now - this._lastEmitTs > 65) {
         this._lastEmitTs = now;
         this._emit();
@@ -2239,8 +2262,11 @@ export class ViewerEngine {
     }
   }
 
-  renderFrame() {
+  // delta is elapsed simulation time; transport sampling is controlled by the
+  // caller. No delta means a redraw/seek snapshot, not another physics frame.
+  renderFrame(physicsDelta = 0) {
     if (!this.renderer || !this.scene || !this.camera || !this.char) return;
+    this.physicsTime += physicsDelta;
     if (this.mode === 'asset') {
       this._renderAssetFrame();
     } else {
@@ -2254,6 +2280,7 @@ export class ViewerEngine {
       if (entry.groundShadow) entry.groundShadow.visible = false;
     }
     const showClassroom = this.assetStageMode === 'classroom' && this.envLoaded;
+    const manageVolume = showClassroom ? this.envInfo?.meta?.volumes?.animationManage : null;
     if (showClassroom) this._activateEnv3d('env_3d_adv_classroom-00-00-noon');
     this.envGroup.visible = showClassroom;
     this.scene.background = showClassroom && this.skyTexture ? this.skyTexture : new THREE.Color(0x111520);
@@ -2274,12 +2301,14 @@ export class ViewerEngine {
 
     if (this.assetBodyClip) {
       const ev = evalClip(this.assetBodyClip, this.assetTime);
+      applyAnimationManage(this.char.solver.swing, this.animationManageProperties, ev.manage, manageVolume);
       this.char.solver.applyPose(
         null,
         this.char.solver.poseFrom(ev.muscles, ev.bones, ev.root),
         1,
       );
     } else {
+      applyAnimationManage(this.char.solver.swing, this.animationManageProperties, null, manageVolume);
       this.char.reset();
     }
 
@@ -2297,7 +2326,7 @@ export class ViewerEngine {
     }
     this.char.setMorph(morph);
 
-    this.char.solver.updatePostRig(this.assetTime);
+    this.char.solver.updatePostRig(this.physicsTime);
     this.char.update(this.camera);
     this.char.renderShadow(this.renderer);
 
@@ -2331,13 +2360,15 @@ export class ViewerEngine {
     this._updateStoryOverlayState(t, st);
     this.voiceCtrl.sync(t, st, this.storyPlaying, this.storySpeed, () => this.storyTime);
 
+    this.storyPlayer.animationManageProperties = this.animationManageProperties;
+    this.storyPlayer.animationManageVolume = this._activeAnimationManageVolume;
     this.storyPlayer.applyCharacter(t, st);
     for (const [aid, entry] of this.storyPlayer.actorEntries) {
       const aSt = st.actors ? st.actors.get(aid) : st;
       if (!entry.char || !entry.group) continue;
       if (aSt && aSt.visible) {
         this._applyLookTargetForActor(entry, aSt, t);
-        entry.char.solver.updatePostRig(t);
+        entry.char.solver.updatePostRig(this.physicsTime);
         entry.char.update(this.camera);
         entry.char.renderShadow(this.renderer);
       }
@@ -2537,6 +2568,8 @@ export class ViewerEngine {
     if (is3d) {
       this._activateEnv3d(src);
     }
+    this._activeAnimationManageVolume = is3d
+      ? this.envInfo?.meta?.volumes?.animationManage : this.bgMeta[src]?.volumes?.animationManage;
     this.envGroup.visible = is3d;
     this.scene.background = is3d && this.skyTexture ? this.skyTexture : null;
     if (src && src !== this._lastVolumeSrc) {

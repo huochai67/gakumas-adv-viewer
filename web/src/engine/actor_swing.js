@@ -63,8 +63,19 @@ export class ActorSwing {
     this.nodes = nodes;
     this.spaceRoot = hips?.parent || hips;
     this.hips = hips;
+    // Exported lengths include only assembled glTF transforms. Normalize once
+    // against that same bind hierarchy, never against external story layout.
+    const sourceNodes = new Set(nodes.values());
+    const bindWorld = new THREE.Matrix4(), local = new THREE.Matrix4();
+    for (let n = this.spaceRoot; n && sourceNodes.has(n); n = n.parent) {
+      const bind = n.userData.bindTRS;
+      bindWorld.premultiply(local.compose(bind.p, bind.q, bind.s));
+    }
+    const bindScale = new THREE.Vector3().setFromMatrixScale(bindWorld);
+    const initialRootScale = Math.min(bindScale.x, bindScale.y, bindScale.z);
     this.parameters = {
-      weight: 1, speed: 1, root: 1, rootXZ: 1, rootY: 1,
+      weight: 1, localBlend: 0, speed: 1, root: 1, rootXZ: 1, rootY: 1,
+      breastPower: 1, breastCorrection: 1,
       initializationCount: DEFAULT_INITIALIZATION_COUNT,
       seated: false,
       wind: {
@@ -83,14 +94,18 @@ export class ActorSwing {
       if (!node) continue;
       const modeling = cfg.modelingTransform;
       const bind = node.userData.bindTRS;
-      const localPosition = modeling ? vectorU(modeling.localPosition) : bind.p.clone();
-      const localRotation = modeling ? quaternionU(modeling.localRotation) : bind.q.clone();
+      // Setup reads runtime initialTransform (+0x7c), not the serialized
+      // modelingTransform (+0xb4). The latter is only the final local blend.
+      const localPosition = bind.p.clone();
+      const localRotation = bind.q.clone();
       const length = localPosition.length();
       const state = {
         cfg, node, parent: null, child: null, depth: 0,
         active: cfg.enabled !== false,
         initialPosition: localPosition,
         initialRotation: localRotation,
+        modelingPosition: vectorU(modeling?.localPosition),
+        modelingRotation: quaternionU(modeling?.localRotation),
         direction: length > 1e-5 ? localPosition.clone().multiplyScalar(1 / length) : new THREE.Vector3(1, 0, 0),
         length,
         position: new THREE.Vector3(), rotation: new THREE.Quaternion(),
@@ -112,19 +127,29 @@ export class ActorSwing {
     }
     for (const b of this.bones) {
       b.parent = this.boneByObject.get(b.node.parent) || null;
+      b.rootInput = !b.parent && b.node.parent ? makePoseSample(b.node.parent) : null;
       b.child = this.boneByObject.get(b.node.children[0]) || null;
       b.reference = this.boneByNode.get(b.cfg.referenceLimit?.node) || null;
+      // AddDynamicBone starts at -1 and walks self -> parent -> null.
       let n = b.node.parent;
       while (n) { b.depth++; n = n.parent; }
     }
-    // Native SortDynamicBone is hierarchy-first; the imported component order
-    // is retained within a layer, including static collider traversal order.
+    // Native AddDynamicBone stores absolute Transform depth at job +0x80.
+    // A common glTF wrapper adds the same offset to bones and chain layers.
     this.bones.sort((a, b) => a.depth - b.depth);
+    // SortDynamicBone partitions reference-dependent bones after all primary
+    // bones, propagating that dependency through direct dynamic parents.
+    const primary = [], secondary = [];
+    for (const b of this.bones) {
+      b.secondary = Boolean(b.reference || b.parent?.secondary);
+      (b.secondary ? secondary : primary).push(b);
+    }
+    this.bones = primary.concat(secondary);
     this.layers = [];
     for (const b of this.bones) {
       let layer = this.layers[this.layers.length - 1];
-      if (!layer || layer.depth !== b.depth) {
-        layer = { depth: b.depth, bones: [], nets: [] };
+      if (!layer || layer.depth !== b.depth || layer.secondary !== b.secondary) {
+        layer = { depth: b.depth, secondary: b.secondary, bones: [], nets: [] };
         this.layers.push(layer);
       }
       layer.bones.push(b);
@@ -132,12 +157,16 @@ export class ActorSwing {
     this.nets = [];
     for (const chain of defs.chains || []) {
       if (chain.enabled === false) continue;
-      for (const cfg of chain.layers || []) {
+      // UpdateHierarchyDepth seeds from the first source slot, then increments
+      // for every layer, including inactive or empty layers.
+      const first = this.boneByNode.get(chain.layers?.[0]?.nodes[0]);
+      if (!first) continue;
+      for (const [layerIndex, cfg] of (chain.layers || []).entries()) {
         if (!cfg.active || cfg.nodes.length < 2) continue;
         const members = cfg.nodes.map((id) => this.boneByNode.get(id) || null);
-        const first = members.find((b) => b?.parent);
-        if (!first) continue;
-        const layer = this.layers.find((l) => l.depth === first.parent.depth);
+        const secondary = members.some((b) => b?.secondary);
+        const depth = first.depth + layerIndex;
+        const layer = this.layers.find((l) => l.depth + 1 === depth && l.secondary === secondary);
         if (!layer) continue;
         const segments = [];
         const count = cfg.around ? members.length : members.length - 1;
@@ -151,14 +180,23 @@ export class ActorSwing {
             vA: ZERO, vB: ZERO, rA: cfg.radius, rB: cfg.radius,
           }) });
         }
-        const net = {
-          cfg, members, segments, restLength: 0,
-          before: members.map(() => new THREE.Vector3()),
-          smooth: members.map(() => new THREE.Vector3()),
-        };
+        const net = { cfg, segments, restLength: cfg.restLength / initialRootScale };
         this.nets.push(net);
         layer.nets.push(net);
       }
+    }
+    // ProcessChainBoneSmoothing groups contiguous segments by native layer,
+    // not by serialized ActorSwingChain component. Its first segment supplies
+    // the around/smoothing/restLength settings for the entire layer group.
+    for (const layer of this.layers) {
+      if (!layer.nets.length) continue;
+      const members = [];
+      for (const net of layer.nets) for (const seg of net.segments) members.push(seg.a);
+      layer.smoothing = {
+        cfg: layer.nets[0].cfg, restNet: layer.nets[0], members, activeMembers: [],
+        before: members.map(() => new THREE.Vector3()),
+        smooth: members.map(() => new THREE.Vector3()),
+      };
     }
     this.statics = [];
     this.collisionWorld = [];
@@ -265,6 +303,7 @@ export class ActorSwing {
       b.sourceRotation.copy(b.node.quaternion);
       b.sourceScale.copy(b.node.scale);
       this._captureSample(b.sample, first);
+      if (b.rootInput) this._captureSample(b.rootInput, first);
       b.scale = b.sample.scale;
       if (first) {
         b.position.copy(b.sample.position);
@@ -276,12 +315,6 @@ export class ActorSwing {
       if (entry.parent) this._captureSample(entry.parent, first);
     }
     this.breasts.capture(this.context);
-    if (first) {
-      for (const net of this.nets) {
-        net.restLength = 0;
-        for (const seg of net.segments) net.restLength += seg.a.sample.position.distanceTo(seg.b.sample.position);
-      }
-    }
   }
 
   _sample(sample, alpha) {
@@ -309,6 +342,8 @@ export class ActorSwing {
     const ctx = this.context;
     ctx.weight = p.weight;
     ctx.speed = p.speed;
+    ctx.modelingWeight = p.localBlend;
+    ctx.armCorrectionWeight = p.breastCorrection;
     ctx.seated = p.seated;
     ctx.rootCorrection.weight = p.root;
     ctx.rootCorrection.xz = p.rootXZ;
@@ -321,7 +356,9 @@ export class ActorSwing {
       ctx.time = time;
       ctx.alpha = 1;
       this._staticColliders(1);
+      ctx.speed = p.breastPower;
       this.breasts.step(NATIVE_STEP, ctx);
+      ctx.speed = p.speed;
       this._step(NATIVE_STEP, 1);
       this.ready = true;
       this.accumulator = 0;
@@ -336,7 +373,9 @@ export class ActorSwing {
         ctx.time = this.lastTime + progressed;
         ctx.alpha = alpha;
         this._staticColliders(alpha);
+        ctx.speed = p.breastPower;
         this.breasts.step(NATIVE_STEP, ctx);
+        ctx.speed = p.speed;
         this._step(NATIVE_STEP, alpha);
         this.accumulator -= FRAME_TIME;
         progressed += FRAME_TIME;
@@ -347,6 +386,10 @@ export class ActorSwing {
     for (const b of this.bones) {
       b.sample.previousPosition.copy(b.sample.position);
       b.sample.previousRotation.copy(b.sample.rotation);
+      if (b.rootInput) {
+        b.rootInput.previousPosition.copy(b.rootInput.position);
+        b.rootInput.previousRotation.copy(b.rootInput.rotation);
+      }
     }
     for (const entry of this.statics) {
       entry.sample.previousPosition.copy(entry.sample.position);
@@ -361,13 +404,22 @@ export class ActorSwing {
 
   _step(dt, alpha) {
     const ctx = this.context;
-    for (const b of this.bones) this._sample(b.sample, alpha);
+    for (const b of this.bones) {
+      this._sample(b.sample, alpha);
+      if (b.rootInput) this._sample(b.rootInput, alpha);
+    }
     if (ctx.seated) this._seatAnchors();
     for (const layer of this.layers) {
       for (const parent of layer.bones) {
         if (!parent.parent) {
-          parent.position.copy(parent.sample.samplePosition);
-          parent.rotation.copy(parent.sample.sampleRotation);
+          if (parent.rootInput) {
+            parent.position.copy(parent.initialPosition).applyQuaternion(parent.rootInput.sampleRotation)
+              .add(parent.rootInput.samplePosition);
+            parent.rotation.copy(parent.rootInput.sampleRotation).multiply(parent.initialRotation);
+          } else {
+            parent.position.copy(parent.sample.samplePosition);
+            parent.rotation.copy(parent.sample.sampleRotation);
+          }
         } else if (parent.parent.child !== parent) {
           parent.position.copy(parent.initialPosition).applyQuaternion(parent.parent.rotation).add(parent.parent.position);
           parent.rotation.copy(parent.parent.rotation).multiply(parent.initialRotation);
@@ -378,9 +430,9 @@ export class ActorSwing {
         if (!child) continue;
         this._integrate(parent, child, dt);
       }
-      for (const net of layer.nets) {
-        this._collideNet(net);
-        if (this._smoothNet(net)) this._collideNet(net);
+      for (const net of layer.nets) this._collideNet(net);
+      if (layer.smoothing && this._smoothNet(layer.smoothing)) {
+        for (const net of layer.nets) this._collideNet(net);
       }
       for (const parent of layer.bones) this._solveTransform(parent);
     }
@@ -514,8 +566,11 @@ export class ActorSwing {
     // ProcessChainBoneSmoothing only runs on closed (around) layers. Preserve
     // the rest circumference after averaging, rather than shrinking the cloth.
     if (!net.cfg.around || net.cfg.smoothing < 1e-5) return false;
-    const members = net.members, n = members.length;
-    for (let i = 0; i < n; i++) if (!members[i]?.active) return false;
+    const members = net.activeMembers;
+    members.length = 0;
+    for (const b of net.members) if (b.active) members.push(b);
+    const n = members.length;
+    if (n === 0) return true;
     const s = this.scratch;
     for (let i = 0; i < n; i++) net.before[i].copy(members[i].position);
     for (let i = 0; i < n; i++) {
@@ -529,8 +584,9 @@ export class ActorSwing {
       s.mean.add(net.smooth[i]);
     }
     s.mean.multiplyScalar(1 / n);
-    if (length < net.restLength && length > 0) {
-      const scale = net.restLength / length;
+    const restLength = net.restNet.restLength;
+    if (length < restLength && length > 0) {
+      const scale = restLength / length;
       for (let i = 0; i < n; i++) net.smooth[i].sub(s.mean).multiplyScalar(scale).add(s.mean);
     }
     for (let i = 0; i < n; i++) members[i].position.copy(net.smooth[i]);
@@ -549,7 +605,10 @@ export class ActorSwing {
       clampSwingRotation(parent.rotation, parent.frameRotation, parent.rotation,
         parent.cfg, parent.reference?.rotation || null, parent.cfg.referenceLimit,
         this.context.seated, parent.cfg.seatDynamicCorrection);
-      parent.rotation.slerpQuaternions(parent.frameRotation, parent.rotation, this.parameters.weight);
+      // slerpQuaternions copies its first argument before reading the second.
+      // Keep the solved rotation distinct from the destination quaternion.
+      s.q1.copy(parent.rotation);
+      parent.rotation.slerpQuaternions(parent.frameRotation, s.q1, this.parameters.weight);
       child.position.copy(child.initialPosition).applyQuaternion(parent.rotation).add(parent.position);
       child.rotation.copy(parent.rotation).multiply(child.initialRotation);
     } else {
@@ -576,22 +635,37 @@ export class ActorSwing {
 
   _writePose() {
     const s = this.scratch;
+    const blend = this.parameters.localBlend;
+    // ProcessDynamicBones: a swing writes its parent's rotation, whereas a
+    // slide writes its child's position. Never copy both simulated channels:
+    // the untouched animation channel still belongs to the input stream.
     for (const b of this.bones) {
-      if (!b.active) continue;
-      s.p.copy(b.position).applyMatrix4(this.spaceWorld);
-      s.q.copy(b.rotation).premultiply(this.spaceWorldRotation);
-      const parent = b.node.parent;
-      if (parent) {
-        parent.updateWorldMatrix(true, false);
-        s.parentInverse.copy(parent.matrixWorld).invert();
-        b.node.position.copy(s.p).applyMatrix4(s.parentInverse);
-        parent.getWorldQuaternion(s.q0).invert();
-        b.node.quaternion.copy(s.q0).multiply(s.q);
+      const child = b.child;
+      if (!b.active || !child) continue;
+      const swing = child.cfg.dynamicType === 0;
+      const output = swing ? b : child;
+      const node = output.node;
+      const parent = node.parent;
+      if (parent) parent.updateWorldMatrix(true, false);
+      if (swing) {
+        s.q.copy(b.rotation).premultiply(this.spaceWorldRotation);
+        if (parent) {
+          parent.getWorldQuaternion(s.q0).invert();
+          node.quaternion.copy(s.q0).multiply(s.q);
+        } else node.quaternion.copy(s.q);
+        // ManageProperty +4 defaults to zero (ManageData ctor +0x24).
+        // modelingPoseWeight is an additional local-modeling blend after
+        // SetRotation, not the simulation weight used by CalcDynamicSwing.
+        if (blend > 1e-5) node.quaternion.slerp(b.modelingRotation, blend);
       } else {
-        b.node.position.copy(s.p);
-        b.node.quaternion.copy(s.q);
+        s.p.copy(child.position).applyMatrix4(this.spaceWorld);
+        if (parent) {
+          s.parentInverse.copy(parent.matrixWorld).invert();
+          node.position.copy(s.p).applyMatrix4(s.parentInverse);
+        } else node.position.copy(s.p);
+        if (blend > 1e-5) node.position.lerp(child.modelingPosition, blend);
       }
-      b.node.updateWorldMatrix(false, false);
+      node.updateWorldMatrix(false, false);
     }
     this.breasts.apply(this.context);
     this.written = true;

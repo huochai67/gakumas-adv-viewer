@@ -32,6 +32,7 @@ import {
   type SkeletonNode,
 } from "./assets.ts";
 import { Glb } from "./core/gltf.ts";
+import { setSwingChainRestLengths } from "../web/src/runtime/swing_metadata.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
@@ -899,7 +900,7 @@ function main(): void {
           const lnodes: number[] = [];
           for (const p of ly.bones ?? []) {
             const idx = mb_to_node.get(pkey(p.m_PathID));
-            if (idx !== undefined) lnodes.push(idx);
+            lnodes.push(idx ?? -1);
           }
           layers.push({
             active: Math.trunc(Number(ly.active ?? 0)),
@@ -920,6 +921,7 @@ function main(): void {
       }
     }
   }
+  setSwingChainRestLengths(exp.glb.json.nodes, swing_chains);
   exp.meta.swing = {
     staticColliders: static_cols,
     dynamicBones: dyn_bones,

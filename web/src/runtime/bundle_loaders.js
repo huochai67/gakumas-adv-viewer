@@ -22,6 +22,8 @@ import {
   ClipSampler,
   extractAcbHcaStreams,
 } from './bundle_env.js';
+import { setSwingChainRestLengths } from './swing_metadata.js';
+import { ANIMATION_MANAGE_DEFAULTS, ANIMATION_MANAGE_FIELDS } from '../engine/animation_manage.js';
 
 /* -------------------------------------------------------------------------- */
 /* Shared helpers                                                             */
@@ -937,7 +939,7 @@ export async function buildCharFromBundles(env, parts = PARTS) {
           const lnodes = [];
           for (const p of ly.bones ?? []) {
             const idx = mb_to_node.get(pkey(p.m_PathID));
-            if (idx !== undefined) lnodes.push(idx);
+            lnodes.push(idx ?? -1);
           }
           layers.push({
             active: Math.trunc(Number(ly.active ?? 0)),
@@ -958,6 +960,7 @@ export async function buildCharFromBundles(env, parts = PARTS) {
       }
     }
   }
+  setSwingChainRestLengths(exp.glb.json.nodes, swing_chains);
   exp.meta.swing = {
     staticColliders: static_cols,
     dynamicBones: dyn_bones,
@@ -1360,6 +1363,8 @@ class EnvExporter {
             'shadowStrength', 'directionalType', 'lightDirectional',
             'facePartsShadowStrength',
           ]);
+        } else if ('modelingPoseWeight' in tt && 'swingPowerWeight' in tt) {
+          mergeOvr(vol('animationManage'), ANIMATION_MANAGE_FIELDS);
         } else if ('reflectionScale' in tt && 'intensity' in tt) {
           this.meta.volumes.lightmap = {
             intensity: v('intensity', 1.0),
@@ -1812,6 +1817,9 @@ export async function loadBg2dFromBundle(env, bundleName) {
     } else if ('shadowStrength' in tt && 'lightDirectional' in tt) {
       volumes.actorShadow ??= {};
       mergeOvr(volumes.actorShadow, ACTOR_SHADOW_FIELDS);
+    } else if ('modelingPoseWeight' in tt && 'swingPowerWeight' in tt) {
+      volumes.animationManage ??= {};
+      mergeOvr(volumes.animationManage, ANIMATION_MANAGE_FIELDS);
     }
   }
 
@@ -1839,7 +1847,9 @@ const ROOT_PROPS = [
   ['rootT', 7, 3],
   ['rootQ', 10, 4],
   ['lfT', 14, 3],
+  ['lfQ', 17, 4],
   ['rfT', 21, 3],
+  ['rfQ', 24, 4],
   ['lhT', 28, 3],
   ['lhQ', 31, 4],
   ['rhT', 35, 3],
@@ -1851,6 +1861,8 @@ const TRANSFORM_PROPS = {
   3: 'scale',
   4: 'euler',
 };
+const MANAGE_PROPS = new Map(Object.keys(ANIMATION_MANAGE_DEFAULTS).map((key) =>
+  [crc32(`propertyData.${key}`) >>> 0, key]));
 
 function nodePathTable(env, body_bundle) {
   let root = null;
@@ -1980,6 +1992,13 @@ function exportClipsFromBundle(env, bundleName, paths, blends) {
           }
         }
       } else if (gb.typeID === 114) {
+        const manage = MANAGE_PROPS.get(gb.attribute >>> 0);
+        if (manage !== undefined) {
+          const values = times.map((t) => round5(s.value(slot, t)));
+          tracks.push({ kind: 'manage', prop: manage, values });
+          slot += dim;
+          continue;
+        }
         const info = blends.get(gb.attribute >>> 0);
         if (info !== undefined) {
           const vals = [];

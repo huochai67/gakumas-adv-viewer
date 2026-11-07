@@ -73,7 +73,7 @@ function sample(track, time) {
 
 /**
  * Sample a clip at `time` seconds.
- * @returns {{muscles: Float32Array, hasMuscle: Uint8Array, root: object, bones: Array, morph: Array<[number, number]>}}
+ * @returns {{muscles: Float32Array, hasMuscle: Uint8Array, root: object, bones: Array, morph: Array<[number, number]>, manage: object}}
  */
 export function evalClip(clip, time) {
   const muscles = new Float32Array(MUSCLE_COUNT);
@@ -81,7 +81,8 @@ export function evalClip(clip, time) {
   const root = {};
   const bones = [];
   const morph = [];
-  if (!clip) return { muscles, hasMuscle, root, bones, morph };
+  const manage = {};
+  if (!clip) return { muscles, hasMuscle, root, bones, morph, manage };
   for (const t of clip.tracks) {
     if (t.kind === 'muscle') {
       muscles[t.index] = sample(t, time)[0];
@@ -97,7 +98,9 @@ export function evalClip(clip, time) {
       });
     } else if (t.kind === 'blend') {
       morph.push([t.index, sample(t, time)[0] / 100]);
+    } else if (t.kind === 'manage') {
+      manage[t.prop] = sample(t, time)[0];
     }
   }
-  return { muscles, hasMuscle, root, bones, morph };
+  return { muscles, hasMuscle, root, bones, morph, manage };
 }

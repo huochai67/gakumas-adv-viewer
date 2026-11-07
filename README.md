@@ -184,11 +184,45 @@ correction:
 * **Mecanim humanoid pose & helper bones**: `export_clips.ts` shifts Unity
   humanoid muscle attributes `42..136 -> 0..94` (fixing cubic `StreamedFrames`
   evaluation in `unity_anim.ts`) and exports `RootT/RootQ` + foot/hand IK tracks.
-  `pose.js` solves exact Unity `zyRoll` muscle Swing-Twist rotations relative to
-  `TPOSE_MUSCLES`, anchors `Hips` height from foot sole `lfT/rfT`, curls/spreads
-  fingers in local bone frames, and applies IK correction before clothing drivers.
+  `human_rig.js` constructs muscle frames, default limits, neutral muscles and
+  `humanScale` from each assembled character's bind skeleton using the native
+  UnityPlayer axis tables and bone-mass center. `pose.js` retargets the pelvis
+  from the current body center/orientation and consumes hand/foot Goal positions
+  **and rotations**; it no longer reuses Amao's fitted arm axes or scale.
+  `human_ik.js`, `human_limb_ik.js` and `human_twist.js` implement the native
+  `FullBodySolve` Goal stages: length adjustment (default stretch `0.05`),
+  lower-limb DoF preparation, weighted two-bone solving, hint correction,
+  Goal rotation / end-DoF correction, then `TwistSolve` in native order (default
+  twist factors `0.5`). Stretch writes local translations as well as rotations;
+  unstretched frames restore those translations during seeking and cross-fades.
+  Foot targets retain the sole offset and each character's post-axis frame.
+  IK and twist run before clothing drivers and remain independent of story
+  placement. The clip adapter treats present T/Q channels as full-weight goals;
+  this is not a reconstruction of Unity's complete AnimationStream activation
+  flags, playable IK callbacks or look-at solver.
+  The Goal math was compared against the matching UnityPlayer machine code:
+  four characters at three animation times, fractional/zero weights, position-
+  and rotation-only goals, hints, unreachable targets and an intermediate-bone
+  chain. JavaScript double arithmetic is not bit-identical to native SIMD floats.
   Full-body `actormotion` cues cross-fade directly over `transition` seconds,
   while `actoradditivemotion` subtracts its `t = 0` reference pose (`add(t) - add(0)`).
+* **Hand/body avoidance IK**: `body_ik.js` replaces the old post-pose analytical
+  arm correction with the shared native `FullBodySolve` Goal path, before Quartz
+  and ActorSwing, without applying `TwistSolve` a second time. Goal locator
+  scale X/Y supplies position/rotation weights; elbow Hint scale X supplies the
+  hint blend/weight, while Hint scale Y independently enables and weights body
+  avoidance. `ik_correction.js` checks the current wrist plus the configured
+  offset against serialized spheres/tapered capsules, including capsule rotation.
+  The nearest signed-distance contact supplies an unblended surface target and
+  a damped weight; a miss in correction mode clears position weight. A rotation-
+  only goal remains active even without a collision. Pose snapshots prevent
+  paused-frame feedback, and missing effector tracks restore authored bind
+  weights instead of retaining the previous clip's flags. Scene placement is
+  kept outside the solve. This ports the hand-avoidance branch, not the separate
+  custom job's body-pull, move/reference or full-body look-at machinery.
+  Collision helpers and an actual `talk-015_pose` correction were checked against
+  the matching GameAssembly/UnityPlayer machine code. Regression cases run with
+  `node --test web/src/engine/body_ik.test.mjs`.
 * **QuartzDriver clothing pose**: `quartz.js` and `quartz_math.js` execute the
   serialized Rotation, Frill, Skirt, Hair, HumanoidHand/Sleeve/UpLeg/Arm, Waist,
   Furisode and Poncho jobs after IK and before ActorSwing. Browser loading and
@@ -196,26 +230,53 @@ correction:
   assembled Head/Neck references are injected into hair jobs as in the game.
   Native axis orders, decomposition, coefficients, limits and setting coordinate
   conversions replace the former fixed-name helper rules. Animation snapshots
-  prevent helper feedback during paused renders, blending and seeking. This fixes
-  the sideways sleeves on `fktn-cstm-0063` / `mot_all_chr_fktn_kime-002_in`;
-  increasing physics collider sizes is not a substitute for these pose drivers.
-  The JavaScript port preserves the native formulas, not bit-identical Unity
-  floating-point results or a guarantee of no clipping in every outfit/motion.
+  prevent helper feedback during paused renders, blending and seeking. These
+  drivers supply the missing sleeve-root animation on `fktn-cstm-0063`; they are
+  not a standalone cure for every cloth contact. The JavaScript port preserves
+  the recovered formulas, not bit-identical Unity floating-point results.
 * **ActorSwing secondary motion**: `actor_swing.js` replaces the approximate
   solver with the native dynamic swing/slide, capsule collision, chain-net
   smoothing, angular/reference limits, root compensation and stabilization
   paths. `swing_breast.js` ports paired breast motion, weighted curves and arm
   correction; the serialized breast collider is not used by the native job.
-  Both browser loading and CLI export retain the serialized modeling poses and
-  physics parameters without stiffness remapping. Capsule axes are X/Y/Z =
-  0/1/2, and their center-line half-length is `height / 2 - radiusA`.
+  Both browser loading and CLI export distinguish the assembled **initial bind
+  pose**, used for simulation directions and lengths, from serialized **modeling
+  poses**, used by the final modeling-pose blend. Chain rest circumferences are
+  measured from the assembled initial skeleton, never from a seeked animation;
+  external story layout scaling does not change their actor-space lengths.
+  Reference-dependent bones run after the primary bone groups. Swing writes
+  only the parent's rotation; slide writes only the child's position, preserving
+  the other animated channel. Capsule axes are X/Y/Z = 0/1/2, and their center-line
+  half-length is `height / 2 - radiusA`.
   Animation snapshots feed a 60 Hz accumulator; each native integration tick
-  uses `0.01667`, including reset-count stabilization (default count: 5).
-  Paused renders do not advance physics; seeking, looping backwards, changing
-  modes and toggling physics reset the state. This is a JavaScript/Three.js
-  port, not a claim of bit-identical Unity floating-point or AnimationStream
-  behavior. The viewer supplies neutral wind and standing defaults; the solver
-  also exposes wind and seated-correction parameters to its caller.
+  uses `0.01667`, including reset-count stabilization (default count: 5). The
+  solved quaternion is kept separate from the blend destination, so full physics
+  weight preserves the simulated swing rather than replacing it with animation.
+  Physics advances on its own elapsed-time clock, independent of clip wrapping
+  and playback speed. Short pose loops retain inertia; non-looping asset motions
+  hold their final pose while hair/cloth continue settling. Playback stays active
+  at that endpoint so the pause button can freeze both animation and physics.
+  Explicit pauses and UI-only redraws do not advance physics. Seeking, dialogue
+  jumps, voice replay jumps, changing motions/actors or modes, and toggling
+  physics reset the state and seed the clock from the selected timeline time.
+  `viewerEngine.renderFrame(deltaSeconds)` advances this clock for deterministic
+  stepping; omitting the argument redraws without advancing it. The video export
+  loop supplies `1 / fps` after frame zero instead of reusing clip time.
+  Swing output/weight and inertial carry-over regressions run with
+  `node --test web/src/engine/actor_swing.test.mjs`.
+  `animation_manage.js` maps native `weight`, `modelingPoseWeight` (default 0),
+  swing/breast/root weights and wind fields from scene `ActorAnimationParameter`
+  volumes, explicit `viewerEngine.setAnimationManageProperties(properties)`
+  overrides, and sampled management tracks. Passing `null` clears the explicit
+  override; missing values fall back to the native defaults, not the previous
+  frame. `swingPowerWeight` changes secondary-motion force, not playback speed.
+  Wind vectors accept Unity-space `{x, y, z}` values. Seated correction remains
+  a separate solver parameter; absent scene input defaults to standing.
+  Collision uses animated body proxies, not body/cloth mesh triangles, CCD or
+  general cloth self-collision. The native order ends with angular limits and
+  rigid bone reconstruction after collision; this can leave proxy overlaps.
+  There is deliberately no extra final collision iteration or inflated collider
+  radius, and this port does not guarantee zero mesh penetration in every motion.
 
 ## Timeline
 

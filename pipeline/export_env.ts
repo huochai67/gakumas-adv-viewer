@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import * as assets from "./assets.ts";
 import { Glb } from "./core/gltf.ts";
 import type { SerializedFile, UnityObject } from "./core/serialized_file.ts";
+import { ANIMATION_MANAGE_FIELDS } from "../web/src/engine/animation_manage.js";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(MODULE_DIR, "..");
@@ -458,6 +459,8 @@ export class EnvExporter {
             "shadowStrength", "directionalType", "lightDirectional",
             "facePartsShadowStrength",
           ]);
+        } else if ("modelingPoseWeight" in tt && "swingPowerWeight" in tt) {
+          mergeOvr(vol("animationManage"), [...ANIMATION_MANAGE_FIELDS]);
         } else if ("reflectionScale" in tt && "intensity" in tt) {
           this.meta.volumes.lightmap = {
             intensity: v("intensity", 1.0),
