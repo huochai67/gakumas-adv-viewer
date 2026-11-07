@@ -22,13 +22,40 @@ WebGL renderer (`web/src/engine/ViewerEngine.js`):
 
 * **Tab 1 — 资产浏览器 (Asset Browser)**: browse and switch characters, costumes
   (`body`/`hair`/`face`), body motion clips, facial expression clips, manual
-  BlendShape overrides, IK/Swing physics toggles, and studio vs. 3D classroom
-  stages (with on-demand Octo bundle fetching via `/api/ensure`).
+  BlendShape overrides, IK/Swing physics toggles, character position/orientation
+  controls (sliders, presets, 3D viewport gizmo, and `WASD`/`QE` shortcuts), and
+  2D/3D stages (with on-demand Octo bundle fetching via `/api/ensure`).
 * **Tab 2 — 剧情浏览器 (Story Browser)**: select built-in or local/pasted `.txt`
   ADV scripts, jump directly to any dialogue cue on the timeline, and render the
   full 2D/3D stage, character animations, DOF bokeh, Bloom, and CRI `.acb` voice
   lip-sync. Deep-linking via `?tab=story` or `/story.html?script=...` opens
   directly in Story Browser mode.
+
+### Resource lifetime
+
+Character switches dispose the previous actor's textures, skeleton/bone textures,
+materials (including the separate hair-shadow pass), geometry and shadow render
+target. Texture ownership is per character; loading another actor cannot overwrite
+or dispose textures still used by a character in the current story.
+
+The viewer retains only the selected asset scene and backgrounds referenced by
+the current story, so timeline seeking remains immediate. Other 3D stages release
+their geometry, materials, textures and sky render targets; unused 2D backgrounds
+release textures, DOM images and blob URLs. Replacing a story also releases its
+extra actors, ground shadows and voice URLs. Stale character loads are disposed,
+and overlapping loads of the same background share one pending request.
+
+Raw Unity bundles/CABs are scoped to each build instead of accumulating in the
+shared browser environment. Lazy texture sources are released after material
+construction. Sampled animations use a 64-entry LRU cache; compressed voice sheets
+use a 2-entry LRU cache. Disk/HTTP caches remain available for subsequent loads.
+
+Run `node --test web/src/engine/*.test.mjs` for regression checks. For browser
+memory checks, repeatedly switch characters and 2D/3D scenes, return to the same
+scene, and compare `viewerEngine.renderer.info.memory` in DevTools. After warm-up,
+GPU resource counts should return to the same baseline. Browser allocators and
+WebAssembly linear memory may retain their high-water allocation; immediate OS
+memory reduction is not required for released objects to be collectable.
 
 ## Project Structure
 
@@ -65,6 +92,7 @@ gakumas-adv-viewer/
         ├── App.jsx               # Top multi-tab bar + split-pane workspace shell
         ├── styles.css            # Studio UI stylesheet
         ├── components/           # React UI panels
+        │   ├── ActorTransformControl.jsx
         │   ├── AssetBrowserPanel.jsx
         │   ├── StoryBrowserPanel.jsx
         │   └── ViewportPane.jsx

@@ -209,6 +209,7 @@ class VoiceController {
     this.audio = new Audio();
     this.audio.preload = 'auto';
     this.blobUrls = new Map();
+    this._generation = 0;
     this.muted = false;
     this.userVolume = 1;
     this.autoplayBlocked = false;
@@ -229,12 +230,30 @@ class VoiceController {
     return this.blobUrls.get(cueName) || null;
   }
 
+  clear() {
+    ++this._generation;
+    this.currentCue = null;
+    this.manualCue = null;
+    this.audio.pause();
+    this.audio.removeAttribute('src');
+    this.audio.load();
+    for (const url of this.blobUrls.values()) URL.revokeObjectURL(url);
+    this.blobUrls.clear();
+    this.lipsyncDb.cues = {};
+  }
+
   async preloadCues(cueNames) {
+    const generation = this._generation;
     for (const vc of cueNames) {
+      if (generation !== this._generation) return;
       if (this.blobUrls.has(vc) || (this.lipsyncDb?.cues?.[vc] && this.muted)) continue;
       try {
         const info = await loadVoiceCueFromAcb(vc);
         if (!info) continue;
+        if (generation !== this._generation) {
+          URL.revokeObjectURL(info.wavBlobUrl);
+          return;
+        }
         this.lipsyncDb.cues[vc] = { duration: info.duration, fps: info.fps, frames: info.frames };
         this.blobUrls.set(vc, info.wavBlobUrl);
       } catch (e) {
@@ -1002,12 +1021,30 @@ class StoryPlayer {
 
     entry.char.setMorph(morph);
     const L = aSt.layout;
+    const offset = aid === this.actorId ? this.actorTransformOffset : null;
+    const ox = Number(offset?.x) || 0;
+    const oy = Number(offset?.y) || 0;
+    const oz = Number(offset?.z) || 0;
+    const orotY = Number(offset?.rotY) || 0;
     if (L) {
-      entry.group.position.set(L.position.x, L.position.y, -L.position.z);
+      entry.group.position.set(L.position.x + ox, L.position.y + oy, -L.position.z + oz);
       entry.group.quaternion.copy(unityEulerQuat(L.rotation.x, L.rotation.y, L.rotation.z));
+      if (Math.abs(orotY) > 1e-4) {
+        entry.group.quaternion.premultiply(
+          new THREE.Quaternion().setFromAxisAngle(
+            new THREE.Vector3(0, 1, 0),
+            THREE.MathUtils.degToRad(orotY),
+          ),
+        );
+      }
       const s = L.scale || { x: 1, y: 1, z: 1 };
       entry.group.scale.set(s.x, s.y, s.z);
+    } else if (aid === this.actorId) {
+      entry.group.position.set(ox, oy, oz);
+      entry.group.rotation.set(0, THREE.MathUtils.degToRad(orotY), 0);
+      entry.group.scale.set(1, 1, 1);
     }
+    entry.group.updateMatrixWorld(true);
   }
 
   applyCharacter(t, st) {
@@ -1043,6 +1080,10 @@ export class ViewerEngine {
     this.envInfo = null;
     this.envLoaded = false;
     this.env3dCache = new Map();
+    this._env3dLoads = new Map();
+    this._bg2dLoads = new Map();
+    this._characterRequest = 0;
+    this._sceneRequest = 0;
     this.activeEnv3dName = null;
 
     this.char = null;
@@ -1064,6 +1105,19 @@ export class ViewerEngine {
     this.assetEnableSwing = true;
     this.animationManageProperties = null;
     this.assetManualMorphs = new Map();
+    this.assetActorTransform = { x: 0, y: 0, z: 0, rotY: 0 };
+    this.storyActorTransform = { x: 0, y: 0, z: 0, rotY: 0 };
+    this.showActorGizmo = false;
+    this.actorGizmo = null;
+    this.gizmoYawGroup = null;
+    this._gizmoPickables = [];
+    this._gizmoHovered = null;
+    this._gizmoDrag = null;
+    this._raycaster = new THREE.Raycaster();
+    this._pointerNdc = new THREE.Vector2();
+    this._dragPlane = new THREE.Plane();
+    this._dragHitPoint = new THREE.Vector3();
+    this._gizmoEuler = new THREE.Euler(0, 0, 0, 'YXZ');
 
     // Story Browser state
     this.lipsyncDb = { fps: 60, cues: {} };
@@ -1119,6 +1173,7 @@ export class ViewerEngine {
 
   subscribe(fn) {
     this.listeners.add(fn);
+    fn(this.getSnapshot());
     return () => this.listeners.delete(fn);
   }
 
@@ -1148,6 +1203,9 @@ export class ViewerEngine {
       assetEnableIK: this.assetEnableIK,
       assetEnableSwing: this.assetEnableSwing,
       faceBlendShapeCount: this.char?.meta?.faceBlendShapeCount || 0,
+      assetActorTransform: { ...this.assetActorTransform },
+      storyActorTransform: { ...this.storyActorTransform },
+      showActorGizmo: this.showActorGizmo,
 
       // Story mode state
       storyScriptUrl: this.storyScriptUrl,
@@ -1174,6 +1232,7 @@ export class ViewerEngine {
 
     if (!this.renderer) {
       this._initThree();
+      this._setupWindowHooks();
       this._bootInitial();
     } else {
       canvasContainer.innerHTML = '';
@@ -1239,6 +1298,10 @@ export class ViewerEngine {
     const actorGroup = new THREE.Group();
     scene.add(actorGroup);
     this.actorGroup = actorGroup;
+    const actorGizmo = this._createActorGizmo();
+    scene.add(actorGizmo);
+    this.actorGizmo = actorGizmo;
+    this._bindGizmoPointerEvents(renderer.domElement);
 
     const envGroup = new THREE.Group();
     envGroup.visible = false;
@@ -1272,6 +1335,299 @@ export class ViewerEngine {
     groundShadow.position.y = 0.004;
     groundShadow.renderOrder = 4;
     return groundShadow;
+  }
+
+  _createActorGizmo() {
+    const gizmo = new THREE.Group();
+    gizmo.name = 'ActorTransformGizmo';
+    gizmo.visible = false;
+    const pickables = [];
+
+    // Ground XZ free-move disc
+    const xzMat = new THREE.MeshBasicMaterial({
+      color: 0x4c9aff,
+      transparent: true,
+      opacity: 0.28,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      depthTest: false,
+    });
+    const xzMesh = new THREE.Mesh(new THREE.RingGeometry(0.03, 0.24, 40), xzMat);
+    xzMesh.rotation.x = -Math.PI / 2;
+    xzMesh.position.y = 0.008;
+    xzMesh.renderOrder = 25;
+    xzMesh.userData = {
+      gizmoAxis: 'xz',
+      visualMat: xzMat,
+      baseColor: 0x4c9aff,
+      hoverColor: 0x8ec2ff,
+      baseOpacity: 0.28,
+      hoverOpacity: 0.52,
+    };
+    gizmo.add(xzMesh);
+    pickables.push(xzMesh);
+
+    const makeAxisArrow = (axis, colorHex, hoverHex, dirVec) => {
+      const mat = new THREE.MeshBasicMaterial({
+        color: colorHex,
+        transparent: true,
+        opacity: 0.9,
+        depthWrite: false,
+        depthTest: false,
+      });
+      const hitMat = new THREE.MeshBasicMaterial({
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        depthTest: false,
+      });
+      const group = new THREE.Group();
+      const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.011, 0.011, 0.34, 12), mat);
+      shaft.position.y = 0.19;
+      shaft.renderOrder = 26;
+      const head = new THREE.Mesh(new THREE.ConeGeometry(0.032, 0.085, 16), mat);
+      head.position.y = 0.38;
+      head.renderOrder = 26;
+      const hit = new THREE.Mesh(new THREE.CylinderGeometry(0.048, 0.048, 0.44, 8), hitMat);
+      hit.position.y = 0.22;
+      const uData = {
+        gizmoAxis: axis,
+        visualMat: mat,
+        baseColor: colorHex,
+        hoverColor: hoverHex,
+        baseOpacity: 0.9,
+        hoverOpacity: 1.0,
+      };
+      shaft.userData = uData;
+      head.userData = uData;
+      hit.userData = uData;
+      group.add(shaft, head, hit);
+      group.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dirVec.clone().normalize());
+      if (axis !== 'y') group.position.y = 0.015;
+      gizmo.add(group);
+      pickables.push(hit, shaft, head);
+    };
+
+    makeAxisArrow('x', 0xff5668, 0xff94a0, new THREE.Vector3(1, 0, 0));
+    makeAxisArrow('y', 0x42d392, 0x85f2c0, new THREE.Vector3(0, 1, 0));
+    makeAxisArrow('z', 0x4c9aff, 0x94c4ff, new THREE.Vector3(0, 0, 1));
+
+    // Outer Yaw Rotation Ring + Forward Arrow (-Z in local character space)
+    const yawGroup = new THREE.Group();
+    yawGroup.position.y = 0.012;
+    const yawMat = new THREE.MeshBasicMaterial({
+      color: 0xe868b8,
+      transparent: true,
+      opacity: 0.88,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      depthTest: false,
+    });
+    const yawHitMat = new THREE.MeshBasicMaterial({
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      depthTest: false,
+    });
+    const ringMesh = new THREE.Mesh(new THREE.TorusGeometry(0.46, 0.013, 12, 64), yawMat);
+    ringMesh.rotation.x = Math.PI / 2;
+    ringMesh.renderOrder = 26;
+    const frontCone = new THREE.Mesh(new THREE.ConeGeometry(0.044, 0.11, 16), yawMat);
+    frontCone.rotation.x = -Math.PI / 2;
+    frontCone.position.set(0, 0, -0.53);
+    frontCone.renderOrder = 26;
+    const ringHit = new THREE.Mesh(new THREE.TorusGeometry(0.46, 0.055, 8, 48), yawHitMat);
+    ringHit.rotation.x = Math.PI / 2;
+    const yawData = {
+      gizmoAxis: 'rotY',
+      visualMat: yawMat,
+      baseColor: 0xe868b8,
+      hoverColor: 0xffaee0,
+      baseOpacity: 0.88,
+      hoverOpacity: 1.0,
+    };
+    ringMesh.userData = yawData;
+    frontCone.userData = yawData;
+    ringHit.userData = yawData;
+    yawGroup.add(ringMesh, frontCone, ringHit);
+    gizmo.add(yawGroup);
+    this.gizmoYawGroup = yawGroup;
+    pickables.push(ringHit, ringMesh, frontCone);
+
+    this._gizmoPickables = pickables;
+    return gizmo;
+  }
+
+  _setGizmoHover(hitObj) {
+    const nextData = hitObj?.userData?.gizmoAxis ? hitObj.userData : null;
+    if (this._gizmoHovered === nextData) return;
+    if (this._gizmoHovered && this._gizmoHovered.visualMat) {
+      this._gizmoHovered.visualMat.color.setHex(this._gizmoHovered.baseColor);
+      this._gizmoHovered.visualMat.opacity = this._gizmoHovered.baseOpacity;
+    }
+    this._gizmoHovered = nextData;
+    if (nextData && nextData.visualMat) {
+      nextData.visualMat.color.setHex(nextData.hoverColor);
+      nextData.visualMat.opacity = nextData.hoverOpacity;
+    }
+    this.renderFrame();
+  }
+
+  _getPointerRay(clientX, clientY) {
+    if (!this.renderer || !this.camera) return null;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    this._pointerNdc.set(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    this._raycaster.setFromCamera(this._pointerNdc, this.camera);
+    return this._raycaster.ray;
+  }
+
+  _bindGizmoPointerEvents(domElement) {
+    const onPointerDown = (e) => {
+      if (e.button !== 0 || !this.showActorGizmo || !this.actorGizmo || !this.actorGizmo.visible) {
+        return;
+      }
+      const ray = this._getPointerRay(e.clientX, e.clientY);
+      if (!ray) return;
+      const hits = this._raycaster.intersectObjects(this._gizmoPickables, false);
+      if (!hits.length) return;
+      const hitObj = hits[0].object;
+      const axis = hitObj?.userData?.gizmoAxis;
+      if (!axis) return;
+
+      this._setGizmoHover(hitObj);
+      const groupPos = this.actorGroup.position.clone();
+      const curTf = {
+        ...(this.mode === 'asset' ? this.assetActorTransform : this.storyActorTransform),
+      };
+
+      if (axis === 'y') {
+        const n = new THREE.Vector3(
+          this.camera.position.x - groupPos.x,
+          0,
+          this.camera.position.z - groupPos.z,
+        );
+        if (n.lengthSq() < 1e-6) n.set(0, 0, 1);
+        else n.normalize();
+        this._dragPlane.setFromNormalAndCoplanarPoint(n, groupPos);
+      } else {
+        this._dragPlane.setFromNormalAndCoplanarPoint(new THREE.Vector3(0, 1, 0), groupPos);
+      }
+
+      if (!ray.intersectPlane(this._dragPlane, this._dragHitPoint)) {
+        this._dragHitPoint.copy(hits[0].point);
+      }
+      const startAngle = Math.atan2(
+        -(this._dragHitPoint.x - groupPos.x),
+        -(this._dragHitPoint.z - groupPos.z),
+      );
+      this._gizmoDrag = {
+        axis,
+        pointerId: e.pointerId,
+        startTransform: curTf,
+        startGroupPos: groupPos,
+        startHit: this._dragHitPoint.clone(),
+        startAngle,
+      };
+      if (this.controls) this.controls.enabled = false;
+      domElement.style.cursor = 'grabbing';
+      try {
+        domElement.setPointerCapture(e.pointerId);
+      } catch {
+        /* ignore synthetic pointer events */
+      }
+      e.stopPropagation();
+      e.preventDefault();
+    };
+
+    const onPointerMove = (e) => {
+      if (this._gizmoDrag) {
+        const drag = this._gizmoDrag;
+        const ray = this._getPointerRay(e.clientX, e.clientY);
+        if (!ray || !ray.intersectPlane(this._dragPlane, this._dragHitPoint)) return;
+        if (drag.axis === 'y') {
+          const dy = Math.max(-10, Math.min(10, this._dragHitPoint.y - drag.startHit.y));
+          this.setActorTransform({ y: Number((drag.startTransform.y + dy).toFixed(3)) });
+        } else if (drag.axis === 'rotY') {
+          const dx = this._dragHitPoint.x - drag.startGroupPos.x;
+          const dz = this._dragHitPoint.z - drag.startGroupPos.z;
+          if (Math.hypot(dx, dz) > 1e-4) {
+            const curAngle = Math.atan2(-dx, -dz);
+            const deltaDeg = THREE.MathUtils.radToDeg(curAngle - drag.startAngle);
+            this.setActorTransform({ rotY: Math.round(drag.startTransform.rotY + deltaDeg) });
+          }
+        } else {
+          let dx = this._dragHitPoint.x - drag.startHit.x;
+          let dz = this._dragHitPoint.z - drag.startHit.z;
+          const dist = Math.hypot(dx, dz);
+          if (dist > 30) {
+            dx *= 30 / dist;
+            dz *= 30 / dist;
+          }
+          const patch = {};
+          if (drag.axis === 'x' || drag.axis === 'xz') {
+            patch.x = Number((drag.startTransform.x + dx).toFixed(3));
+          }
+          if (drag.axis === 'z' || drag.axis === 'xz') {
+            patch.z = Number((drag.startTransform.z + dz).toFixed(3));
+          }
+          this.setActorTransform(patch);
+        }
+        e.stopPropagation();
+        return;
+      }
+
+      if (!this.showActorGizmo || !this.actorGizmo || !this.actorGizmo.visible) {
+        if (this._gizmoHovered) {
+          this._setGizmoHover(null);
+          domElement.style.cursor = '';
+        }
+        return;
+      }
+      const ray = this._getPointerRay(e.clientX, e.clientY);
+      if (!ray) return;
+      const hits = this._raycaster.intersectObjects(this._gizmoPickables, false);
+      const hitObj = hits.length ? hits[0].object : null;
+      this._setGizmoHover(hitObj);
+      domElement.style.cursor = hitObj ? 'grab' : '';
+    };
+
+    const onPointerUp = (e) => {
+      if (!this._gizmoDrag) return;
+      try {
+        if (domElement.hasPointerCapture?.(this._gizmoDrag.pointerId)) {
+          domElement.releasePointerCapture(this._gizmoDrag.pointerId);
+        }
+      } catch {
+        /* ignore */
+      }
+      this._gizmoDrag = null;
+      if (this.controls) {
+        this.controls.enabled = this.mode === 'asset' ? true : this.storyCameraLocked;
+      }
+      domElement.style.cursor = this._gizmoHovered ? 'grab' : '';
+      e.stopPropagation();
+    };
+
+    domElement.addEventListener('pointerdown', onPointerDown, { capture: true });
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
+  }
+
+  _syncActorGizmoTransform() {
+    if (!this.actorGizmo) return;
+    const visible = Boolean(this.showActorGizmo && this.actorGroup && this.actorGroup.visible);
+    this.actorGizmo.visible = visible;
+    if (!visible) return;
+    this.actorGizmo.position.copy(this.actorGroup.position);
+    if (this.gizmoYawGroup) {
+      const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(this.actorGroup.quaternion);
+      this.gizmoYawGroup.rotation.set(0, Math.atan2(-fwd.x, -fwd.z), 0);
+    }
   }
 
   setViewportSize(w, h, pixelRatio = null) {
@@ -1340,14 +1696,15 @@ export class ViewerEngine {
         this.setAssetFacialMotion(this.assetFacialMotionName),
       ]);
 
-      // Preload default story script in the background so switching to Story tab is instant
-      await this.loadStoryFromUrl(this.storyScriptUrl, 'script.txt', false);
-
       this.loading = false;
       this.loadingText = '';
       this._setupWindowHooks();
       this._emit();
       this.renderFrame();
+
+      if (this.mode === 'story' && !this.storyTimeline && !this._storyLoad) {
+        await this.loadStoryFromUrl(this.storyScriptUrl, 'script.txt', false);
+      }
     } catch (e) {
       console.error('Boot error:', e);
       this.loading = false;
@@ -1357,10 +1714,23 @@ export class ViewerEngine {
   }
 
   async _loadEnv3d(sceneName = 'env_3d_adv_classroom-00-00-noon') {
+    if (this.env3dCache.has(sceneName)) return this._activateEnv3d(sceneName);
+    if (this._env3dLoads.has(sceneName)) return this._env3dLoads.get(sceneName);
+    const pending = this._buildEnv3d(sceneName);
+    this._env3dLoads.set(sceneName, pending);
+    try {
+      return await pending;
+    } finally {
+      this._env3dLoads.delete(sceneName);
+    }
+  }
+
+  async _buildEnv3d(sceneName) {
     if (this.env3dCache.has(sceneName)) {
       return this._activateEnv3d(sceneName);
     }
-    const env = await getBrowserEnv();
+    const sharedEnv = await getBrowserEnv();
+    const env = sharedEnv.createScope();
     let needsServerEnsure = !env.hasBundle(sceneName);
     if (!needsServerEnsure) {
       try {
@@ -1381,25 +1751,32 @@ export class ViewerEngine {
     }
     if (needsServerEnsure) {
       await this.ensureAssetsOnServer([sceneName, 't_sky_noon-00'], [], true).catch(() => {});
+      env.updateIndex(sharedEnv.index);
     }
-    const { glbBytes, meta, textures } = await buildEnv3dFromBundles(env, sceneName);
+    let { glbBytes, meta, textures } = await buildEnv3dFromBundles(env, sceneName);
     const gltf = await new GLTFLoader().parseAsync(
       glbBytes.buffer.slice(glbBytes.byteOffset, glbBytes.byteOffset + glbBytes.byteLength),
       '',
     );
+    glbBytes = null;
+    const stageGroup = new THREE.Group();
+    stageGroup.name = sceneName;
+    stageGroup.add(gltf.scene);
+    const entry = { sceneName, meta, group: stageGroup, skyTexture: null, skyTarget: null, textures: new Set() };
+    try {
 
     const stageTexCache = new Map();
     const stageTex = (rel, srgb, flipY = false, maxDim = 1024) => {
       if (!rel) return null;
-      const entry = textures.get(rel);
-      if (!entry) return null;
+      const image = textures.get(rel);
+      if (!image) return null;
       const ckey = `${rel}|${srgb ? 1 : 0}|${flipY ? 1 : 0}|${maxDim}`;
       let tex = stageTexCache.get(ckey);
       if (!tex) {
         const img =
-          entry.width > maxDim || entry.height > maxDim
-            ? downsampleRgba(entry.data, entry.width, entry.height, maxDim)
-            : entry;
+          image.width > maxDim || image.height > maxDim
+            ? downsampleRgba(image.data, image.width, image.height, maxDim)
+            : image;
         tex = new THREE.DataTexture(img.data, img.width, img.height, THREE.RGBAFormat);
         tex.flipY = flipY;
         tex.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
@@ -1411,6 +1788,7 @@ export class ViewerEngine {
         tex.anisotropy = 4;
         tex.needsUpdate = true;
         stageTexCache.set(ckey, tex);
+        entry.textures.add(tex);
       }
       return tex;
     };
@@ -1438,9 +1816,13 @@ export class ViewerEngine {
         eqTex.generateMipmaps = false;
         eqTex.needsUpdate = true;
         const pmrem = new THREE.PMREMGenerator(this.renderer);
-        stageSkyTexture = pmrem.fromEquirectangular(eqTex).texture;
-        pmrem.dispose();
-        eqTex.dispose();
+        try {
+          entry.skyTarget = pmrem.fromEquirectangular(eqTex);
+          stageSkyTexture = entry.skyTarget.texture;
+        } finally {
+          pmrem.dispose();
+          eqTex.dispose();
+        }
       }
     }
 
@@ -1502,7 +1884,7 @@ export class ViewerEngine {
           color: tint,
           roughness: 0.68,
           metalness: 0.04,
-          envMap: isGlass ? null : stageSkyTexture || this.skyTexture || null,
+          envMap: isGlass ? null : stageSkyTexture,
           envMapIntensity: isGlass ? 0.0 : 0.4,
           side,
           transparent: isBlend,
@@ -1529,12 +1911,11 @@ export class ViewerEngine {
         mat.customProgramCacheKey = () => `emis-${matName}`;
       }
       if (isBlend) o.renderOrder = 2;
+      const previousMaterials = Array.isArray(o.material) ? o.material : [o.material];
+      for (const previous of previousMaterials) previous?.dispose();
       o.material = mat;
     });
 
-    const stageGroup = new THREE.Group();
-    stageGroup.name = sceneName;
-    stageGroup.add(gltf.scene);
 
     for (const d of meta.decals || []) {
       if (!d.map || !d.positions || d.fade <= 0.005) continue;
@@ -1561,15 +1942,69 @@ export class ViewerEngine {
     }
 
     this.envGroup.add(stageGroup);
-    const entry = {
-      sceneName,
-      meta,
-      group: stageGroup,
-      skyTexture: stageSkyTexture,
-    };
+    entry.skyTexture = stageSkyTexture;
+    textures.clear();
+    textures = null;
     this.env3dCache.set(sceneName, entry);
     this.envLoaded = true;
     return this._activateEnv3d(sceneName);
+    } catch (error) {
+      this.env3dCache.delete(sceneName);
+      this._disposeEnv3d(entry);
+      throw error;
+    } finally {
+      textures?.clear();
+    }
+  }
+
+  _disposeEnv3d(entry) {
+    entry.group.removeFromParent();
+    const geometries = new Set();
+    const materials = new Set();
+    entry.group.traverse((object) => {
+      if (object.geometry) geometries.add(object.geometry);
+      for (const material of Array.isArray(object.material) ? object.material : [object.material]) {
+        if (material) materials.add(material);
+      }
+    });
+    for (const geometry of geometries) geometry.dispose();
+    for (const material of materials) material.dispose();
+    for (const texture of entry.textures) texture.dispose();
+    entry.textures.clear();
+    entry.skyTarget?.dispose();
+    entry.group.clear();
+  }
+
+  _pruneSceneResources(timeline = this.storyTimeline) {
+    // Keep only the selected asset scene and the current story's seekable backgrounds.
+    const keep = new Set([this.assetSceneName]);
+    for (const bg of timeline?.backgrounds.values() || []) if (bg?.src) keep.add(bg.src);
+    for (const [name, entry] of this.env3dCache) {
+      if (keep.has(name)) continue;
+      if (this.scene.background === entry.skyTexture) this.scene.background = null;
+      if (this.envInfo === entry) {
+        this.envInfo = null;
+        this.skyTexture = null;
+        this.activeEnv3dName = null;
+      }
+      this._disposeEnv3d(entry);
+      this.env3dCache.delete(name);
+    }
+    this.envLoaded = this.env3dCache.size > 0;
+    for (const [name, texture] of this.bgTextures) {
+      if (keep.has(name)) continue;
+      // Drop post-processing references before deleting the GPU texture.
+      this.bloom?.setBg2D({ active: false });
+      texture.dispose();
+      this.bgTextures.delete(name);
+      const image = this.bgImages.get(name);
+      if (image) { image.removeAttribute('src'); image.remove(); }
+      this.bgImages.delete(name);
+      const info = this.bgMeta[name];
+      if (info?.blobUrl) URL.revokeObjectURL(info.blobUrl);
+      delete this.bgMeta[name];
+    }
+    this.renderer?.renderLists.dispose();
   }
 
   _activateEnv3d(sceneName) {
@@ -1646,8 +2081,18 @@ export class ViewerEngine {
   }
 
   async _loadBg2d(src) {
-    if (!src) return null;
-    if (this.bgMeta[src]) return null;
+    if (!src || this.bgMeta[src]) return null;
+    if (this._bg2dLoads.has(src)) return this._bg2dLoads.get(src);
+    const pending = this._buildBg2d(src);
+    this._bg2dLoads.set(src, pending);
+    try {
+      return await pending;
+    } finally {
+      this._bg2dLoads.delete(src);
+    }
+  }
+
+  async _buildBg2d(src) {
     const env = await getBrowserEnv();
     let updatedCatalog = null;
     if (!env.hasBundle(src)) {
@@ -1725,9 +2170,10 @@ export class ViewerEngine {
       this.storyPlaying = false;
       this.voiceCtrl.audio.pause();
       this._syncAssetSceneLighting();
+      const { x, y, z, rotY } = this.assetActorTransform;
       this.actorGroup.visible = true;
-      this.actorGroup.position.set(0, 0, 0);
-      this.actorGroup.quaternion.identity();
+      this.actorGroup.position.set(x, y, z);
+      this.actorGroup.rotation.set(0, THREE.MathUtils.degToRad(rotY), 0);
       this.actorGroup.scale.set(1, 1, 1);
       this.controls.enabled = true;
       this.setAssetCameraPreset('full');
@@ -1742,6 +2188,9 @@ export class ViewerEngine {
         this.char.solver.enableIK = true;
         this.char.solver.enableSwing = true;
       }
+      if (!this.storyTimeline && !this._storyLoad) {
+        this.loadStoryFromUrl(this.storyScriptUrl, 'script.txt', false);
+      }
     }
     this._emit();
     this.renderFrame();
@@ -1749,6 +2198,7 @@ export class ViewerEngine {
 
   // -------------------- Tab 1: Asset Browser Controls --------------------
   async loadCharacterParts(parts) {
+    const request = ++this._characterRequest;
     const nextParts = {
       body: parts.body || this.currentParts.body,
       face: parts.face || this.currentParts.face,
@@ -1764,7 +2214,13 @@ export class ViewerEngine {
         nextParts.face,
         nextParts.hair,
       ]);
+      if (request !== this._characterRequest) return updatedCatalog;
       const newChar = await loadCharacter(null, nextParts);
+      if (request !== this._characterRequest) {
+        newChar.dispose();
+        return updatedCatalog;
+      }
+      const oldChar = this.char;
       if (this.char) {
         this.char.dispose();
       }
@@ -1776,6 +2232,13 @@ export class ViewerEngine {
       newChar.solver.enableSwing = this.assetEnableSwing;
       newChar.root.position.set(0, 0, 0);
       this.actorGroup.add(newChar.root);
+      if (this.storyPlayer) {
+        this.storyPlayer.char = newChar;
+        for (const entry of this.storyPlayer.actorEntries.values()) {
+          if (entry.char === oldChar) entry.char = newChar;
+        }
+      }
+      this.renderer?.renderLists.dispose();
 
       // Re-bind current asset clips against new character skeleton
       await Promise.all([
@@ -1783,9 +2246,7 @@ export class ViewerEngine {
         this.setAssetFacialMotion(this.assetFacialMotionName),
       ]);
 
-      if (this.storyPlayer) {
-        this.storyPlayer.char = newChar;
-      }
+      if (request !== this._characterRequest) return updatedCatalog;
 
       this.loading = false;
       this.loadingText = '';
@@ -1793,6 +2254,7 @@ export class ViewerEngine {
       this.renderFrame();
       return updatedCatalog;
     } catch (e) {
+      if (request !== this._characterRequest) return null;
       console.error('Failed to load character parts:', e);
       this.loading = false;
       this.loadingText = `模型加载失败: ${e?.message || e}`;
@@ -1889,6 +2351,7 @@ export class ViewerEngine {
   }
 
   async setAssetScene(sceneName) {
+    const request = ++this._sceneRequest;
     const normalized =
       !sceneName || sceneName === 'studio'
         ? 'studio'
@@ -1904,6 +2367,9 @@ export class ViewerEngine {
           : normalized;
 
     if (normalized === 'studio') {
+      this.loading = false;
+      this.loadingText = '';
+      this._pruneSceneResources();
       this._syncAssetSceneLighting();
       this._emit();
       this.renderFrame();
@@ -1918,6 +2384,7 @@ export class ViewerEngine {
           this.loadingText = `正在加载 3D 场景 (${normalized})…`;
           this._emit();
           await this._loadEnv3d(normalized);
+          if (request !== this._sceneRequest) return updatedCatalog;
           this.loading = false;
           this.loadingText = '';
         }
@@ -1927,6 +2394,7 @@ export class ViewerEngine {
           this.loadingText = `正在加载 2D 场景 (${normalized})…`;
           this._emit();
           updatedCatalog = await this._loadBg2d(normalized);
+          if (request !== this._sceneRequest) return updatedCatalog;
           this.loading = false;
           this.loadingText = '';
         }
@@ -1936,12 +2404,16 @@ export class ViewerEngine {
       this.renderFrame();
       return updatedCatalog;
     } catch (e) {
+      if (request !== this._sceneRequest) return null;
       console.error('Failed to load asset scene:', e);
       this.loading = false;
       this.loadingText = `场景加载失败: ${e?.message || e}`;
       this._emit();
       this.renderFrame();
       return null;
+    } finally {
+      this._pruneSceneResources();
+      this.renderFrame();
     }
   }
 
@@ -1984,25 +2456,181 @@ export class ViewerEngine {
     this.renderFrame();
   }
 
+  setActorTransform(partial = {}, targetMode = this.mode) {
+    const isStory = targetMode === 'story';
+    const prev = isStory ? this.storyActorTransform : this.assetActorTransform;
+    const next = { ...prev };
+    if (partial.x !== undefined && Number.isFinite(Number(partial.x))) {
+      next.x = Number(partial.x);
+    }
+    if (partial.y !== undefined && Number.isFinite(Number(partial.y))) {
+      next.y = Number(partial.y);
+    }
+    if (partial.z !== undefined && Number.isFinite(Number(partial.z))) {
+      next.z = Number(partial.z);
+    }
+    if (partial.rotY !== undefined && Number.isFinite(Number(partial.rotY))) {
+      let d = ((Number(partial.rotY) + 180) % 360 + 360) % 360 - 180;
+      if (d === -180 && Number(partial.rotY) > 0) d = 180;
+      next.rotY = d;
+    }
+    if (isStory) {
+      this.storyActorTransform = next;
+    } else {
+      this.assetActorTransform = next;
+    }
+    this._emit();
+    this.renderFrame();
+  }
+
+  setAssetActorTransform(partial) {
+    this.setActorTransform(partial, 'asset');
+  }
+
+  setStoryActorTransform(partial) {
+    this.setActorTransform(partial, 'story');
+  }
+
+  resetActorTransform(targetMode = this.mode) {
+    this.setActorTransform({ x: 0, y: 0, z: 0, rotY: 0 }, targetMode);
+  }
+
+  rotateActorBy(deltaDeg, targetMode = this.mode) {
+    const cur = targetMode === 'story' ? this.storyActorTransform : this.assetActorTransform;
+    this.setActorTransform({ rotY: (cur.rotY || 0) + (Number(deltaDeg) || 0) }, targetMode);
+  }
+
+  translateActorBy(dx = 0, dy = 0, dz = 0, local = false, targetMode = this.mode) {
+    const cur = targetMode === 'story' ? this.storyActorTransform : this.assetActorTransform;
+    let ox = Number(dx) || 0;
+    const oy = Number(dy) || 0;
+    let oz = Number(dz) || 0;
+    if (local && (Math.abs(ox) > 1e-6 || Math.abs(oz) > 1e-6)) {
+      const rad = THREE.MathUtils.degToRad(cur.rotY || 0);
+      const cos = Math.cos(rad);
+      const sin = Math.sin(rad);
+      const rx = ox * cos + oz * sin;
+      const rz = -ox * sin + oz * cos;
+      ox = rx;
+      oz = rz;
+    }
+    this.setActorTransform(
+      {
+        x: Number((cur.x + ox).toFixed(3)),
+        y: Number((cur.y + oy).toFixed(3)),
+        z: Number((cur.z + oz).toFixed(3)),
+      },
+      targetMode,
+    );
+  }
+
+  moveActorCameraRelative(forwardStep = 0, rightStep = 0, upStep = 0, targetMode = this.mode) {
+    if (!this.camera) {
+      this.translateActorBy(rightStep, upStep, forwardStep, false, targetMode);
+      return;
+    }
+    const fwd = new THREE.Vector3();
+    this.camera.getWorldDirection(fwd);
+    fwd.y = 0;
+    if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, 1);
+    else fwd.normalize();
+    const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0)).normalize();
+    const dx = fwd.x * forwardStep + right.x * rightStep;
+    const dz = fwd.z * forwardStep + right.z * rightStep;
+    this.translateActorBy(dx, upStep, dz, false, targetMode);
+  }
+
+  faceActorToCamera() {
+    if (!this.camera) return;
+    const ax = this.actorGroup ? this.actorGroup.position.x : this.assetActorTransform.x;
+    const az = this.actorGroup ? this.actorGroup.position.z : this.assetActorTransform.z;
+    const dx = this.camera.position.x - ax;
+    const dz = this.camera.position.z - az;
+    if (Math.hypot(dx, dz) <= 1e-4) return;
+    const worldYawDeg = THREE.MathUtils.radToDeg(Math.atan2(-dx, -dz));
+    if (this.mode === 'story' && this.storyPlayer) {
+      const st = this.storyPlayer.stateAt(this.storyTime);
+      const rot = st?.layout?.rotation;
+      let baseThreeYaw = 0;
+      if (rot) {
+        const baseQ = unityEulerQuat(rot.x || 0, rot.y || 0, rot.z || 0);
+        const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(baseQ);
+        baseThreeYaw = THREE.MathUtils.radToDeg(Math.atan2(-fwd.x, -fwd.z));
+      }
+      this.setActorTransform({ rotY: Math.round(worldYawDeg - baseThreeYaw) }, 'story');
+    } else {
+      this.setActorTransform({ rotY: Math.round(worldYawDeg) }, 'asset');
+    }
+  }
+
+  placeActorAtCameraTarget() {
+    if (!this.controls || !this.camera) return;
+    const tx = Number(this.controls.target.x.toFixed(2));
+    const tz = Number(this.controls.target.z.toFixed(2));
+    const dx = this.camera.position.x - tx;
+    const dz = this.camera.position.z - tz;
+    const rotY =
+      Math.hypot(dx, dz) > 1e-4
+        ? Math.round(THREE.MathUtils.radToDeg(Math.atan2(-dx, -dz)))
+        : this.assetActorTransform.rotY;
+    this.setActorTransform({ x: tx, z: tz, rotY }, 'asset');
+  }
+
+  focusCameraOnActor() {
+    if (!this.camera || !this.controls || !this.actorGroup) return;
+    const targetPos = new THREE.Vector3(
+      this.actorGroup.position.x,
+      this.actorGroup.position.y + 1.08,
+      this.actorGroup.position.z,
+    );
+    const delta = targetPos.clone().sub(this.controls.target);
+    this.camera.position.add(delta);
+    this.controls.target.copy(targetPos);
+    this.controls.update();
+    this.renderFrame();
+  }
+
+  setShowActorGizmo(v) {
+    this.showActorGizmo = !!v;
+    if (!this.showActorGizmo && this.renderer?.domElement) {
+      this.renderer.domElement.style.cursor = '';
+      this._gizmoHovered = null;
+    }
+    this._syncActorGizmoTransform();
+    this._emit();
+    this.renderFrame();
+  }
+
   setAssetCameraPreset(preset) {
     if (!this.camera || !this.controls) return;
+    let camOffset;
+    let targetOffset;
     if (preset === 'face') {
-      this.camera.position.set(0, 1.38, -0.58);
-      this.controls.target.set(0, 1.36, 0);
+      camOffset = new THREE.Vector3(0, 1.38, -0.58);
+      targetOffset = new THREE.Vector3(0, 1.36, 0);
     } else if (preset === 'bust') {
-      this.camera.position.set(0, 1.28, -1.05);
-      this.controls.target.set(0, 1.22, 0);
+      camOffset = new THREE.Vector3(0, 1.28, -1.05);
+      targetOffset = new THREE.Vector3(0, 1.22, 0);
     } else if (preset === 'side') {
-      this.camera.position.set(1.45, 1.12, -0.45);
-      this.controls.target.set(0, 1.02, 0);
+      camOffset = new THREE.Vector3(1.45, 1.12, -0.45);
+      targetOffset = new THREE.Vector3(0, 1.02, 0);
     } else if (preset === 'back') {
-      this.camera.position.set(0, 1.22, 1.75);
-      this.controls.target.set(0, 1.02, 0);
+      camOffset = new THREE.Vector3(0, 1.22, 1.75);
+      targetOffset = new THREE.Vector3(0, 1.02, 0);
     } else {
       // full
-      this.camera.position.set(0, 1.18, -1.85);
-      this.controls.target.set(0, 1.02, 0);
+      camOffset = new THREE.Vector3(0, 1.18, -1.85);
+      targetOffset = new THREE.Vector3(0, 1.02, 0);
     }
+    const { x, y, z, rotY } = this.assetActorTransform;
+    const q = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(0, 1, 0),
+      THREE.MathUtils.degToRad(rotY || 0),
+    );
+    camOffset.applyQuaternion(q);
+    targetOffset.applyQuaternion(q);
+    this.camera.position.set(x + camOffset.x, y + camOffset.y, z + camOffset.z);
+    this.controls.target.set(x + targetOffset.x, y + targetOffset.y, z + targetOffset.z);
     this.controls.update();
     this.renderFrame();
   }
@@ -2021,14 +2649,29 @@ export class ViewerEngine {
     for (const entry of this.extraStoryActors.values()) {
       if (entry.char) entry.char.dispose();
       if (entry.group && entry.group.parent) entry.group.parent.remove(entry.group);
-      if (entry.groundShadow && entry.groundShadow.parent) {
-        entry.groundShadow.parent.remove(entry.groundShadow);
+      if (entry.groundShadow) {
+        entry.groundShadow.removeFromParent();
+        entry.groundShadow.geometry.dispose();
+        entry.groundShadow.material.map?.dispose();
+        entry.groundShadow.material.dispose();
       }
     }
     this.extraStoryActors.clear();
   }
 
   async loadStoryFromText(text, label = 'custom.txt', autoPlay = false) {
+    // Story loads mutate shared actor groups; do not interleave their ownership.
+    const pending = (this._storyLoad || Promise.resolve()).then(() =>
+      this._loadStoryFromText(text, label, autoPlay));
+    this._storyLoad = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this._storyLoad === pending) this._storyLoad = null;
+    }
+  }
+
+  async _loadStoryFromText(text, label, autoPlay) {
     try {
       this.loading = true;
       this.loadingText = `正在解析剧情脚本 ${label}…`;
@@ -2037,6 +2680,12 @@ export class ViewerEngine {
       const env = await getBrowserEnv();
       const events = parseAdv(text);
       const timeline = buildTimeline(events);
+      this.storyPlaying = false;
+      this.storyPlayer = null;
+      this.storyTimeline = timeline;
+      this.voiceCtrl.clear();
+      this._disposeExtraStoryActors();
+      this._pruneSceneResources(timeline);
 
       // Collect all required bundles and voice .acb resources from the script
       const neededBundles = new Set([STAND_MOTION]);
@@ -2122,7 +2771,6 @@ export class ViewerEngine {
       }
 
       // Load any additional actors in multi-character scripts
-      this._disposeExtraStoryActors();
       const actorEntries = new Map([
         [
           scriptActorId,
@@ -2253,6 +2901,9 @@ export class ViewerEngine {
       this.loading = false;
       this.loadingText = `脚本加载失败: ${e?.message || e}`;
       this._emit();
+    } finally {
+      this._pruneSceneResources();
+      this.renderFrame();
     }
   }
 
@@ -2419,11 +3070,12 @@ export class ViewerEngine {
       this.controls.update();
     }
 
+    const { x, y, z, rotY } = this.assetActorTransform;
     this.actorGroup.visible = true;
-    this.actorGroup.position.set(0, 0, 0);
-    this.actorGroup.quaternion.identity();
+    this.actorGroup.position.set(x, y, z);
+    this.actorGroup.rotation.set(0, THREE.MathUtils.degToRad(rotY), 0);
     this.actorGroup.scale.set(1, 1, 1);
-
+    this.actorGroup.updateMatrixWorld(true);
     if (this.assetBodyClip) {
       const ev = evalClip(this.assetBodyClip, this.assetTime);
       applyAnimationManage(this.char.solver.swing, this.animationManageProperties, ev.manage, manageVolume);
@@ -2458,8 +3110,8 @@ export class ViewerEngine {
     this.groundShadow.visible = !is2d;
     const hips = this.char.solver.nameToNode.Hips;
     const hp = hips ? hips.getWorldPosition(new THREE.Vector3()) : this.actorGroup.position;
-    this.groundShadow.position.set(hp.x, 0.004, hp.z);
-
+    this.groundShadow.position.set(hp.x, this.actorGroup.position.y + 0.004, hp.z);
+    this._syncActorGizmoTransform();
     if (this.bloom && this.useBloom) this.bloom.render(this.scene, this.camera);
     else this.renderer.render(this.scene, this.camera);
   }
@@ -2487,6 +3139,7 @@ export class ViewerEngine {
 
     this.storyPlayer.animationManageProperties = this.animationManageProperties;
     this.storyPlayer.animationManageVolume = this._activeAnimationManageVolume;
+    this.storyPlayer.actorTransformOffset = this.storyActorTransform;
     this.storyPlayer.applyCharacter(t, st);
     for (const [aid, entry] of this.storyPlayer.actorEntries) {
       const aSt = st.actors ? st.actors.get(aid) : st;
@@ -2506,6 +3159,7 @@ export class ViewerEngine {
         }
       }
     }
+    this._syncActorGizmoTransform();
 
     if (this.bloom && this.useBloom) this.bloom.render(this.scene, this.camera);
     else this.renderer.render(this.scene, this.camera);

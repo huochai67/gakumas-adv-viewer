@@ -14,6 +14,8 @@ import { buildCharFromBundles, loadClipFromBundle } from '../runtime/bundle_load
 export const MUSCLE_COUNT = 95;
 
 const cache = new Map();
+const MAX_CACHED_CLIPS = 64;
+let charMetaRevision = 0;
 
 // Character metadata (glTF node indices per bone, morph target mapping) that
 // clip tracks are resolved against. Provided by loadCharacter() via
@@ -22,29 +24,62 @@ let charMeta = null;
 let charMetaPromise = null;
 
 export function setClipCharMeta(meta) {
-  if (charMeta !== meta) {
-    cache.clear();
-  }
-  charMeta = meta || null;
+  meta = meta || null;
+  if (charMeta === meta && !charMetaPromise) return;
+  cache.clear();
+  charMetaRevision++;
+  charMeta = meta;
   charMetaPromise = null;
 }
 
 async function ensureCharMeta(env) {
-  if (charMeta) return charMeta;
-  if (!charMetaPromise) {
-    charMetaPromise = buildCharFromBundles(env).then(({ meta }) => meta);
+  while (!charMeta) {
+    const revision = charMetaRevision;
+    if (!charMetaPromise) {
+      charMetaPromise = buildCharFromBundles(env).then(({ meta, textures }) => {
+        textures.clear();
+        return meta;
+      });
+    }
+    const pending = charMetaPromise;
+    try {
+      const meta = await pending;
+      if (revision === charMetaRevision) charMeta = meta;
+    } catch (error) {
+      if (revision === charMetaRevision) throw error;
+    } finally {
+      if (charMetaPromise === pending) charMetaPromise = null;
+    }
   }
-  charMeta = await charMetaPromise;
   return charMeta;
 }
 
 export async function getClip(name) {
-  if (cache.has(name)) return cache.get(name);
-  const env = await getBrowserEnv();
-  const clip = await loadClipFromBundle(env, name, await ensureCharMeta(env));
-  if (!clip) throw Object.assign(new Error('clip missing: ' + name), { fatal: true });
-  cache.set(name, clip);
-  return clip;
+  for (;;) {
+    if (cache.has(name)) {
+      const clip = cache.get(name);
+      cache.delete(name);
+      cache.set(name, clip);
+      return clip;
+    }
+    const env = await getBrowserEnv();
+    const meta = await ensureCharMeta(env);
+    const revision = charMetaRevision;
+    // A character replacement may run between ensureCharMeta and this continuation.
+    if (meta !== charMeta) continue;
+    let clip;
+    try {
+      clip = await loadClipFromBundle(env, name, meta);
+    } catch (error) {
+      if (revision !== charMetaRevision) continue;
+      throw error;
+    }
+    if (revision !== charMetaRevision) continue;
+    if (!clip) throw Object.assign(new Error('clip missing: ' + name), { fatal: true });
+    cache.set(name, clip);
+    while (cache.size > MAX_CACHED_CLIPS) cache.delete(cache.keys().next().value);
+    return clip;
+  }
 }
 
 export function hasClip(name) {

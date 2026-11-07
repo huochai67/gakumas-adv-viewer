@@ -940,6 +940,15 @@ export class BrowserAssetEnv {
     this.bundleNames = new Set();
     for (const entry of this.index.bundles) this.bundleNames.add(stripBundleSuffix(entry));
     this._inflight = new Map();
+    this._isScope = false;
+  }
+
+  /** One request may reuse its scope for probing and building, never globally. */
+  createScope() {
+    if (this._isScope) return this;
+    const scope = new BrowserAssetEnv(this.index);
+    scope._isScope = true;
+    return scope;
   }
 
   updateIndex(index = {}) {
@@ -1124,7 +1133,11 @@ export class BrowserAssetEnv {
 
 let _envPromise = null;
 
-/** Initialize WASM + `/cache/index.json` and return the shared asset environment. */
+/**
+ * Initialize WASM + the shared asset index. Runtime builders create request-local
+ * BrowserAssetEnv instances from this index so parsed bundles are not retained
+ * here; lazy texture maps own those instances until upload completes.
+ */
 export async function getBrowserEnv() {
   if (!_envPromise) {
     _envPromise = (async () => {

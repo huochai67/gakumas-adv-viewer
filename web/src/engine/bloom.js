@@ -543,6 +543,9 @@ export function createBloom(renderer, {
     setBg2D(cfg) {
       if (!cfg || !cfg.active || !cfg.texture) {
         bg2dState.active = false;
+        bg2dState.texture = null;
+        bg2dMat.uniforms.tBg.value = null;
+        cachedBgKey = '';
         return;
       }
       bg2dState.active = true;

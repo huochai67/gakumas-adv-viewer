@@ -470,6 +470,33 @@ body,
   cursor: pointer;
 }
 
+.transform-num-input {
+  width: 62px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(0, 0, 0, 0.32);
+  color: var(--text-primary);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-align: right;
+  outline: none;
+}
+
+.transform-num-input:focus {
+  border-color: var(--accent-pink);
+}
+
+.transform-gizmo-hint {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  background: rgba(76, 154, 255, 0.1);
+  border: 1px solid rgba(76, 154, 255, 0.28);
+  border-radius: 7px;
+  padding: 6px 9px;
+}
+
 .btn {
   padding: 6px 12px;
   border-radius: 7px;

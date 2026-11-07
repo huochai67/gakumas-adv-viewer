@@ -13,6 +13,7 @@
 
 import { decodeTextureRgba, decodeHcaAndLipsync } from './wasm_bridge.js';
 import {
+  BrowserAssetEnv,
   skeleton,
   localTrs,
   meshData,
@@ -28,6 +29,11 @@ import { ANIMATION_MANAGE_DEFAULTS, ANIMATION_MANAGE_FIELDS } from '../engine/an
 /* -------------------------------------------------------------------------- */
 /* Shared helpers                                                             */
 /* -------------------------------------------------------------------------- */
+
+// Browser loads own their parsed bundles; CLI environments keep their own I/O.
+function requestEnv(env) {
+  return env instanceof BrowserAssetEnv ? env.createScope() : env;
+}
 
 function toBytes(value) {
   if (value === null || value === undefined) return new Uint8Array(0);
@@ -146,7 +152,16 @@ class LazyTextureMap extends Map {
     const entry = { data: decoded.data, width: decoded.width, height: decoded.height };
     super.set(pending.rel, entry);
     super.set(pending.name, entry);
+    this._lazy.delete(pending.rel);
+    this._lazy.delete(pending.name);
+    if (this._lazy.size === 0) this.env = null;
     return entry;
+  }
+  // Consumers call clear after uploading all needed textures, including on error.
+  clear() {
+    super.clear();
+    this._lazy.clear();
+    this.env = null;
   }
 }
 
@@ -511,6 +526,7 @@ function findRoot(env, bundle) {
  * character bundles.
  */
 export async function buildCharFromBundles(env, parts = PARTS) {
+  env = requestEnv(env);
   const activeParts = {
     body: parts?.body || PARTS.body,
     face: parts?.face || PARTS.face,
@@ -1732,6 +1748,7 @@ class EnvExporter {
 
 /** Build the 3D ADV stage GLB + metadata + in-memory RGBA textures. */
 export async function buildEnv3dFromBundles(env, sceneName = SCENE) {
+  env = requestEnv(env);
   await env.ensureBundle(sceneName, true);
   if (env.hasBundle(SKY_BUNDLE)) {
     try {
@@ -1789,6 +1806,7 @@ async function rgbaToBlobUrl(data, width, height) {
 
 /** Load one `env_2d_*` bundle into raw RGBA pixels plus a PNG blob URL. */
 export async function loadBg2dFromBundle(env, bundleName) {
+  env = requestEnv(env);
   const name = String(bundleName).endsWith('.bundle')
     ? String(bundleName).slice(0, -'.bundle'.length)
     : String(bundleName);
@@ -1921,36 +1939,21 @@ function blendTable(env, face_bundle) {
 }
 
 async function ensureClipTables(env, charMeta) {
-  if (!env._clipPathTable || !env._clipBlendTable) {
-    await Promise.all([
-      env.ensureBundle(PARTS.body, false),
-      env.ensureBundle(PARTS.face, false),
-    ]);
-    if (!env._clipPathTable) {
-      env._clipPathTable = nodePathTable(env, env.bundleFile(PARTS.body));
-    }
-    if (!env._clipBlendTable) {
-      env._clipBlendTable = blendTable(env, env.bundleFile(PARTS.face));
-    }
+  await Promise.all([
+    env.ensureBundle(PARTS.body, false),
+    env.ensureBundle(PARTS.face, false),
+  ]);
+  const sourcePaths = nodePathTable(env, env.bundleFile(PARTS.body));
+  const blends = blendTable(env, env.bundleFile(PARTS.face));
+  const byPath = charMeta?.nodeByPathId;
+  const byName = charMeta?.nodeByName;
+  const paths = new Map();
+  for (const [hash, [pathId, path]] of sourcePaths) {
+    const name = String(path || '').split('/').pop();
+    const raw = byPath?.[String(pathId)] ?? byName?.[name];
+    paths.set(hash, [raw === undefined ? -1 : Math.trunc(Number(raw)), path]);
   }
-
-  const byPath = charMeta?.nodeByPathId ?? null;
-  const byName = charMeta?.nodeByName ?? null;
-  if (byPath && env._clipCharPaths !== byPath) {
-    const paths = new Map();
-    for (const [h, v] of env._clipPathTable) {
-      const bname = String(v[1] || '').split('/').pop();
-      const raw = byPath[String(v[0])] ?? (bname && byName ? byName[bname] : undefined);
-      paths.set(h, [raw === undefined ? -1 : Math.trunc(Number(raw)), v[1]]);
-    }
-    env._clipCharPaths = byPath;
-    env._clipCharPathsMapped = paths;
-  } else if (!byPath && !env._clipCharPathsMapped) {
-    const paths = new Map();
-    for (const [h, v] of env._clipPathTable) paths.set(h, [-1, v[1]]);
-    env._clipCharPathsMapped = paths;
-  }
-  return { paths: env._clipCharPathsMapped, blends: env._clipBlendTable };
+  return { paths, blends };
 }
 
 function exportClipsFromBundle(env, bundleName, paths, blends) {
@@ -2054,21 +2057,15 @@ function exportClipsFromBundle(env, bundleName, paths, blends) {
   return out;
 }
 
-/** Load (and cache) one sampled AnimationClip from its `mot_*` bundle. */
+/** Load one sampled AnimationClip; the engine owns the bounded bound-clip cache. */
 export async function loadClipFromBundle(env, clipName, charMeta) {
-  if (!env._clipCache) env._clipCache = new Map();
-  const cache = env._clipCache;
-  if (cache.has(clipName)) return cache.get(clipName);
-
+  env = requestEnv(env);
   const bundleName = String(clipName).replace(/_[bf]$/, '');
   if (!env.hasBundle(bundleName)) return null;
-
   await env.ensureBundle(bundleName, false);
   const { paths, blends } = await ensureClipTables(env, charMeta);
-  const clips = exportClipsFromBundle(env, bundleName, paths, blends);
-  for (const c of clips) cache.set(c.name, c);
-  if (!cache.has(clipName)) cache.set(clipName, null);
-  return cache.get(clipName);
+  return exportClipsFromBundle(env, bundleName, paths, blends)
+    .find((clip) => clip.name === clipName) ?? null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2076,8 +2073,7 @@ export async function loadClipFromBundle(env, clipName, charMeta) {
 /* -------------------------------------------------------------------------- */
 
 const ACB_SHEET_CACHE = new Map();
-const VOICE_CUE_CACHE = new Map();
-const VOICE_CUE_INFLIGHT = new Map();
+const MAX_ACB_SHEETS = 2;
 
 async function loadAcbSheet(sheet) {
   let promise = ACB_SHEET_CACHE.get(sheet);
@@ -2091,52 +2087,36 @@ async function loadAcbSheet(sheet) {
       return extractAcbHcaStreams(bytes);
     })();
     ACB_SHEET_CACHE.set(sheet, promise);
+    while (ACB_SHEET_CACHE.size > MAX_ACB_SHEETS) {
+      ACB_SHEET_CACHE.delete(ACB_SHEET_CACHE.keys().next().value);
+    }
     promise.catch(() => {
       if (ACB_SHEET_CACHE.get(sheet) === promise) ACB_SHEET_CACHE.delete(sheet);
     });
+  } else {
+    ACB_SHEET_CACHE.delete(sheet);
+    ACB_SHEET_CACHE.set(sheet, promise);
   }
   return promise;
 }
 
-/** Decode a CRI `.acb` cue to a WAV blob URL + 60 Hz AIUEO frames. */
+/** Decode a cue; the caller owns and must revoke the returned WAV blob URL. */
 export async function loadVoiceCueFromAcb(cueName) {
-  if (VOICE_CUE_CACHE.has(cueName)) return VOICE_CUE_CACHE.get(cueName);
-
-  let promise = VOICE_CUE_INFLIGHT.get(cueName);
-  if (!promise) {
-    promise = (async () => {
-      const sheet = String(cueName).replace(/_[a-z0-9]+-\d+$/, '');
-      let streams;
-      try {
-        streams = await loadAcbSheet(sheet);
-      } catch {
-        return null;
-      }
-      const hcaBytes = streams.get(cueName);
-      if (!hcaBytes) {
-        VOICE_CUE_CACHE.set(cueName, null);
-        return null;
-      }
-      try {
-        const decoded = await decodeHcaAndLipsync(hcaBytes, 60);
-        const result = {
-          duration: decoded.duration,
-          fps: 60,
-          frames: decoded.frames,
-          wavBlobUrl: decoded.wavBlobUrl,
-        };
-        VOICE_CUE_CACHE.set(cueName, result);
-        return result;
-      } catch {
-        return null;
-      }
-    })();
-    VOICE_CUE_INFLIGHT.set(cueName, promise);
-    promise.finally(() => {
-      if (VOICE_CUE_INFLIGHT.get(cueName) === promise) VOICE_CUE_INFLIGHT.delete(cueName);
-    });
+  const sheet = String(cueName).replace(/_[a-z0-9]+-\d+$/, '');
+  try {
+    const streams = await loadAcbSheet(sheet);
+    const hcaBytes = streams.get(cueName);
+    if (!hcaBytes) return null;
+    const decoded = await decodeHcaAndLipsync(hcaBytes, 60);
+    return {
+      duration: decoded.duration,
+      fps: 60,
+      frames: decoded.frames,
+      wavBlobUrl: decoded.wavBlobUrl,
+    };
+  } catch {
+    return null;
   }
-  return promise;
 }
 
 /* -------------------------------------------------------------------------- */

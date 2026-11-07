@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { viewerEngine } from '../engine/ViewerEngine.js';
+import { ActorTransformControl } from './ActorTransformControl.jsx';
 
 const PRESET_MORPHS = [
   { index: 20, label: '闭眼 (Eye Blink #20)' },
@@ -214,7 +215,9 @@ export function AssetBrowserPanel({ catalog, onCatalogUpdate, snap }) {
 
       <div className="pane-scroll">
         {subTab === 'scene' && (
-          <div className="section-card">
+          <>
+            <ActorTransformControl snap={snap} mode="asset" />
+            <div className="section-card">
             <div className="section-header">
               <span className="section-title">场景选择 (Stage / Scene)</span>
               <span className="section-count">{filteredEnvironments.length + 1} 项</span>
@@ -274,7 +277,8 @@ export function AssetBrowserPanel({ catalog, onCatalogUpdate, snap }) {
                 </button>
               ))}
             </div>
-          </div>
+            </div>
+          </>
         )}
 
         {subTab === 'model' && (
@@ -401,6 +405,7 @@ export function AssetBrowserPanel({ catalog, onCatalogUpdate, snap }) {
                 </div>
               </div>
             )}
+            <ActorTransformControl snap={snap} mode="asset" />
           </>
         )}
         {subTab === 'motion' && (

@@ -31,6 +31,8 @@ export function App() {
       if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT')) {
         return;
       }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const step = e.shiftKey ? 0.45 : 0.15;
       if (e.code === 'Space') {
         e.preventDefault();
         if (viewerEngine.mode === 'story') {
@@ -42,6 +44,24 @@ export function App() {
         viewerEngine.seekStory(viewerEngine.storyTime + 1, viewerEngine.storyPlaying);
       } else if (e.code === 'ArrowLeft' && viewerEngine.mode === 'story') {
         viewerEngine.seekStory(viewerEngine.storyTime - 1, viewerEngine.storyPlaying);
+      } else if (e.code === 'KeyW') {
+        e.preventDefault();
+        viewerEngine.moveActorCameraRelative(step, 0, 0);
+      } else if (e.code === 'KeyS') {
+        e.preventDefault();
+        viewerEngine.moveActorCameraRelative(-step, 0, 0);
+      } else if (e.code === 'KeyA') {
+        e.preventDefault();
+        viewerEngine.moveActorCameraRelative(0, -step, 0);
+      } else if (e.code === 'KeyD') {
+        e.preventDefault();
+        viewerEngine.moveActorCameraRelative(0, step, 0);
+      } else if (e.code === 'KeyQ') {
+        e.preventDefault();
+        viewerEngine.rotateActorBy(e.shiftKey ? -45 : -15);
+      } else if (e.code === 'KeyE') {
+        e.preventDefault();
+        viewerEngine.rotateActorBy(e.shiftKey ? 45 : 15);
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -87,6 +107,14 @@ export function App() {
         <div className="top-actions">
           {activeTab === 'asset' && (
             <>
+              <button
+                type="button"
+                className={`btn ${snap.showActorGizmo ? 'active' : ''}`}
+                title="在 3D 视口中显示脚底位置/朝向操控环，可直接用鼠标拖拽移动与旋转人物"
+                onClick={() => viewerEngine.setShowActorGizmo(!snap.showActorGizmo)}
+              >
+                🧭 操控环: {snap.showActorGizmo ? 'ON' : 'OFF'}
+              </button>
               <button
                 type="button"
                 className="btn"

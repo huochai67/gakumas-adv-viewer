@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { viewerEngine } from '../engine/ViewerEngine.js';
+import { ActorTransformControl } from './ActorTransformControl.jsx';
 
 export function StoryBrowserPanel({ catalog, snap }) {
   const [dialogueSearch, setDialogueSearch] = useState('');
@@ -171,6 +172,8 @@ export function StoryBrowserPanel({ catalog, snap }) {
           </span>
         </div>
       </div>
+
+      <ActorTransformControl snap={snap} mode="story" />
 
       {/* Interactive Dialogue & Cue Timeline */}
       <div className="section-card" style={{ flex: 1, minHeight: 260 }}>

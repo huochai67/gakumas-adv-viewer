@@ -14,10 +14,6 @@ import { buildCharFromBundles } from '../runtime/bundle_loaders.js';
 const OUTLINE_SCALE = parseFloat(new URLSearchParams(location.search).get('outline') ?? '1.0');
 const STENCIL_MASK = 108; // 0x6C (bits 2, 3, 5, 6 used by Campus/Actor/Default)
 
-const TEX_CACHE = new Map();
-// Texture name -> { data, width, height } decoded straight from the .bundle
-let bundleTextures = null;
-
 // Fallback 1x1 white & neutral textures so shader uniforms are never null
 function solidTex(r, g, b, a = 255, srgb = false) {
   const t = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1, THREE.RGBAFormat);
@@ -31,15 +27,16 @@ const RAMP_DEFAULT = solidTex(255, 255, 255, 0, true);
 
 /**
  * Wrap a decoded bundle texture (row 0 = top of the source image, exactly like
- * a TextureLoader image with flipY = false) in a cached THREE.DataTexture.
+ * a TextureLoader image with flipY = false) in a character-owned THREE.DataTexture.
  */
-function texFromBundle(rel, srgb, clamp = false) {
-  const entry = bundleTextures && bundleTextures.get(rel);
-  if (!entry) return null;
+function texFromBundle(resources, rel, srgb, clamp = false) {
   const ckey = `${rel}|${srgb ? 1 : 0}|${clamp ? 1 : 0}`;
-  let tex = TEX_CACHE.get(ckey);
+  let tex = resources.textureCache.get(ckey);
   if (!tex) {
+    const entry = resources.bundleTextures?.get(rel);
+    if (!entry) return null;
     tex = new THREE.DataTexture(entry.data, entry.width, entry.height, THREE.RGBAFormat);
+    resources.textureCache.set(ckey, tex);
     tex.flipY = false;
     tex.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
     tex.wrapS = clamp ? THREE.ClampToEdgeWrapping : THREE.RepeatWrapping;
@@ -49,15 +46,14 @@ function texFromBundle(rel, srgb, clamp = false) {
     tex.generateMipmaps = true;
     tex.anisotropy = 4;
     tex.needsUpdate = true;
-    TEX_CACHE.set(ckey, tex);
   }
   return tex;
 }
 
-function loadMap(desc, key, srgb, clamp = false) {
+function loadMap(resources, desc, key, srgb, clamp = false) {
   const rel = desc && desc.maps && desc.maps[key];
   if (!rel) return null;
-  return texFromBundle(rel, srgb, clamp);
+  return texFromBundle(resources, rel, srgb, clamp);
 }
 
 // View-space light direction from VLActorParameter / VLActorShadow angles (deg):
@@ -431,17 +427,17 @@ function applyPorterDuffOver(mat) {
   mat.blendDstAlpha = THREE.OneMinusSrcAlphaFactor;
 }
 
-function createActorMaterial(desc, sharedUniforms, bangsPass = false) {
+function createActorMaterial(desc, sharedUniforms, resources, bangsPass = false) {
   const mname = desc.name;
   const stype = desc.floats._ShaderType ?? 0;
-  const baseMap = loadMap(desc, '_BaseMap', true) || WHITE_SRGB;
-  const shadeMap = loadMap(desc, '_ShadeMap', true);
-  const defMap = loadMap(desc, '_DefMap', false);
-  const rampMap = loadMap(desc, '_RampMap', true, true) || RAMP_DEFAULT;
-  const hlMap = loadMap(desc, '_HighlightMap', true);
+  const baseMap = loadMap(resources, desc, '_BaseMap', true) || WHITE_SRGB;
+  const shadeMap = loadMap(resources, desc, '_ShadeMap', true);
+  const defMap = loadMap(resources, desc, '_DefMap', false);
+  const rampMap = loadMap(resources, desc, '_RampMap', true, true) || RAMP_DEFAULT;
+  const hlMap = loadMap(resources, desc, '_HighlightMap', true);
   const layerWeight = desc.floats._LayerWeight ?? 0.0;
   const layerMap = ((desc.floats._EnableLayerMap ?? 0) >= 0.5 && layerWeight > 0.001)
-    ? loadMap(desc, '_LayerMap', true)
+    ? loadMap(resources, desc, '_LayerMap', true)
     : null;
   const bc = desc.colors._BaseColor || [1, 1, 1, 1];
   const specTh = (desc.colors._SpecularThreshold && desc.colors._SpecularThreshold[0]) ?? 0.15;
@@ -492,6 +488,7 @@ function createActorMaterial(desc, sharedUniforms, bangsPass = false) {
     depthWrite: true,
     depthTest: true,
   });
+  resources.materials.add(mat);
 
   // Configure exact Unity queue + WebGL glStencilFunc ((ref & mask) OP (stencil & mask))
   if (mname === 'm_bdy' || mname === 'm_fce') {
@@ -605,10 +602,10 @@ function cloneSkinnedPass(mesh, mat, suffix, order) {
   return o;
 }
 
-function createOutlineMesh(mesh, desc, baseWidth) {
+function createOutlineMesh(mesh, desc, baseWidth, resources) {
   const isWisps = desc.name === 'm_hirco' || (desc.floats._ShaderType === 1);
-  const baseMap = loadMap(desc, '_BaseMap', true) || WHITE_SRGB;
-  const shadeMap = loadMap(desc, '_ShadeMap', true);
+  const baseMap = loadMap(resources, desc, '_BaseMap', true) || WHITE_SRGB;
+  const shadeMap = loadMap(resources, desc, '_ShadeMap', true);
   const mat = new THREE.ShaderMaterial({
     name: `${desc.name}_outline`,
     uniforms: {
@@ -625,6 +622,7 @@ function createOutlineMesh(mesh, desc, baseWidth) {
     depthWrite: true,
     depthTest: true,
   });
+  resources.materials.add(mat);
   // Hair outlines draw over bg (0) and face skin (64), stopping cleanly at eyes/brows (68/72): 64 >= stencil
   if (desc.part === 'hair') {
     mat.stencilWrite = true;
@@ -654,6 +652,36 @@ function evalSimpleCurve(pts, x) {
   return 0;
 }
 
+function disposeCharacterResources(resources) {
+  if (resources.disposed) return;
+  resources.disposed = true;
+
+  for (const geometry of resources.geometries) geometry.dispose();
+  for (const material of resources.materials) material.dispose();
+
+  // Passes share skeletons, and distinct skeletons may share a bone texture.
+  const disposedTextures = new Set([WHITE_SRGB, DEF_NEUTRAL, RAMP_DEFAULT]);
+  for (const skeleton of resources.skeletons) {
+    const texture = skeleton.boneTexture;
+    if (texture) {
+      if (disposedTextures.has(texture)) skeleton.boneTexture = null;
+      else disposedTextures.add(texture);
+    }
+    skeleton.dispose();
+  }
+  for (const texture of resources.textureCache.values()) {
+    if (disposedTextures.has(texture)) continue;
+    disposedTextures.add(texture);
+    texture.dispose();
+  }
+  resources.actorShadowRT?.dispose();
+  resources.actorShadowRT = null;
+  resources.geometries.clear();
+  resources.materials.clear();
+  resources.skeletons.clear();
+  resources.textureCache.clear();
+}
+
 /**
  * Load the actor model, build its authentic Campus/Actor/Default materials,
  * stencil passes, outlines, and Mecanim PoseSolver.
@@ -661,15 +689,52 @@ function evalSimpleCurve(pts, x) {
 export async function loadCharacter(scene, parts = null) {
   const env = await getBrowserEnv();
   const { glbBytes, meta, textures } = await buildCharFromBundles(env, parts || undefined);
-  bundleTextures = textures;
-  const gltf = await new GLTFLoader().parseAsync(
-    glbBytes.buffer.slice(glbBytes.byteOffset, glbBytes.byteOffset + glbBytes.byteLength), '');
-  const root = gltf.scene;
-
-  const nodeByIndex = new Map();
-  for (const [obj, assoc] of gltf.parser.associations) {
-    if (assoc && typeof assoc.nodes === 'number') nodeByIndex.set(assoc.nodes, obj);
+  const resources = {
+    bundleTextures: textures,
+    textureCache: new Map(),
+    geometries: new Set(),
+    materials: new Set(),
+    skeletons: new Set(),
+    actorShadowRT: null,
+    disposed: false,
+  };
+  let root = null;
+  try {
+    const gltf = await new GLTFLoader().parseAsync(
+      glbBytes.buffer.slice(glbBytes.byteOffset, glbBytes.byteOffset + glbBytes.byteLength), '');
+    root = gltf.scene;
+    root.traverse((o) => {
+      if (!o.isMesh) return;
+      if (o.geometry) resources.geometries.add(o.geometry);
+      if (o.skeleton) resources.skeletons.add(o.skeleton);
+      if (Array.isArray(o.material)) {
+        for (const material of o.material) resources.materials.add(material);
+      } else if (o.material) {
+        resources.materials.add(o.material);
+      }
+    });
+    const nodeByIndex = new Map();
+    for (const [obj, assoc] of gltf.parser.associations) {
+      if (assoc && typeof assoc.nodes === 'number') nodeByIndex.set(assoc.nodes, obj);
+    }
+    const char = createCharacter(root, nodeByIndex, meta, resources);
+    if (scene) scene.add(root);
+    return char;
+  } catch (error) {
+    if (root?.parent) root.parent.remove(root);
+    disposeCharacterResources(resources);
+    throw error;
+  } finally {
+    // All lazy maps have been consumed; only character-owned RGBA textures remain.
+    textures.clear();
+    resources.bundleTextures = null;
   }
+}
+
+// Keep returned callbacks outside the loader's scope: neither the GLB/parser nor
+// the lazy texture map and its source bundles belong to a live character.
+function createCharacter(root, nodeByIndex, meta, resources) {
+  const sourceMaterials = new Set(resources.materials);
   for (const n of nodeByIndex.values()) {
     n.userData.bindTRS = { p: n.position.clone(), q: n.quaternion.clone(), s: n.scale.clone() };
   }
@@ -683,6 +748,7 @@ export async function loadCharacter(scene, parts = null) {
     depthBuffer: true,
     stencilBuffer: false,
   });
+  resources.actorShadowRT = actorShadowRT;
   const shadowScene = new THREE.Scene();
   const shadowCamera = new THREE.Camera();
   let shadowAngles = { ...DEFAULT_ACTOR_LIGHT.shadowAngles };
@@ -734,20 +800,20 @@ export async function loadCharacter(scene, parts = null) {
       o.geometry.setAttribute('color', new THREE.BufferAttribute(arr, 4));
     }
 
-    o.material = createActorMaterial(desc, sharedUniforms, false);
+    o.material = createActorMaterial(desc, sharedUniforms, resources, false);
     o.renderOrder = RENDER_ORDER[desc.name] ?? 10;
     o.frustumCulled = false;
 
     if (o.isSkinnedMesh) {
       if (o.morphTargetInfluences && o.morphTargetInfluences.length) morphMeshes.push(o);
       if (desc.name === 'm_hir') {
-        const bangsMat = createActorMaterial(desc, sharedUniforms, true);
+        const bangsMat = createActorMaterial(desc, sharedUniforms, resources, true);
         extraPasses.push([o.parent, cloneSkinnedPass(o, bangsMat, 'bangs', RENDER_ORDER.m_hir_bangs)]);
 
         const sMat = new THREE.ShaderMaterial({
           name: 'm_hir_shadow_caster',
           uniforms: {
-            uBaseMap: { value: loadMap(desc, '_BaseMap', false) || WHITE_SRGB },
+            uBaseMap: { value: loadMap(resources, desc, '_BaseMap', false) || WHITE_SRGB },
             uActorShadowMatrix: sharedUniforms.uActorShadowMatrix,
           },
           vertexShader: SHADOW_CASTER_VERT,
@@ -756,19 +822,34 @@ export async function loadCharacter(scene, parts = null) {
           depthWrite: true,
           depthTest: true,
         });
+        resources.materials.add(sMat);
         const sMesh = cloneSkinnedPass(o, sMat, 'shadow', 0);
         sMesh.matrixAutoUpdate = false;
         shadowScene.add(sMesh);
         shadowCasters.push([o, sMesh]);
       }
       if (OUTLINE_SCALE > 0 && desc.name in OUTLINED_WIDTH) {
-        extraPasses.push([o.parent, createOutlineMesh(o, desc, OUTLINED_WIDTH[desc.name])]);
+        extraPasses.push([o.parent, createOutlineMesh(o, desc, OUTLINED_WIDTH[desc.name], resources)]);
       }
     }
   });
 
   for (const [parent, child] of extraPasses) parent.add(child);
-  if (scene) scene.add(root);
+
+  // GLTF materials are texture-free placeholders. Release replaced ones once no
+  // remaining mesh uses them, including when a source material was shared.
+  root.traverse((o) => {
+    if (Array.isArray(o.material)) {
+      for (const material of o.material) sourceMaterials.delete(material);
+    } else {
+      sourceMaterials.delete(o.material);
+    }
+  });
+  for (const material of sourceMaterials) {
+    resources.materials.delete(material);
+    material.dispose();
+  }
+  sourceMaterials.clear();
 
   const solver = new PoseSolver(nodeByIndex, meta);
   const headNode = solver.nameToNode.Head || null;
@@ -818,7 +899,7 @@ export async function loadCharacter(scene, parts = null) {
     },
     /** Update view-space head uniforms, shadow matrix & CampusActorFaceCorrection profile blendshapes. */
     update(camera) {
-      if (!camera || !headNode) return;
+      if (resources.disposed || !camera || !headNode) return;
       root.updateMatrixWorld(true);
       camera.updateMatrixWorld(true);
 
@@ -862,7 +943,7 @@ export async function loadCharacter(scene, parts = null) {
     },
     /** Render hair caster into _ActorShadowmapTexture before main render pass. */
     renderShadow(renderer) {
-      if (!renderer || !shadowCasters.length || !root.visible) return;
+      if (resources.disposed || !renderer || !shadowCasters.length || !root.visible) return;
       for (const [srcMesh, dstMesh] of shadowCasters) {
         dstMesh.matrixWorld.copy(srcMesh.matrixWorld);
         dstMesh.matrix.copy(srcMesh.matrixWorld);
@@ -928,14 +1009,12 @@ export async function loadCharacter(scene, parts = null) {
     },
     reset() { solver.resetPose(); },
     dispose() {
+      if (resources.disposed) return;
       if (root.parent) root.parent.remove(root);
-      actorShadowRT.dispose();
-      root.traverse((o) => {
-        if (o.isMesh) {
-          if (o.geometry) o.geometry.dispose();
-          if (o.material && o.material.dispose) o.material.dispose();
-        }
-      });
+      sharedUniforms.uActorShadowMap.value = WHITE_SRGB;
+      shadowScene.clear();
+      shadowCasters.length = 0;
+      disposeCharacterResources(resources);
     },
   };
   return char;
