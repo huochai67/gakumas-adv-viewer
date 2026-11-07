@@ -16,11 +16,12 @@ export function AssetBrowserPanel({ catalog, onCatalogUpdate, snap }) {
   const [selectedActorId, setSelectedActorId] = useState('amao');
   const [costumeFilter, setCostumeFilter] = useState('all');
   const [costumeSearch, setCostumeSearch] = useState('');
+  const [sceneFilter, setSceneFilter] = useState('all');
+  const [sceneSearch, setSceneSearch] = useState('');
   const [motionTag, setMotionTag] = useState('all');
   const [motionSearch, setMotionSearch] = useState('');
   const [facialSearch, setFacialSearch] = useState('');
   const [morphValues, setMorphValues] = useState({});
-
   const actors = catalog?.actors || [];
   const activeActor = useMemo(
     () => actors.find((a) => a.id === selectedActorId) || actors[0] || null,
@@ -40,6 +41,47 @@ export function AssetBrowserPanel({ catalog, onCatalogUpdate, snap }) {
       return true;
     });
   }, [activeActor, costumeFilter, costumeSearch]);
+
+  const environments = useMemo(() => {
+    const raw = catalog?.environments || [];
+    return raw.map((item) => {
+      if (typeof item === 'string') {
+        const is2d = item.startsWith('env_2d_');
+        const parts = item.split('_');
+        return {
+          name: item,
+          type: is2d ? '2d' : '3d',
+          category: parts[2] || 'other',
+          timeOfDay: '',
+          label: item,
+          cached: true,
+        };
+      }
+      return item;
+    });
+  }, [catalog]);
+
+  const filteredEnvironments = useMemo(() => {
+    const q = sceneSearch.trim().toLowerCase();
+    return environments.filter((env) => {
+      if (sceneFilter === '3d' && env.type !== '3d') return false;
+      if (sceneFilter === '2d' && env.type !== '2d') return false;
+      if (sceneFilter === 'adv' && env.category !== 'adv') return false;
+      if (sceneFilter === 'live' && env.category !== 'live') return false;
+      if (
+        sceneFilter === 'lesson_prod' &&
+        env.category !== 'lesson' &&
+        env.category !== 'prod' &&
+        env.category !== 'home'
+      ) {
+        return false;
+      }
+      if (q && !env.name.toLowerCase().includes(q) && !env.label.toLowerCase().includes(q)) {
+        return false;
+      }
+      return true;
+    });
+  }, [environments, sceneFilter, sceneSearch]);
 
   const filteredBodyMotions = useMemo(() => {
     const list = catalog?.bodyMotions || [];
@@ -128,9 +170,25 @@ export function AssetBrowserPanel({ catalog, onCatalogUpdate, snap }) {
     if (updated && onCatalogUpdate) onCatalogUpdate(updated);
   };
 
+
+  const handleSelectScene = async (sceneName) => {
+    const updated = await viewerEngine.setAssetScene(sceneName);
+    if (updated && onCatalogUpdate) onCatalogUpdate(updated);
+  };
+
+  const activeSceneName =
+    snap.assetSceneName ||
+    (snap.assetStageMode === 'classroom' ? 'env_3d_adv_classroom-00-00-noon' : 'studio');
   return (
     <>
       <div className="subnav-bar">
+        <button
+          type="button"
+          className={`subnav-btn ${subTab === 'scene' ? 'active' : ''}`}
+          onClick={() => setSubTab('scene')}
+        >
+          🏞 舞台场景
+        </button>
         <button
           type="button"
           className={`subnav-btn ${subTab === 'model' ? 'active' : ''}`}
@@ -143,7 +201,7 @@ export function AssetBrowserPanel({ catalog, onCatalogUpdate, snap }) {
           className={`subnav-btn ${subTab === 'motion' ? 'active' : ''}`}
           onClick={() => setSubTab('motion')}
         >
-          💃 身体动作 ({catalog?.bodyMotions?.length || 0})
+          💃 身体动作
         </button>
         <button
           type="button"
@@ -155,6 +213,70 @@ export function AssetBrowserPanel({ catalog, onCatalogUpdate, snap }) {
       </div>
 
       <div className="pane-scroll">
+        {subTab === 'scene' && (
+          <div className="section-card">
+            <div className="section-header">
+              <span className="section-title">场景选择 (Stage / Scene)</span>
+              <span className="section-count">{filteredEnvironments.length + 1} 项</span>
+            </div>
+            <input
+              type="text"
+              className="search-input"
+              placeholder="搜索场景 (如 教室, 宿舍, live, night)…"
+              value={sceneSearch}
+              onChange={(e) => setSceneSearch(e.target.value)}
+            />
+            <div className="pill-row">
+              {[
+                { id: 'all', label: '全部' },
+                { id: '3d', label: '3D 舞台' },
+                { id: '2d', label: '2D 背景' },
+                { id: 'adv', label: '剧情' },
+                { id: 'live', label: 'Live' },
+                { id: 'lesson_prod', label: '课程/培育' },
+              ].map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  className={`pill-btn ${sceneFilter === f.id ? 'active' : ''}`}
+                  onClick={() => setSceneFilter(f.id)}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
+            <div className="item-list tall">
+              <button
+                type="button"
+                className={`item-row ${activeSceneName === 'studio' ? 'active' : ''}`}
+                onClick={() => handleSelectScene('studio')}
+              >
+                <div className="item-main">
+                  <div className="item-title">🌑 摄影棚暗场 (Studio)</div>
+                  <div className="item-sub">默认纯色暗场 · 标准打光</div>
+                </div>
+                <span className="badge tag">暗场</span>
+              </button>
+              {filteredEnvironments.map((env) => (
+                <button
+                  key={env.name}
+                  type="button"
+                  className={`item-row ${activeSceneName === env.name ? 'active' : ''}`}
+                  onClick={() => handleSelectScene(env.name)}
+                >
+                  <div className="item-main">
+                    <div className="item-title">{env.label}</div>
+                    <div className="item-sub">{env.name}</div>
+                  </div>
+                  <span className={`badge ${env.type === '3d' ? 'cached' : 'cloud'}`}>
+                    {env.type.toUpperCase()}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {subTab === 'model' && (
           <>
             {/* Character Selector */}
@@ -281,7 +403,6 @@ export function AssetBrowserPanel({ catalog, onCatalogUpdate, snap }) {
             )}
           </>
         )}
-
         {subTab === 'motion' && (
           <div className="section-card">
             <div className="section-header">
@@ -443,15 +564,15 @@ export function AssetBrowserPanel({ catalog, onCatalogUpdate, snap }) {
               <div className="pill-row">
                 <button
                   type="button"
-                  className={`btn ${snap.assetStageMode === 'studio' ? 'active' : ''}`}
-                  onClick={() => viewerEngine.setAssetStageMode('studio')}
+                  className={`btn ${activeSceneName === 'studio' ? 'active' : ''}`}
+                  onClick={() => handleSelectScene('studio')}
                 >
                   🌑 摄影棚暗场
                 </button>
                 <button
                   type="button"
-                  className={`btn ${snap.assetStageMode === 'classroom' ? 'active' : ''}`}
-                  onClick={() => viewerEngine.setAssetStageMode('classroom')}
+                  className={`btn ${activeSceneName === 'env_3d_adv_classroom-00-00-noon' ? 'active' : ''}`}
+                  onClick={() => handleSelectScene('env_3d_adv_classroom-00-00-noon')}
                 >
                   🏫 3D 教室实景
                 </button>

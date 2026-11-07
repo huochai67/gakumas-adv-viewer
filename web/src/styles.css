@@ -184,13 +184,14 @@ body,
 
 .subnav-btn {
   flex: 1;
-  padding: 6px 8px;
+  padding: 6px 6px;
   border: 1px solid transparent;
   border-radius: 6px;
   background: transparent;
   color: var(--text-secondary);
   font-size: 12px;
   font-weight: 600;
+  white-space: nowrap;
   cursor: pointer;
   transition: all 0.12s ease;
 }
@@ -223,6 +224,7 @@ body,
   background: rgba(255, 255, 255, 0.16);
   border-radius: 3px;
 }
+
 
 .section-card {
   background: var(--bg-card);

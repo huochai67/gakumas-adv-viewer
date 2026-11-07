@@ -1058,7 +1058,8 @@ export class ViewerEngine {
     this.assetFacialMotionName = 'mot_all_chr_amao_facial-all-default_in';
     this.assetBodyClip = null;
     this.assetFacialClip = null;
-    this.assetStageMode = 'studio'; // 'studio' | 'classroom'
+    this.assetStageMode = 'studio'; // 'studio' | 'classroom' | sceneName
+    this.assetSceneName = 'studio'; // 'studio' | 'env_3d_*' | 'env_2d_*'
     this.assetEnableIK = true;
     this.assetEnableSwing = true;
     this.animationManageProperties = null;
@@ -1143,6 +1144,7 @@ export class ViewerEngine {
       assetBodyMotionName: this.assetBodyMotionName,
       assetFacialMotionName: this.assetFacialMotionName,
       assetStageMode: this.assetStageMode,
+      assetSceneName: this.assetSceneName,
       assetEnableIK: this.assetEnableIK,
       assetEnableSwing: this.assetEnableSwing,
       faceBlendShapeCount: this.char?.meta?.faceBlendShapeCount || 0,
@@ -1359,8 +1361,26 @@ export class ViewerEngine {
       return this._activateEnv3d(sceneName);
     }
     const env = await getBrowserEnv();
-    if (!env.hasBundle(sceneName)) {
-      await this.ensureBundlesOnServer([sceneName, 't_sky_noon-00']).catch(() => {});
+    let needsServerEnsure = !env.hasBundle(sceneName);
+    if (!needsServerEnsure) {
+      try {
+        const container = await env.ensureBundle(sceneName, false);
+        for (const sf of container.serializedFiles) {
+          for (const ext of sf.externals) {
+            const base = ext.path.split('/').pop().toLowerCase();
+            if (base && base.startsWith('cab-') && !env.index.cabToBundle[base]) {
+              needsServerEnsure = true;
+              break;
+            }
+          }
+          if (needsServerEnsure) break;
+        }
+      } catch {
+        needsServerEnsure = true;
+      }
+    }
+    if (needsServerEnsure) {
+      await this.ensureAssetsOnServer([sceneName, 't_sky_noon-00'], [], true).catch(() => {});
     }
     const { glbBytes, meta, textures } = await buildEnv3dFromBundles(env, sceneName);
     const gltf = await new GLTFLoader().parseAsync(
@@ -1566,7 +1586,7 @@ export class ViewerEngine {
     if (this.activeEnv3dName !== targetName) {
       this.activeEnv3dName = targetName;
       this.envInfo = entry;
-      if (entry.skyTexture) this.skyTexture = entry.skyTexture;
+      this.skyTexture = entry.skyTexture || null;
       const { meta } = entry;
       if (meta.renderSettings) {
         const rs = meta.renderSettings;
@@ -1590,9 +1610,11 @@ export class ViewerEngine {
     return entry;
   }
 
-  async ensureAssetsOnServer(bundleNames = [], resourceNames = []) {
+  async ensureAssetsOnServer(bundleNames = [], resourceNames = [], forceBundles = false) {
     const env = await getBrowserEnv();
-    const missingBundles = [...new Set(bundleNames.filter((n) => n && !env.hasBundle(n)))];
+    const missingBundles = forceBundles
+      ? [...new Set(bundleNames.filter(Boolean))]
+      : [...new Set(bundleNames.filter((n) => n && !env.hasBundle(n)))];
     const cachedResources = new Set(
       (env.index && Array.isArray(env.index.resources) ? env.index.resources : []).map((r) =>
         String(r),
@@ -1619,8 +1641,73 @@ export class ViewerEngine {
     return data.catalog || null;
   }
 
-  async ensureBundlesOnServer(bundleNames) {
-    return this.ensureAssetsOnServer(bundleNames, []);
+  async ensureBundlesOnServer(bundleNames, forceBundles = false) {
+    return this.ensureAssetsOnServer(bundleNames, [], forceBundles);
+  }
+
+  async _loadBg2d(src) {
+    if (!src) return null;
+    if (this.bgMeta[src]) return null;
+    const env = await getBrowserEnv();
+    let updatedCatalog = null;
+    if (!env.hasBundle(src)) {
+      updatedCatalog = await this.ensureBundlesOnServer([src]).catch(() => null);
+    }
+    const info = await loadBg2dFromBundle(env, src);
+    if (!info) return updatedCatalog;
+    this.bgMeta[src] = info;
+    const tex = new THREE.DataTexture(
+      info.rgba,
+      info.width,
+      info.height,
+      THREE.RGBAFormat,
+    );
+    tex.flipY = false;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    tex.needsUpdate = true;
+    this.bgTextures.set(src, tex);
+    if (this.bgEl && !this.bgImages.has(src)) {
+      const img = document.createElement('img');
+      img.src = info.blobUrl;
+      img.style.display = 'none';
+      this.bgEl.appendChild(img);
+      this.bgImages.set(src, img);
+      if (typeof img.decode === 'function') await img.decode().catch(() => {});
+    }
+    return updatedCatalog;
+  }
+
+  _syncAssetSceneLighting() {
+    const sceneName = this.assetSceneName || 'studio';
+    if (sceneName.startsWith('env_3d_') && this.env3dCache.has(sceneName)) {
+      this._activateEnv3d(sceneName);
+      if (this.char) {
+        this.char.applyActorVolume(this.envInfo?.meta?.volumes || null);
+      }
+      return;
+    }
+    if (this.sunLight) {
+      this.sunLight.color.setHex(0xfffaf0);
+      this.sunLight.position.set(2.5, 4.5, -4.0);
+      this.sunLight.intensity = 2.1;
+    }
+    if (this.stageHemi) {
+      this.stageHemi.color.setHex(0xf6f4ee);
+      this.stageHemi.groundColor.setHex(0x9e9284);
+      this.stageHemi.intensity = 1.45;
+    }
+    if (this.char) {
+      if (sceneName.startsWith('env_2d_') && this.bgMeta[sceneName]?.volumes) {
+        this.char.applyActorVolume(this.bgMeta[sceneName].volumes);
+      } else {
+        this.char.applyActorVolume(null);
+      }
+    }
   }
 
   // -------------------- Mode Switching --------------------
@@ -1637,11 +1724,7 @@ export class ViewerEngine {
     if (newMode === 'asset') {
       this.storyPlaying = false;
       this.voiceCtrl.audio.pause();
-      if (this.bgEl) this.bgEl.style.display = 'none';
-      if (this.bloom) {
-        this.bloom.setBg2D({ active: false });
-        this.bloom.setDof(null, 35, this.assetStageMode === 'classroom');
-      }
+      this._syncAssetSceneLighting();
       this.actorGroup.visible = true;
       this.actorGroup.position.set(0, 0, 0);
       this.actorGroup.quaternion.identity();
@@ -1688,9 +1771,7 @@ export class ViewerEngine {
       this.char = newChar;
       this.currentParts = nextParts;
       setClipCharMeta(newChar.meta);
-      if (this.envInfo?.meta?.volumes) {
-        newChar.applyActorVolume(this.envInfo.meta.volumes);
-      }
+      this._syncAssetSceneLighting();
       newChar.solver.enableIK = this.assetEnableIK;
       newChar.solver.enableSwing = this.assetEnableSwing;
       newChar.root.position.set(0, 0, 0);
@@ -1807,10 +1888,65 @@ export class ViewerEngine {
     this._emit();
   }
 
+  async setAssetScene(sceneName) {
+    const normalized =
+      !sceneName || sceneName === 'studio'
+        ? 'studio'
+        : sceneName === 'classroom'
+          ? 'env_3d_adv_classroom-00-00-noon'
+          : String(sceneName);
+    this.assetSceneName = normalized;
+    this.assetStageMode =
+      normalized === 'studio'
+        ? 'studio'
+        : normalized === 'env_3d_adv_classroom-00-00-noon'
+          ? 'classroom'
+          : normalized;
+
+    if (normalized === 'studio') {
+      this._syncAssetSceneLighting();
+      this._emit();
+      this.renderFrame();
+      return null;
+    }
+
+    try {
+      let updatedCatalog = null;
+      if (normalized.startsWith('env_3d_')) {
+        if (!this.env3dCache.has(normalized)) {
+          this.loading = true;
+          this.loadingText = `正在加载 3D 场景 (${normalized})…`;
+          this._emit();
+          await this._loadEnv3d(normalized);
+          this.loading = false;
+          this.loadingText = '';
+        }
+      } else if (normalized.startsWith('env_2d_')) {
+        if (!this.bgMeta[normalized]) {
+          this.loading = true;
+          this.loadingText = `正在加载 2D 场景 (${normalized})…`;
+          this._emit();
+          updatedCatalog = await this._loadBg2d(normalized);
+          this.loading = false;
+          this.loadingText = '';
+        }
+      }
+      this._syncAssetSceneLighting();
+      this._emit();
+      this.renderFrame();
+      return updatedCatalog;
+    } catch (e) {
+      console.error('Failed to load asset scene:', e);
+      this.loading = false;
+      this.loadingText = `场景加载失败: ${e?.message || e}`;
+      this._emit();
+      this.renderFrame();
+      return null;
+    }
+  }
+
   setAssetStageMode(mode) {
-    this.assetStageMode = mode;
-    this._emit();
-    this.renderFrame();
+    return this.setAssetScene(mode);
   }
 
   setAssetPhysics({ enableIK, enableSwing }) {
@@ -2055,37 +2191,7 @@ export class ViewerEngine {
         }
         if (this.bgMeta[src]) continue;
         bgLoads.push(
-          (async () => {
-            if (!env.hasBundle(src)) {
-              await this.ensureBundlesOnServer([src]).catch(() => {});
-            }
-            const info = await loadBg2dFromBundle(env, src);
-            if (!info) return;
-            this.bgMeta[src] = info;
-            const tex = new THREE.DataTexture(
-              info.rgba,
-              info.width,
-              info.height,
-              THREE.RGBAFormat,
-            );
-            tex.flipY = false;
-            tex.colorSpace = THREE.SRGBColorSpace;
-            tex.wrapS = THREE.ClampToEdgeWrapping;
-            tex.wrapT = THREE.ClampToEdgeWrapping;
-            tex.minFilter = THREE.LinearFilter;
-            tex.magFilter = THREE.LinearFilter;
-            tex.generateMipmaps = false;
-            tex.needsUpdate = true;
-            this.bgTextures.set(src, tex);
-            if (this.bgEl) {
-              const img = document.createElement('img');
-              img.src = info.blobUrl;
-              img.style.display = 'none';
-              this.bgEl.appendChild(img);
-              this.bgImages.set(src, img);
-              if (typeof img.decode === 'function') await img.decode().catch(() => {});
-            }
-          })().catch((e) => console.warn(`bg load failed ${src}`, e)),
+          this._loadBg2d(src).catch((e) => console.warn(`bg load failed ${src}`, e)),
         );
       }
       await Promise.all(bgLoads);
@@ -2279,15 +2385,34 @@ export class ViewerEngine {
       if (entry.group) entry.group.visible = false;
       if (entry.groundShadow) entry.groundShadow.visible = false;
     }
-    const showClassroom = this.assetStageMode === 'classroom' && this.envLoaded;
-    const manageVolume = showClassroom ? this.envInfo?.meta?.volumes?.animationManage : null;
-    if (showClassroom) this._activateEnv3d('env_3d_adv_classroom-00-00-noon');
-    this.envGroup.visible = showClassroom;
-    this.scene.background = showClassroom && this.skyTexture ? this.skyTexture : new THREE.Color(0x111520);
-    if (this.bgEl) this.bgEl.style.display = 'none';
-    if (this.bloom) {
-      this.bloom.setBg2D({ active: false });
-      this.bloom.setDof(null, 35, showClassroom);
+    const sceneName = this.assetSceneName || 'studio';
+    const is3d = sceneName.startsWith('env_3d_') && this.env3dCache.has(sceneName);
+    const is2d = sceneName.startsWith('env_2d_') && Boolean(this.bgMeta[sceneName]);
+    let manageVolume = null;
+    if (is3d) {
+      this._activateEnv3d(sceneName);
+      manageVolume = this.envInfo?.meta?.volumes?.animationManage || null;
+      this.envGroup.visible = true;
+      this.scene.background = this.skyTexture || new THREE.Color(0x111520);
+      if (this.bgEl) this.bgEl.style.display = 'none';
+      if (this.bloom) {
+        this.bloom.setBg2D({ active: false });
+        this.bloom.setDof(null, 35, true);
+      }
+    } else if (is2d) {
+      manageVolume = this.bgMeta[sceneName]?.volumes?.animationManage || null;
+      this.envGroup.visible = false;
+      this.scene.background = null;
+      if (this.bloom) this.bloom.setDof(null, 35, false);
+      this._applyBg2dLayer(sceneName, {});
+    } else {
+      this.envGroup.visible = false;
+      this.scene.background = new THREE.Color(0x111520);
+      if (this.bgEl) this.bgEl.style.display = 'none';
+      if (this.bloom) {
+        this.bloom.setBg2D({ active: false });
+        this.bloom.setDof(null, 35, false);
+      }
     }
 
     if (this.controls && this.controls.enabled) {
@@ -2330,7 +2455,7 @@ export class ViewerEngine {
     this.char.update(this.camera);
     this.char.renderShadow(this.renderer);
 
-    this.groundShadow.visible = true;
+    this.groundShadow.visible = !is2d;
     const hips = this.char.solver.nameToNode.Hips;
     const hp = hips ? hips.getWorldPosition(new THREE.Vector3()) : this.actorGroup.position;
     this.groundShadow.position.set(hp.x, 0.004, hp.z);
@@ -2590,10 +2715,14 @@ export class ViewerEngine {
       return;
     }
 
+    const setting = st.bgSet.get(st.bgActive) || {};
+    this._applyBg2dLayer(src, setting);
+  }
+
+  _applyBg2dLayer(src, setting = {}) {
     const meta = this.bgMeta[src] || {};
     const W = this.viewportWidth;
     const H = this.viewportHeight;
-    const setting = st.bgSet.get(st.bgActive) || {};
     const pos = setting.position || { x: 0, y: 0 };
     const scale = setting.scale || { x: 1, y: 1 };
     const angle = setting.angle || 0;

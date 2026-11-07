@@ -880,6 +880,15 @@ export async function loadCharacter(scene, parts = null) {
     },
     /** Apply VLActorParameter & VLActorShadow overrides from 3D stage or 2D bg volume. */
     applyActorVolume(volOrParam) {
+      sharedUniforms.uLightDirView.value.copy(DEFAULT_ACTOR_LIGHT.lightDirView);
+      sharedUniforms.uRimDirView.value.copy(DEFAULT_ACTOR_LIGHT.rimDirView);
+      sharedUniforms.uLightColor.value.copy(DEFAULT_ACTOR_LIGHT.lightColor);
+      sharedUniforms.uShadeMultiply.value.copy(DEFAULT_ACTOR_LIGHT.shadeMultiply);
+      sharedUniforms.uRimPower.value = DEFAULT_ACTOR_LIGHT.rimPower;
+      sharedUniforms.uRimIntensity.value = DEFAULT_ACTOR_LIGHT.rimIntensity;
+      sharedUniforms.uRimBaseRatio.value = DEFAULT_ACTOR_LIGHT.rimBaseRatio;
+      sharedUniforms.uShadowStrength.value = DEFAULT_ACTOR_LIGHT.shadowStrength;
+      shadowAngles = { ...DEFAULT_ACTOR_LIGHT.shadowAngles };
       if (!volOrParam) return;
       const ap = volOrParam.actorParam || volOrParam;
       const as = volOrParam.actorShadow || null;

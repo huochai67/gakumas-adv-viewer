@@ -291,6 +291,137 @@ export interface MotionCatalogEntry {
   cached: boolean;
 }
 
+export interface EnvironmentCatalogEntry {
+  name: string;
+  type: "3d" | "2d";
+  category: string;
+  timeOfDay: string;
+  label: string;
+  cached: boolean;
+}
+
+const ENV_TIME_LABELS: Record<string, string> = {
+  noon: "白昼",
+  evening: "傍晚",
+  night: "夜晚",
+  morning: "清晨",
+  other: "特殊",
+};
+
+const ENV_GROUP_LABELS: Record<string, string> = {
+  adv: "剧情",
+  live: "Live舞台",
+  lesson: "课程",
+  prod: "培育",
+  home: "主页",
+  tour: "巡演",
+  photo: "摄影",
+  dress: "更衣室",
+  gasha: "抽卡",
+  angya: "行脚",
+  all: "通用",
+  general: "通用",
+};
+
+const ENV_PLACE_LABELS: Record<string, string> = {
+  classroom: "教室",
+  consultingroom: "谈话室",
+  corridor: "走廊",
+  councilroom: "学生会室",
+  courtyard: "中庭",
+  danceroom: "舞蹈训练室",
+  dormitory: "宿舍",
+  dormterrace: "宿舍露台",
+  dressroom: "更衣室",
+  ground: "操场",
+  hallexterior: "大礼堂外",
+  hallway: "大厅走廊",
+  hifstage: "HIF舞台",
+  hotspring: "温泉",
+  offstage: "后台通道",
+  riverbed: "河岸",
+  rooftop: "天台",
+  schoolgarden: "学园庭院",
+  schoolroom: "教务室/教室",
+  seats: "观众席",
+  sharedspace: "公共休息区",
+  studio: "摄影棚",
+  toschool: "通学路",
+  toschoolop: "通学路 (OP)",
+  trainingroom: "训练室",
+  unitstage: "组合舞台",
+  visualroom: "表现力训练室",
+  vocalroom: "声乐训练室",
+  waitingroom: "候场室",
+  audition: "试镜会场",
+  ceremony: "典礼会场",
+  photobooth: "拍照亭",
+  charactercapture: "角色展示背景",
+};
+
+function parseEnvironmentBundle(stem: string, cached = true): EnvironmentCatalogEntry {
+  const m = /^env_(3d|2d)_([a-z0-9]+)_(.+)$/i.exec(stem);
+  if (!m) {
+    return {
+      name: stem,
+      type: stem.startsWith("env_2d_") ? "2d" : "3d",
+      category: "other",
+      timeOfDay: "",
+      label: stem,
+      cached,
+    };
+  }
+  const [, dim, groupRaw, rest] = m;
+  const type = dim.toLowerCase() as "3d" | "2d";
+  const category = groupRaw.toLowerCase();
+  const tm = /-(noon|evening|night|morning|other)(?:_c\d+)?$/i.exec(rest);
+  const timeOfDay = tm ? tm[1].toLowerCase() : "";
+  const timeLabel = ENV_TIME_LABELS[timeOfDay] || "";
+
+  const baseSlug = rest
+    .replace(/-(?:noon|evening|night|morning|other)(?:_c\d+)?$/i, "")
+    .replace(/-(\d{2})(?:-(\d{2}))?$/, (_, a: string, b?: string) => {
+      if (b) return a === "00" && b === "00" ? "" : ` #${a}-${b}`;
+      return a === "00" ? "" : ` #${a}`;
+    });
+
+  const rawPlace = baseSlug.split(" #")[0];
+  const variantSuffix = baseSlug.includes(" #") ? ` #${baseSlug.split(" #")[1]}` : "";
+
+  let placeTitle = ENV_PLACE_LABELS[rawPlace] || "";
+  if (!placeTitle) {
+    const actorMatch = /^([a-z]{4})(\d{3})$/i.exec(rawPlace);
+    if (actorMatch && ACTOR_NAMES[actorMatch[1].toLowerCase()]) {
+      placeTitle = `${ACTOR_NAMES[actorMatch[1].toLowerCase()].ja} 舞台 #${actorMatch[2]}`;
+    } else if (/^all(\d{3})$/i.exec(rawPlace)) {
+      placeTitle = `全员舞台 #${rawPlace.slice(3)}`;
+    } else if (rawPlace.startsWith("dormitory-")) {
+      const sub = rawPlace.slice("dormitory-".length);
+      const roomMatch = /^([a-z]{4})room$/i.exec(sub);
+      if (roomMatch && ACTOR_NAMES[roomMatch[1].toLowerCase()]) {
+        placeTitle = `宿舍 · ${ACTOR_NAMES[roomMatch[1].toLowerCase()].ja}房间`;
+      } else {
+        placeTitle = `宿舍 · ${sub.replace(/-/g, " ")}`;
+      }
+    } else {
+      placeTitle = rawPlace.replace(/^(other|outschool|school|hall)-/, "$1 · ").replace(/-/g, " ");
+    }
+  }
+
+  const groupLabel = ENV_GROUP_LABELS[category] || category.toUpperCase();
+  const labelParts = [`[${type.toUpperCase()}·${groupLabel}]`, `${placeTitle}${variantSuffix}`];
+  if (timeLabel) labelParts.push(`· ${timeLabel}`);
+
+  return {
+    name: stem,
+    type,
+    category,
+    timeOfDay,
+    label: labelParts.join(" "),
+    cached,
+  };
+}
+
 export interface ScriptSummary {
   id: string;
   name: string;
@@ -508,9 +639,26 @@ export function buildCatalog() {
   bodyMotions.sort(sortMotion);
   facialMotions.sort(sortMotion);
 
-  const environments = [...cachedSet]
-    .filter((b) => b.startsWith("env_3d_") || b.startsWith("env_2d_"))
-    .sort();
+  const envMap = new Map<string, EnvironmentCatalogEntry>();
+  const addEnvStem = (stem: string, isCached: boolean) => {
+    if (envMap.has(stem)) return;
+    if ((!stem.startsWith("env_3d_") && !stem.startsWith("env_2d_")) || stem.startsWith("env_3d_warmup_")) {
+      return;
+    }
+    envMap.set(stem, parseEnvironmentBundle(stem, isCached));
+  };
+  for (const b of cachedSet) addEnvStem(b, true);
+  for (const mb of manifestList) {
+    if (mb.name) addEnvStem(mb.name, cachedSet.has(mb.name));
+  }
+  const environments = [...envMap.values()].sort((a, b) => {
+    if (a.cached !== b.cached) return a.cached ? -1 : 1;
+    if (a.name === "env_3d_adv_classroom-00-00-noon") return -1;
+    if (b.name === "env_3d_adv_classroom-00-00-noon") return 1;
+    if (a.type !== b.type) return a.type === "3d" ? -1 : 1;
+    if ((a.category === "adv") !== (b.category === "adv")) return a.category === "adv" ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
 
   const scripts: ScriptSummary[] = [];
   const seenScripts = new Set<string>();

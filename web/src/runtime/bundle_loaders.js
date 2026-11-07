@@ -1612,12 +1612,24 @@ class EnvExporter {
       this.stats.decals += 1;
     }
 
-    // Skybox texture from t_sky_noon-00
+    // Skybox texture from external t_sky_* bundle (fallback to t_sky_noon-00)
     try {
-      const skyB = env.bundleFile(SKY_BUNDLE);
+      let skyBundleName = null;
+      for (const sf of this.bundle.serializedFiles ?? []) {
+        for (const ext of sf.externals ?? []) {
+          const base = ext.path.split('/').pop().toLowerCase();
+          const depFile = env.index?.cabToBundle?.[base];
+          if (depFile && depFile.startsWith('t_sky_')) {
+            skyBundleName = depFile.replace(/\.bundle$/, '');
+            break;
+          }
+        }
+        if (skyBundleName) break;
+      }
+      const skyB = env.bundleFile(skyBundleName || SKY_BUNDLE);
       for (const o of env.objectsOf(skyB, 'Texture2D')) {
         const tx = o.read();
-        if (tx.m_Name === SKY_BUNDLE) {
+        if (tx.m_Name && tx.m_Name.startsWith('t_sky_')) {
           this.meta.skybox = this.texture(tx);
           break;
         }
