@@ -113,7 +113,7 @@ export class BodyIKCorrection {
     if (!goals.some(g => g && (g.positionWeight > 0 || g.rotationWeight > 0 || g.hintWeight > 0))) return;
     const localRotations = new Map(state.localRotations), localPositions = new Map(state.localPositions);
     // AnimationHumanStream.SolveIK invokes FullBodySolve, not EvaluateAvatarEnd:
-    // no second TwistSolve, no second preblend of the corrected target.
+    // leave final twist to PoseSolver and do not preblend the corrected target.
     solveHumanGoals(state, goals);
     for (const bone of this.rig.bones) {
       if (state.localRotations.get(bone) === localRotations.get(bone) &&

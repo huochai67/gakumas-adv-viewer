@@ -412,22 +412,9 @@ fn half_to_float(half: u16) -> f32 {
     }
 }
 
-/// Convert an unquantized BC6H value to an 8-bit channel.
-fn bc6h_to_byte(value: i32) -> u8 {
-    let half = ((value * 31) >> 6) as u16;
-    let f = half_to_float(half);
-    let scaled = (f * 255.0).trunc();
-    if scaled.is_nan() || scaled <= 0.0 {
-        0
-    } else if scaled >= 255.0 {
-        255
-    } else {
-        scaled as u8
-    }
-}
 
-/// Decode one 16-byte BC6H (UF16) block into 16 RGBA pixels (64 bytes).
-fn decode_bc6h_block(data: &[u8], out: &mut [u8; 64]) {
+/// Decode one BC6H block without clipping its unsigned half-float values.
+fn decode_bc6h_half_block(data: &[u8], out: &mut [u16; 64]) {
     let mut bits = BitReader::new(data);
 
     let mut r = [0i32; 4];
@@ -763,7 +750,7 @@ fn decode_bc6h_block(data: &[u8], out: &mut [u8; 64]) {
             // Reserved modes decode to black (RGB), opaque alpha.
             out.fill(0);
             for i in 0..16 {
-                out[i * 4 + 3] = 255;
+                out[i * 4 + 3] = 0x3c00;
             }
             return;
         }
@@ -814,12 +801,44 @@ fn decode_bc6h_block(data: &[u8], out: &mut [u8; 64]) {
             let index = bits.read_bits(base_index_bits - if is_fix_up { 1 } else { 0 });
             let ep = subset * 2;
             let dst = pixel * 4;
-            out[dst] = bc6h_to_byte(interpolate(r[ep], r[ep + 1], weights, index));
-            out[dst + 1] = bc6h_to_byte(interpolate(g[ep], g[ep + 1], weights, index));
-            out[dst + 2] = bc6h_to_byte(interpolate(b[ep], b[ep + 1], weights, index));
-            out[dst + 3] = 255;
+            out[dst] = ((interpolate(r[ep], r[ep + 1], weights, index) * 31) >> 6) as u16;
+            out[dst + 1] = ((interpolate(g[ep], g[ep + 1], weights, index) * 31) >> 6) as u16;
+            out[dst + 2] = ((interpolate(b[ep], b[ep + 1], weights, index) * 31) >> 6) as u16;
+            out[dst + 3] = 0x3c00;
         }
     }
+}
+
+fn decode_bc6h_block(data: &[u8], out: &mut [u8; 64]) {
+    let mut half = [0u16; 64];
+    decode_bc6h_half_block(data, &mut half);
+    for i in 0..64 {
+        out[i] = (half_to_float(half[i]) * 255.0).clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// Decode BC6H to RGBA16F, retaining HDR and rejecting truncated input.
+pub fn decode_bc6h_half(src: &[u8], width: usize, height: usize, dst: &mut [u16]) -> i32 {
+    let bx = (width + 3) / 4;
+    let by = (height + 3) / 4;
+    if width == 0 || height == 0 || dst.len() < width * height * 4 || src.len() < bx * by * 16 { return -1; }
+    let mut pixels = [0u16; 64];
+    for yb in 0..by {
+        for xb in 0..bx {
+            let off = (yb * bx + xb) * 16;
+            decode_bc6h_half_block(&src[off..off + 16], &mut pixels);
+            for y in 0..4 {
+                for x in 0..4 {
+                    if xb * 4 + x < width && yb * 4 + y < height {
+                        let d = ((yb * 4 + y) * width + xb * 4 + x) * 4;
+                        let s = (y * 4 + x) * 4;
+                        dst[d..d + 4].copy_from_slice(&pixels[s..s + 4]);
+                    }
+                }
+            }
+        }
+    }
+    0
 }
 
 /* ------------------------------------------------------------------------- */

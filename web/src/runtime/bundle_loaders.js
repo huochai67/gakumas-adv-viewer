@@ -11,7 +11,7 @@
  *   - voices are decoded to a WAV blob URL plus 60 Hz AIUEO frames
  */
 
-import { decodeTextureRgba, decodeHcaAndLipsync } from './wasm_bridge.js';
+import { decodeTextureRgba, decodeBc6hHalf, decodeHcaAndLipsync } from './wasm_bridge.js';
 import {
   BrowserAssetEnv,
   skeleton,
@@ -25,6 +25,7 @@ import {
 } from './bundle_env.js';
 import { setSwingChainRestLengths } from './swing_metadata.js';
 import { ANIMATION_MANAGE_DEFAULTS, ANIMATION_MANAGE_FIELDS } from '../engine/animation_manage.js';
+import { SCENE_VOLUME_DEFAULTS, SceneVolumeResolver } from './scene_volumes.js';
 
 /* -------------------------------------------------------------------------- */
 /* Shared helpers                                                             */
@@ -105,9 +106,9 @@ function pyRound(v) {
 
 /**
  * Decode a Unity `Texture2D` (UnityObject wrapper or read typetree record)
- * into `{ name, width, height, data }` with top-down RGBA8 pixels.
+ * into top-down RGBA pixels; BC6H retains linear RGBA16F HDR values.
  */
-function decodeTexture(env, tex) {
+function decodeTexture(env, tex, decodeHalf = decodeBc6hHalf) {
   const tt = typeof tex.read === 'function' ? tex.read() : tex;
   const name = String(tt.m_Name ?? '');
   const width = Number(tt.m_Width);
@@ -126,8 +127,36 @@ function decodeTexture(env, tex) {
   if (imageData.length === 0) throw new Error(`texture ${name} has no image data`);
 
   const format = Number(tt.m_TextureFormat) | 0;
+  if (format === 24) {
+    const data = decodeHalf(imageData, width, height);
+    const row = width * 4;
+    const flipped = new Uint16Array(data.length);
+    for (let y = 0; y < height; y++) flipped.set(data.subarray(y * row, (y + 1) * row), (height - 1 - y) * row);
+    return { name, width, height, data: flipped, type: 'half-float', colorSpace: 'linear' };
+  }
   const data = decodeTextureRgba(imageData, width, height, format, true);
-  return { name, width, height, data };
+  return { name, width, height, data, type: 'unsigned-byte', colorSpace: tt.m_ColorSpace === 1 ? 'srgb' : 'linear' };
+}
+
+/** Native UniversalAdditionalLightData controls consumed by Environment/Default. */
+export function extractLightControls(env, sf, light) {
+  const go = env.readPPtr(sf, light.m_GameObject);
+  let data = null;
+  for (const ref of go?.m_Component || []) {
+    const component = env.resolvePPtr(go._assetsFile ?? sf, ref.component);
+    if (component?.typeName !== 'MonoBehaviour') continue;
+    const value = component.read();
+    if ('m_CustomLightingType' in value) { data = value; break; }
+  }
+  const layers = Number(data?.m_RenderingLayers ?? 1);
+  return {
+    shaderLayerMask: (layers & 0xf00) ? layers : layers | 0x10,
+    mixedLightingMode: Number(light.m_BakingOutput?.lightmapBakeMode?.mixedLightingMode ?? 0),
+    occlusionMaskChannel: Number(light.m_BakingOutput?.occlusionMaskChannel ?? -1),
+    isBaked: !!light.m_BakingOutput?.isBaked,
+    customProperties: [data?.m_BackLightingIntensity ?? 0, data?.m_MainLightShadowStrength ?? 0,
+      data?.m_SpecularStrength ?? 1, (data?.m_CustomLightingType ?? 0) | (data?.m_IndirectLighting ? 16 : 0)],
+  };
 }
 
 class LazyTextureMap extends Map {
@@ -148,8 +177,9 @@ class LazyTextureMap extends Map {
     if (super.has(key)) return super.get(key);
     const pending = this._lazy.get(key);
     if (!pending) return undefined;
-    const decoded = decodeTexture(this.env, pending.tex);
-    const entry = { data: decoded.data, width: decoded.width, height: decoded.height };
+    const tt = typeof pending.tex.read === 'function' ? pending.tex.read() : pending.tex;
+    const decoded = Number(tt.m_ImageCount) === 6 ? decodeProbeCubemap(this.env, pending.tex, decodeBc6hHalf) : decodeTexture(this.env, pending.tex);
+    const entry = decoded;
     super.set(pending.rel, entry);
     super.set(pending.name, entry);
     this._lazy.delete(pending.rel);
@@ -163,6 +193,134 @@ class LazyTextureMap extends Map {
     this._lazy.clear();
     this.env = null;
   }
+}
+
+/** Unity stores each cube face's complete mip chain consecutively, +X,-X,+Y,-Y,+Z,-Z. */
+export function decodeProbeCubemap(env, tex, decodeHalf) {
+  const tt = typeof tex.read === 'function' ? tex.read() : tex;
+  if (Number(tt.m_TextureFormat) !== 24) throw new Error(`Unsupported HDR probe format ${tt.m_TextureFormat}: ${tt.m_Name}`);
+  let bytes = toBytes(tt['image data'] ?? tt.m_ImageData);
+  if (!bytes.length) bytes = toBytes(env.getResourceData(tex.assetsFile ?? tex._assetsFile ?? tt._assetsFile, tt.m_StreamData));
+  const mipmaps = [];
+  let faceBytes = 0;
+  for (let level = 0; level < Number(tt.m_MipCount); level++) {
+    const width = Math.max(1, Number(tt.m_Width) >> level), height = Math.max(1, Number(tt.m_Height) >> level);
+    const length = Math.ceil(width / 4) * Math.ceil(height / 4) * 16;
+    mipmaps.push({ width, height, offset: faceBytes, length, faces: [] });
+    faceBytes += length;
+  }
+  if (!mipmaps.length || bytes.length !== faceBytes * 6) throw new Error(`Invalid probe mip payload: ${tt.m_Name}`);
+  for (let face = 0; face < 6; face++) for (const mip of mipmaps) {
+    const offset = face * faceBytes + mip.offset;
+    mip.faces.push(decodeHalf(bytes.subarray(offset, offset + mip.length), mip.width, mip.height));
+  }
+  return { isCubemap: true, type: 'half-float', colorSpace: 'linear', faceOrder: ['+X', '-X', '+Y', '-Y', '+Z', '-Z'], mipmaps: mipmaps.map(({width, height, faces}) => ({width, height, faces})) };
+}
+
+function componentTransform(env, sf, component) {
+  const go = env.readPPtr(sf, component.m_GameObject);
+  if (!go) return null;
+  for (const c of go.m_Component ?? []) {
+    const obj = env.resolvePPtr(go._assetsFile ?? sf, c.component);
+    if (obj?.typeName === 'Transform') return obj.read();
+  }
+  return null;
+}
+
+export function activeComponent(env, sf, component) {
+  if (!(component.m_Enabled ?? 1)) return false;
+  let tr = componentTransform(env, sf, component);
+  if (!tr) return false;
+  while (tr) {
+    const go = env.readPPtr(tr._assetsFile, tr.m_GameObject);
+    if (!go || !(go.m_IsActive ?? 1)) return false;
+    tr = env.readPPtr(tr._assetsFile, tr.m_Father);
+  }
+  return true;
+}
+
+/** Shared browser/CLI probe extraction. Cube bytes remain in Unity coordinates. */
+export function extractReflectionProbes(env, bundle, world, register) {
+  const result = [];
+  for (const o of env.objectsOf(bundle, 'ReflectionProbe')) {
+    const t = o.read();
+    if (!activeComponent(env, o.assetsFile, t)) continue;
+    const tr = componentTransform(env, o.assetsFile, t), m = world(tr, env);
+    const go = env.readPPtr(o.assetsFile, t.m_GameObject);
+    const texture = env.resolvePPtr(o.assetsFile, Number(t.m_Mode) === 2 ? t.m_CustomBakedTexture : t.m_BakedTexture);
+    if (!texture) throw new Error(`Enabled reflection probe ${go.m_Name} has no baked texture`);
+    const position = conv([m[3], m[7], m[11]]);
+    // ReflectionProbe boxes are world-axis aligned; transform scale/rotation do not rotate them.
+    const offset = t.m_BoxOffset, size = t.m_BoxSize;
+    const boxCenter = [position[0] + offset.x, position[1] + offset.y, position[2] - offset.z];
+    const half = [size.x / 2, size.y / 2, size.z / 2];
+    result.push({ id: String(o.pathId), name: go.m_Name, position, boxCenter,
+      boxMin: boxCenter.map((v, i) => v - half[i]), boxMax: boxCenter.map((v, i) => v + half[i]),
+      boxProjection: !!t.m_BoxProjection, intensity: Number(t.m_IntensityMultiplier),
+      blendDistance: Number(t.m_BlendDistance), importance: Number(t.m_Importance), cubeRef: register(texture) });
+  }
+  return result;
+}
+
+/** The baked sky reflection is a referenced native cube, not an arbitrary unused probe. */
+export function extractDefaultReflection(env, bundle, register) {
+  for (const o of env.objectsOf(bundle, 'RenderSettings')) {
+    const rs = o.read();
+    const ref = Number(rs.m_DefaultReflectionMode) === 1 ? rs.m_CustomReflection : rs.m_GeneratedSkyboxReflection;
+    if (pidIsZero(ref?.m_PathID)) return null;
+    const texture = env.resolvePPtr(o.assetsFile, ref);
+    if (!texture) throw new Error('Scene default reflection texture reference is unresolved');
+    return { cubeRef: register(texture), intensity: Number(rs.m_ReflectionIntensity ?? 1) };
+  }
+  return null;
+}
+
+
+/** Resolve only active, enabled profile references, never unattached profile assets. */
+export function extractSceneVolumes(env, bundle, world) {
+  const stack = [];
+  for (const o of env.objectsOf(bundle, 'MonoBehaviour')) {
+    const t = o.read();
+    if (!('sharedProfile' in t) || !activeComponent(env, o.assetsFile, t) || !(t.weight > 0)) continue;
+    const profile = env.readPPtr(o.assetsFile, t.sharedProfile);
+    if (!profile) throw new Error('Active Volume profile is missing');
+    const components = {};
+    for (const ref of profile.components ?? []) {
+      const c = env.readPPtr(profile._assetsFile, ref);
+      if (!c || !(c.active ?? 1)) continue;
+      const key = 'reflectionScale' in c ? 'lightmap' : 'threshold' in c && 'diffusion' in c ? 'bloom' : 'postExposure' in c ? 'colorAdjustments' : null;
+      if (!key) continue;
+      const parameters = {};
+      for (const field of Object.keys(SCENE_VOLUME_DEFAULTS[key])) {
+        const p = c[field];
+        if (p?.m_OverrideState) parameters[field] = p.m_Value;
+      }
+      components[key] = parameters;
+    }
+    const tr = componentTransform(env, o.assetsFile, t), matrix = world(tr, env);
+    const go = env.readPPtr(o.assetsFile, t.m_GameObject), colliders = [];
+    if (!t.m_IsGlobal) for (const ref of go.m_Component ?? []) {
+      const obj = env.resolvePPtr(go._assetsFile, ref.component);
+      if (obj?.typeName.endsWith('Collider')) {
+        const c = obj.read();
+        if (c.m_Enabled ?? 1) colliders.push({ type: obj.typeName, center: c.m_Center, size: c.m_Size, radius: c.m_Radius, height: c.m_Height, direction: c.m_Direction });
+      }
+    }
+    stack.push({ name: profile.m_Name, isGlobal: !!t.m_IsGlobal, priority: Number(t.priority), weight: Math.min(1, Number(t.weight)), blendDistance: Number(t.blendDistance), matrix, colliders, components });
+  }
+  stack.sort((a, b) => a.priority - b.priority);
+  const volumes = new SceneVolumeResolver({ volumeStack: stack.filter(v => v.isGlobal) }).update([0, 0, 0]);
+  return { volumes, stack };
+}
+
+export function rendererReflection(env, renderer, positions, world) {
+  const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < positions.length; i += 3) for (let j = 0; j < 3; j++) {
+    min[j] = Math.min(min[j], positions[i + j]); max[j] = Math.max(max[j], positions[i + j]);
+  }
+  const tr = env.readPPtr(renderer._assetsFile, renderer.m_ProbeAnchor);
+  const wm = tr ? world(tr, env) : null;
+  return { usage: Number(renderer.m_ReflectionProbeUsage ?? 1), anchor: wm ? conv([wm[3], wm[7], wm[11]]) : min.map((v, i) => (v + max[i]) / 2), bounds: {min, max} };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1040,10 +1198,19 @@ function xform(m, v) {
 function xformNormal(m, v) {
   const x = v[0], y = v[1], z = v[2];
   return [
-    m[0] * x + m[4] * y + m[8] * z,
-    m[1] * x + m[5] * y + m[9] * z,
-    m[2] * x + m[6] * y + m[10] * z,
+    m[0] * x + m[1] * y + m[2] * z,
+    m[3] * x + m[4] * y + m[5] * z,
+    m[6] * x + m[7] * y + m[8] * z,
   ];
+}
+
+export function environmentNormalMatrix(m) {
+  const a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
+  const cofactors = [e * i - f * h, f * g - d * i, d * h - e * g, c * h - b * i, a * i - c * g, b * g - a * h, b * f - c * e, c * d - a * f, a * e - b * d];
+  const determinant = a * cofactors[0] + b * cofactors[1] + c * cofactors[2];
+  if (determinant === 0) throw new Error('Singular environment renderer transform');
+  for (let j = 0; j < 9; j++) cofactors[j] /= determinant;
+  return cofactors;
 }
 
 function conv(p) {
@@ -1089,9 +1256,13 @@ class EnvExporter {
     const name = tt.m_Name;
     if (!name || !(Number(tt.m_Width) > 0) || !(Number(tt.m_Height) > 0)) return null;
     if (!(name in this.texDone)) {
-      const rel = `tex/${name}.png`;
+      const rel = `tex/${name}.${Number(tt.m_TextureFormat) === 24 ? 'rgba16f' : 'png'}`;
       this.textures.register(rel, name, tex);
       this.texDone[name] = rel;
+      if (Number(tt.m_TextureFormat) === 24) {
+        this.meta.hdrTextures ??= {};
+        this.meta.hdrTextures[rel] = { width: Number(tt.m_Width), height: Number(tt.m_Height), type: 'half-float', colorSpace: 'linear' };
+      }
     }
     return this.texDone[name] ?? null;
   }
@@ -1103,6 +1274,9 @@ class EnvExporter {
       maps: {},
       colors: {},
       floats: {},
+      textureTransforms: {},
+      shader: env.readPPtr(mat._assetsFile, mat.m_Shader)?.m_ParsedForm?.m_Name ?? env.readPPtr(mat._assetsFile, mat.m_Shader)?.m_Name ?? null,
+      keywords: mat.m_ValidKeywords ?? String(mat.m_ShaderKeywords ?? '').split(/\s+/).filter(Boolean),
       renderQueue: Math.trunc(mat.m_CustomRenderQueue ?? -1),
     };
     const sf = mat._assetsFile;
@@ -1110,6 +1284,7 @@ class EnvExporter {
     for (const pair of saved.m_TexEnvs ?? []) {
       const prop = pair?.[0];
       const te = pair?.[1];
+      entry.textureTransforms[prop] = { scale: [te?.m_Scale?.x ?? 1, te?.m_Scale?.y ?? 1], offset: [te?.m_Offset?.x ?? 0, te?.m_Offset?.y ?? 0] };
       const tex = env.readPPtr(sf, te?.m_Texture);
       if (!tex) continue;
       const rel = this.texture(tex);
@@ -1175,6 +1350,8 @@ class EnvExporter {
     const vNrm = [];
     const vUv0 = [];
     const vUv2 = [];
+    const vTan = [];
+    const tangents = md.tangents ?? [];
     let lm = mr.m_LightmapIndex ?? -1;
     if (lm === null || lm === undefined || lm >= 65000) lm = -1;
     const to = mr.m_LightmapTilingOffset ?? null;
@@ -1187,11 +1364,17 @@ class EnvExporter {
       - m[1] * (m[4] * m[10] - m[6] * m[8])
       + m[2] * (m[4] * m[9] - m[5] * m[8]);
     const flipWinding = det < 0.0;
+    const normalMatrix = environmentNormalMatrix(m);
     for (let i = 0; i < n; i++) {
       const pw = conv(xform(m, verts[i]));
       vPos.push(pw[0], pw[1], pw[2]);
+      if (tangents.length === n) {
+        const t = tangents[i], d = conv([m[0] * t[0] + m[1] * t[1] + m[2] * t[2], m[4] * t[0] + m[5] * t[1] + m[6] * t[2], m[8] * t[0] + m[9] * t[1] + m[10] * t[2]]);
+        const len = Math.hypot(...d) || 1;
+        vTan.push(d[0] / len, d[1] / len, d[2] / len, t[3] * (flipWinding ? -1 : 1));
+      }
       if (i < normals.length) {
-        const nn = xformNormal(m, normals[i]);
+        const nn = xformNormal(normalMatrix, normals[i]);
         const ln = Math.sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]) || 1.0;
         const nnc = conv([nn[0] / ln, nn[1] / ln, nn[2] / ln]);
         vNrm.push(nnc[0], nnc[1], nnc[2]);
@@ -1210,6 +1393,7 @@ class EnvExporter {
       const b = Number(uv1v[1]);
       vUv2.push(a * tsx + tox, b * tsy + toy);
     }
+    const reflection = rendererReflection(env, mr, vPos, this.world.bind(this));
 
     const mats = [];
     const names = [];
@@ -1241,7 +1425,7 @@ class EnvExporter {
       const ovrTag = ovr !== null
         ? `${fmt3(ovr[0])}_${fmt3(ovr[1])}_${fmt3(ovr[2])}_${fmt3(ovr[3])}`
         : '1';
-      const bkey = `${mname}|${lm >= 0 ? 'lm' : 'lit'}|${ovrTag}`;
+      const bkey = `${mname}|${lm >= 0 ? 'lm' : 'lit'}|${ovrTag}|${reflection.usage ? mrPid : 'off'}|${vTan.length ? 'tangent' : 'no-tangent'}|${mr.m_RenderingLayerMask ?? 1}`;
       let bkt = this.buckets.get(bkey);
       if (bkt === undefined) {
         bkt = {
@@ -1249,6 +1433,9 @@ class EnvExporter {
           glsm,
           lightmap: lm >= 0,
           overrideColor: ovr,
+          reflection,
+          renderingLayerMask: Number(mr.m_RenderingLayerMask ?? 1),
+          tan: [],
           pos: [],
           nrm: [],
           uv0: [],
@@ -1270,6 +1457,7 @@ class EnvExporter {
             bkt.nrm.push(vNrm[vi * 3], vNrm[vi * 3 + 1], vNrm[vi * 3 + 2]);
             bkt.uv0.push(vUv0[vi * 2], vUv0[vi * 2 + 1]);
             bkt.uv2.push(vUv2[vi * 2], vUv2[vi * 2 + 1]);
+            if (vTan.length) bkt.tan.push(...vTan.slice(vi * 4, vi * 4 + 4));
           }
         }
         const ia = remap.get(a), ib = remap.get(b), ic = remap.get(c);
@@ -1309,6 +1497,16 @@ class EnvExporter {
 
   run() {
     const env = this.env;
+    const registerCube = texture => {
+      const t = texture.read(), ref = `tex/${t.m_Name}.cube.json`;
+      this.textures.register(ref, t.m_Name, texture);
+      return ref;
+    };
+    this.meta.reflectionProbes = extractReflectionProbes(env, this.bundle, this.world.bind(this), registerCube);
+    this.meta.defaultReflection = extractDefaultReflection(env, this.bundle, registerCube);
+    const resolvedVolumes = extractSceneVolumes(env, this.bundle, this.world.bind(this));
+    Object.assign(this.meta.volumes, resolvedVolumes.volumes);
+    this.meta.volumeStack = resolvedVolumes.stack;
     // scene roots
     const roots = [];
     for (const o of env.objectsOf(this.bundle, 'Transform')) {
@@ -1381,23 +1579,6 @@ class EnvExporter {
           ]);
         } else if ('modelingPoseWeight' in tt && 'swingPowerWeight' in tt) {
           mergeOvr(vol('animationManage'), ANIMATION_MANAGE_FIELDS);
-        } else if ('reflectionScale' in tt && 'intensity' in tt) {
-          this.meta.volumes.lightmap = {
-            intensity: v('intensity', 1.0),
-            color: v('color'),
-          };
-        } else if ('threshold' in tt && 'diffusion' in tt) {
-          this.meta.volumes.bloom = {
-            intensity: v('intensity', 1.0),
-            threshold: v('threshold', 0.97),
-          };
-        } else if ('postExposure' in tt && 'saturation' in tt) {
-          this.meta.volumes.colorAdjustments = {
-            postExposure: v('postExposure', 0.0),
-            contrast: v('contrast', 0.0),
-            saturation: v('saturation', 0.0),
-            colorFilter: v('colorFilter'),
-          };
         } else if ('radius' in tt && 'maxAmount' in tt && 'position' in tt) {
           const posU = v('position') ?? { x: 0, y: 0, z: 0 };
           this.meta.volumes.skyHaze = {
@@ -1657,6 +1838,7 @@ class EnvExporter {
     // lights (position & forward direction from the GameObject's transform chain)
     for (const o of env.objectsOf(this.bundle, 'Light')) {
       const L = o.read();
+      if (!activeComponent(env, o.assetsFile, L)) continue;
       const sf = o.assetsFile;
       let go = null;
       let tr = null;
@@ -1684,6 +1866,9 @@ class EnvExporter {
         type: Math.trunc(L.m_Type),
         color: [col.r, col.g, col.b],
         intensity: Number(L.m_Intensity),
+        layerMask: Number(L.m_RenderingLayerMask ?? 1),
+        ...extractLightControls(env, sf, L),
+        bakeType: Number(L.m_BakingOutput?.lightmapBakeMode?.lightmapBakeType ?? L.m_Lightmapping),
         range: Number(L.m_Range),
         spotAngle: Number(L.m_SpotAngle ?? 0.0),
         position: [p2[0], p2[1], p2[2]],
@@ -1733,6 +1918,7 @@ class EnvExporter {
         TEXCOORD_0: this.glb.floats(bkt.uv0, 'VEC2'),
         TEXCOORD_2: this.glb.floats(bkt.uv2, 'VEC2'),
       };
+      if (bkt.tan.length) attrs.TANGENT = this.glb.floats(bkt.tan, 'VEC4');
       const acc = this.glb.uints(bkt.idx, 'SCALAR');
       const prim = this.glb.primitive(attrs, acc, bkt.glsm);
       const idx = this.glb.mesh(name, [prim]);
@@ -1741,6 +1927,8 @@ class EnvExporter {
         material: bkt.material,
         lightmap: bkt.lightmap,
         overrideColor: bkt.overrideColor,
+        reflection: bkt.reflection,
+        renderingLayerMask: bkt.renderingLayerMask,
       };
     }
   }

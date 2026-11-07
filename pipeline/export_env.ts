@@ -17,6 +17,8 @@ import * as assets from "./assets.ts";
 import { Glb } from "./core/gltf.ts";
 import type { SerializedFile, UnityObject } from "./core/serialized_file.ts";
 import { ANIMATION_MANAGE_FIELDS } from "../web/src/engine/animation_manage.js";
+import { decodeBc6hHalf } from './core/bcn_png.ts';
+import { decodeProbeCubemap, decodeTexture, extractReflectionProbes, extractDefaultReflection, extractSceneVolumes, rendererReflection, environmentNormalMatrix, activeComponent, extractLightControls } from '../web/src/runtime/bundle_loaders.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(MODULE_DIR, "..");
@@ -70,9 +72,9 @@ function xform(m: Mat4, v: ArrayLike<number>): Vec3 {
 function xformNormal(m: Mat4, v: ArrayLike<number>): Vec3 {
   const x = v[0], y = v[1], z = v[2];
   return [
-    m[0] * x + m[4] * y + m[8] * z,
-    m[1] * x + m[5] * y + m[9] * z,
-    m[2] * x + m[6] * y + m[10] * z,
+    m[0] * x + m[1] * y + m[2] * z,
+    m[3] * x + m[4] * y + m[5] * z,
+    m[6] * x + m[7] * y + m[8] * z,
   ];
 }
 
@@ -103,6 +105,9 @@ interface Bucket {
   glsm: number | null;
   lightmap: boolean;
   overrideColor: number[] | null;
+  reflection: { usage: number; anchor: number[]; bounds: { min: number[]; max: number[] } };
+  renderingLayerMask: number;
+  tan: number[];
   pos: number[];
   nrm: number[];
   uv0: number[];
@@ -147,6 +152,18 @@ export class EnvExporter {
   // ---------- textures ----------
   texture(tex: Record<string, any>): string | null {
     const name: string = tex.m_Name;
+    if (Number(tex.m_TextureFormat) === 24) {
+      if (!(name in this.texDone)) {
+        fs.mkdirSync(TEX, { recursive: true });
+        const decoded = decodeTexture(assets.loadEnv(), tex, decodeBc6hHalf);
+        const ref = `tex/${name}.rgba16f`;
+        fs.writeFileSync(path.join(OUT, ref), new Uint8Array(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength));
+        this.meta.hdrTextures ??= {};
+        this.meta.hdrTextures[ref] = { width: decoded.width, height: decoded.height, type: 'half-float', colorSpace: 'linear' };
+        this.texDone[name] = ref;
+      }
+      return this.texDone[name];
+    }
     if (!(name in this.texDone)) {
       fs.mkdirSync(TEX, { recursive: true });
       const filePath = path.join(TEX, `${name}.png`);
@@ -171,6 +188,9 @@ export class EnvExporter {
       maps: {},
       colors: {},
       floats: {},
+      textureTransforms: {},
+      shader: env.readPPtr(mat._assetsFile, mat.m_Shader)?.m_ParsedForm?.m_Name ?? env.readPPtr(mat._assetsFile, mat.m_Shader)?.m_Name ?? null,
+      keywords: mat.m_ValidKeywords ?? String(mat.m_ShaderKeywords ?? '').split(/\s+/).filter(Boolean),
       renderQueue: Math.trunc(mat.m_CustomRenderQueue ?? -1),
     };
     const sf = mat._assetsFile as SerializedFile;
@@ -178,6 +198,7 @@ export class EnvExporter {
     for (const pair of saved.m_TexEnvs ?? []) {
       const prop = pair?.[0];
       const te = pair?.[1];
+      entry.textureTransforms[prop] = { scale: [te?.m_Scale?.x ?? 1, te?.m_Scale?.y ?? 1], offset: [te?.m_Offset?.x ?? 0, te?.m_Offset?.y ?? 0] };
       const tex = env.readPPtr(sf, te?.m_Texture);
       if (!tex) continue;
       const rel = this.texture(tex);
@@ -254,6 +275,8 @@ export class EnvExporter {
     const vNrm: number[] = [];
     const vUv0: number[] = [];
     const vUv2: number[] = [];
+    const vTan: number[] = [];
+    const tangents = md.tangents ?? [];
     let lm: number = mr.m_LightmapIndex ?? -1;
     if (lm === null || lm === undefined || lm >= 65000) lm = -1;
     const to = mr.m_LightmapTilingOffset ?? null;
@@ -266,11 +289,17 @@ export class EnvExporter {
       - m[1] * (m[4] * m[10] - m[6] * m[8])
       + m[2] * (m[4] * m[9] - m[5] * m[8]);
     const flipWinding = det < 0.0;
+    const normalMatrix = environmentNormalMatrix(m);
     for (let i = 0; i < n; i++) {
       const pw = conv(xform(m, verts[i]));
       vPos.push(pw[0], pw[1], pw[2]);
+      if (tangents.length === n) {
+        const t = tangents[i], d = conv([m[0] * t[0] + m[1] * t[1] + m[2] * t[2], m[4] * t[0] + m[5] * t[1] + m[6] * t[2], m[8] * t[0] + m[9] * t[1] + m[10] * t[2]]);
+        const len = Math.hypot(...d) || 1;
+        vTan.push(d[0] / len, d[1] / len, d[2] / len, t[3] * (flipWinding ? -1 : 1));
+      }
       if (i < normals.length) {
-        const nn = xformNormal(m, normals[i]);
+        const nn = xformNormal(normalMatrix, normals[i]);
         const ln = Math.sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]) || 1.0;
         const nnc = conv([nn[0] / ln, nn[1] / ln, nn[2] / ln]);
         vNrm.push(nnc[0], nnc[1], nnc[2]);
@@ -289,6 +318,7 @@ export class EnvExporter {
       const b = Number(uv1v[1]);
       vUv2.push(a * tsx + tox, b * tsy + toy);
     }
+    const reflection = rendererReflection(env, mr, vPos, this.world.bind(this));
 
     const mats: Array<number | null> = [];
     const names: string[] = [];
@@ -320,7 +350,7 @@ export class EnvExporter {
       const ovrTag = ovr !== null
         ? `${fmt3(ovr[0])}_${fmt3(ovr[1])}_${fmt3(ovr[2])}_${fmt3(ovr[3])}`
         : "1";
-      const bkey = `${mname}|${lm >= 0 ? "lm" : "lit"}|${ovrTag}`;
+      const bkey = `${mname}|${lm >= 0 ? 'lm' : 'lit'}|${ovrTag}|${reflection.usage ? mrPid : 'off'}|${vTan.length ? 'tangent' : 'no-tangent'}|${mr.m_RenderingLayerMask ?? 1}`;
       let bkt = this.buckets.get(bkey);
       if (bkt === undefined) {
         bkt = {
@@ -328,6 +358,9 @@ export class EnvExporter {
           glsm,
           lightmap: lm >= 0,
           overrideColor: ovr,
+          reflection,
+          renderingLayerMask: Number(mr.m_RenderingLayerMask ?? 1),
+          tan: [],
           pos: [],
           nrm: [],
           uv0: [],
@@ -349,6 +382,7 @@ export class EnvExporter {
             bkt.nrm.push(vNrm[vi * 3], vNrm[vi * 3 + 1], vNrm[vi * 3 + 2]);
             bkt.uv0.push(vUv0[vi * 2], vUv0[vi * 2 + 1]);
             bkt.uv2.push(vUv2[vi * 2], vUv2[vi * 2 + 1]);
+            if (vTan.length) bkt.tan.push(...vTan.slice(vi * 4, vi * 4 + 4));
           }
         }
         const ia = remap.get(a)!, ib = remap.get(b)!, ic = remap.get(c)!;
@@ -388,6 +422,23 @@ export class EnvExporter {
 
   run(): void {
     const env = assets.loadEnv();
+    const registerCube = (texture: UnityObject) => {
+      const t = texture.read(), ref = `tex/${t.m_Name}.cube.json`;
+      const cube = decodeProbeCubemap(env, texture, decodeBc6hHalf);
+      fs.mkdirSync(TEX, { recursive: true });
+      const mipmaps = cube.mipmaps.map((mip: { width: number; height: number; faces: Uint16Array[] }, level: number) => ({ width: mip.width, height: mip.height, faces: mip.faces.map((data: Uint16Array, face: number) => {
+        const file = `tex/${t.m_Name}.m${level}.f${face}.rgba16f`;
+        fs.writeFileSync(path.join(OUT, file), new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+        return file;
+      }) }));
+      fs.writeFileSync(path.join(OUT, ref), JSON.stringify({ ...cube, mipmaps }));
+      return ref;
+    };
+    this.meta.reflectionProbes = extractReflectionProbes(env, this.bundle, this.world.bind(this), registerCube);
+    this.meta.defaultReflection = extractDefaultReflection(env, this.bundle, registerCube);
+    const resolvedVolumes = extractSceneVolumes(env, this.bundle, this.world.bind(this));
+    Object.assign(this.meta.volumes, resolvedVolumes.volumes);
+    this.meta.volumeStack = resolvedVolumes.stack;
     // scene roots
     const roots: UnityObject[] = [];
     for (const o of assets.objectsOf(this.bundle, "Transform")) {
@@ -461,23 +512,6 @@ export class EnvExporter {
           ]);
         } else if ("modelingPoseWeight" in tt && "swingPowerWeight" in tt) {
           mergeOvr(vol("animationManage"), [...ANIMATION_MANAGE_FIELDS]);
-        } else if ("reflectionScale" in tt && "intensity" in tt) {
-          this.meta.volumes.lightmap = {
-            intensity: v("intensity", 1.0),
-            color: v("color"),
-          };
-        } else if ("threshold" in tt && "diffusion" in tt) {
-          this.meta.volumes.bloom = {
-            intensity: v("intensity", 1.0),
-            threshold: v("threshold", 0.97),
-          };
-        } else if ("postExposure" in tt && "saturation" in tt) {
-          this.meta.volumes.colorAdjustments = {
-            postExposure: v("postExposure", 0.0),
-            contrast: v("contrast", 0.0),
-            saturation: v("saturation", 0.0),
-            colorFilter: v("colorFilter"),
-          };
         } else if ("radius" in tt && "maxAmount" in tt && "position" in tt) {
           const posU = v("position") ?? { x: 0, y: 0, z: 0 };
           this.meta.volumes.skyHaze = {
@@ -725,6 +759,7 @@ export class EnvExporter {
     // lights (position & forward direction from the GameObject's transform chain)
     for (const o of assets.objectsOf(this.bundle, "Light")) {
       const L = o.read();
+      if (!activeComponent(env, o.assetsFile, L)) continue;
       const sf = o.assetsFile;
       let go: Record<string, any> | null = null;
       let tr: Record<string, any> | null = null;
@@ -752,6 +787,9 @@ export class EnvExporter {
         type: Math.trunc(L.m_Type),
         color: [col.r, col.g, col.b],
         intensity: Number(L.m_Intensity),
+        layerMask: Number(L.m_RenderingLayerMask ?? 1),
+        ...extractLightControls(env, sf, L),
+        bakeType: Number(L.m_BakingOutput?.lightmapBakeMode?.lightmapBakeType ?? L.m_Lightmapping),
         range: Number(L.m_Range),
         spotAngle: Number(L.m_SpotAngle ?? 0.0),
         position: [p2[0], p2[1], p2[2]],
@@ -795,12 +833,13 @@ export class EnvExporter {
       bi += 1;
       if (!bkt.idx.length) continue;
       const name = `bkt_${i}`;
-      const attrs = {
+      const attrs: Record<string, number> = {
         POSITION: this.glb.floats(bkt.pos, "VEC3"),
         NORMAL: this.glb.floats(bkt.nrm, "VEC3"),
         TEXCOORD_0: this.glb.floats(bkt.uv0, "VEC2"),
         TEXCOORD_2: this.glb.floats(bkt.uv2, "VEC2"),
       };
+      if (bkt.tan.length) attrs.TANGENT = this.glb.floats(bkt.tan, 'VEC4');
       const acc = this.glb.uints(bkt.idx, "SCALAR");
       const prim = this.glb.primitive(attrs, acc, bkt.glsm);
       const idx = this.glb.mesh(name, [prim]);
@@ -809,6 +848,8 @@ export class EnvExporter {
         material: bkt.material,
         lightmap: bkt.lightmap,
         overrideColor: bkt.overrideColor,
+        reflection: bkt.reflection,
+        renderingLayerMask: bkt.renderingLayerMask,
       };
     }
     fs.mkdirSync(OUT, { recursive: true });

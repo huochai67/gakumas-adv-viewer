@@ -1,5 +1,5 @@
 // Post-processing pipeline: Unity VLDOF (thin-lens 5-blade Vogel bokeh DoF for
-// both 3D stages and 2D ClippingRectFitter backgrounds) + URP Bloom + grading.
+// both 3D stages and 2D ClippingRectFitter backgrounds) + native VLBloom + HDR grading.
 
 import * as THREE from 'three';
 
@@ -264,27 +264,42 @@ void main() {
   gl_FragColor = vec4(mix(sharp.rgb, bokeh.rgb, blend), sharp.a);
 }`;
 
-const BRIGHT_FRAG = /* glsl */`
+// Native Hidden/VL/PostEffect/Bloom passes 0/1: four diagonal bilinear samples,
+// then a hard, brightness-preserving threshold subtraction (not URP's soft knee).
+// Recovered DXBC: tmp/ghidra-task-exam/adv_out_scene_bloom/shader_{1,2}.asm.
+const BLOOM_DOWN_FRAG = /* glsl */`
 uniform sampler2D tSrc;
+uniform vec2 uTexel;
 uniform float uThreshold;
-uniform float uKnee;
+uniform bool uPrefilter;
 varying vec2 vUv;
 void main() {
-  vec3 c = texture2D(tSrc, vUv).rgb;
-  float l = max(c.r, max(c.g, c.b));
-  float f = smoothstep(uThreshold, uThreshold + uKnee, l);
-  gl_FragColor = vec4(c * f, 1.0);
+  vec3 c = (texture2D(tSrc, vUv + uTexel).rgb
+          + texture2D(tSrc, vUv - uTexel).rgb
+          + texture2D(tSrc, vUv + vec2(uTexel.x, -uTexel.y)).rgb
+          + texture2D(tSrc, vUv + vec2(-uTexel.x, uTexel.y)).rgb) * 0.25;
+  if (uPrefilter) {
+    c = min(c, vec3(65504.0));
+    float brightness = max(c.r, max(c.g, c.b));
+    c *= max(0.0, brightness - uThreshold) / max(brightness, 0.0001);
+  }
+  gl_FragColor = vec4(c, 1.0);
 }`;
 
-const BLUR_FRAG = /* glsl */`
+// Native passes 2/3: additive box reconstruction, radius = sampleScale / 2.
+const BLOOM_UP_FRAG = /* glsl */`
 uniform sampler2D tSrc;
-uniform vec2 uDir;
+uniform sampler2D tHigh;
+uniform vec2 uTexel;
+uniform float uSampleScale;
 varying vec2 vUv;
 void main() {
-  vec3 s = texture2D(tSrc, vUv).rgb * 0.227027;
-  s += (texture2D(tSrc, vUv + uDir * 1.3846).rgb + texture2D(tSrc, vUv - uDir * 1.3846).rgb) * 0.3162162;
-  s += (texture2D(tSrc, vUv + uDir * 3.2308).rgb + texture2D(tSrc, vUv - uDir * 3.2308).rgb) * 0.0702702;
-  gl_FragColor = vec4(s, 1.0);
+  vec2 o = uTexel * (0.5 * uSampleScale);
+  vec3 c = (texture2D(tSrc, vUv + o).rgb
+          + texture2D(tSrc, vUv - o).rgb
+          + texture2D(tSrc, vUv + vec2(o.x, -o.y)).rgb
+          + texture2D(tSrc, vUv + vec2(-o.x, o.y)).rgb) * 0.25;
+  gl_FragColor = vec4(c + texture2D(tHigh, vUv).rgb, 1.0);
 }`;
 
 const COMPOSITE_FRAG = /* glsl */`
@@ -293,9 +308,11 @@ uniform sampler2D tBloom;
 uniform sampler2D tBg2d;
 uniform float uHasBg2d;
 uniform float uStrength;
+uniform vec3 uBloomColor;
 uniform float uExposure;
 uniform float uContrast;
 uniform float uSaturation;
+uniform vec3 uColorFilter;
 varying vec2 vUv;
 vec3 lin2srgb(vec3 c) {
   vec3 lo = c * 12.92;
@@ -303,15 +320,21 @@ vec3 lin2srgb(vec3 c) {
   return mix(lo, hi, step(vec3(0.0031308), c));
 }
 vec3 grade3d(vec3 lin) {
-  vec3 c = lin2srgb(max(lin * uExposure, vec3(0.0)));
-  c = (c - 0.5) * uContrast + 0.5;
-  c = max(c, vec3(0.0));
-  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-  return clamp(mix(vec3(l), c, uSaturation), 0.0, 1.0);
+  // Native LutBuilderHdr (non-ACES): contrast in Alexa LogC about ACEScc midgray,
+  // then linear color filter and Rec.709 saturation. Exposure is in stops on CPU.
+  // Evaluate the supported grading operations directly, avoiding LUT quantization.
+  vec3 c = max(lin * uExposure, vec3(0.0));
+  vec3 logC = 0.244161 * (log2(5.555556 * c + 0.047996) / log2(10.0)) + 0.386036;
+  logC = (logC - 0.4135884) * uContrast + 0.4135884;
+  c = (pow(vec3(10.0), (logC - 0.386036) / 0.244161) - 0.047996) / 5.555556;
+  c = max(c * uColorFilter, vec3(0.0));
+  float l = dot(c, vec3(0.2126729, 0.7151522, 0.0721750));
+  c = max(mix(vec3(l), c, uSaturation), vec3(0.0));
+  return clamp(lin2srgb(c), 0.0, 1.0);
 }
 void main() {
   vec4 s = texture2D(tScene, vUv);
-  vec3 b = texture2D(tBloom, vUv).rgb * uStrength;
+  vec3 b = texture2D(tBloom, vUv).rgb * uStrength * uBloomColor;
   if (uHasBg2d > 0.5) {
     // 2D artwork is pre-graded; preserve 1:1 sRGB background color + linear Vogel bokeh while
     // compositing graded 3D character (premultiplied/OVER alpha) and additive bloom on top.
@@ -363,10 +386,23 @@ export function computeVldofRadii(dof, focalLengthMm, screenH) {
   };
 }
 
-export function createBloom(renderer, {
-  strength = 0.35, threshold = 0.95, knee = 0.25,
-  exposure = 0.96, contrast = 1.04, saturation = 1.06,
-} = {}) {
+// Unity Mathf.GammaToLinearSpace also has a distinct HDR (> 1) branch.
+function gammaToLinear(value) {
+  if (value <= 0.04045) return value / 12.92;
+  if (value < 1) return ((value + 0.055) / 1.055) ** 2.4;
+  return value ** 2.2;
+}
+
+function setUnityColor(target, color) {
+  target.setRGB(
+    gammaToLinear(color?.r ?? 1),
+    gammaToLinear(color?.g ?? 1),
+    gammaToLinear(color?.b ?? 1),
+    THREE.LinearSRGBColorSpace,
+  );
+}
+
+export function createBloom(renderer) {
   const quadScene = new THREE.Scene();
   const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2));
@@ -413,8 +449,12 @@ export function createBloom(renderer, {
     type: hdrType, depthBuffer: false,
   });
 
-  const rtA = new THREE.WebGLRenderTarget(1, 1, { type: hdrType, depthBuffer: false });
-  const rtB = new THREE.WebGLRenderTarget(1, 1, { type: hdrType, depthBuffer: false });
+  const bloomDown = [];
+  const bloomUp = [];
+  let bloomLevels = 0;
+  let bloomDiffusion = 10;
+  let sceneVolumes;
+  let sceneVolumeRevision;
 
   const bg2dMat = pass(BG2D_FRAG, {
     tBg: { value: null },
@@ -455,24 +495,29 @@ export function createBloom(renderer, {
     uMaxCocPx: { value: 0 },
   });
 
-  const brightMat = pass(BRIGHT_FRAG, {
-    tSrc: { value: rtScene.texture },
-    uThreshold: { value: threshold },
-    uKnee: { value: knee },
-  });
-  const blurMat = pass(BLUR_FRAG, {
+  const downMat = pass(BLOOM_DOWN_FRAG, {
     tSrc: { value: null },
-    uDir: { value: new THREE.Vector2() },
+    uTexel: { value: new THREE.Vector2() },
+    uThreshold: { value: 1 },
+    uPrefilter: { value: true },
+  });
+  const upMat = pass(BLOOM_UP_FRAG, {
+    tSrc: { value: null },
+    tHigh: { value: null },
+    uTexel: { value: new THREE.Vector2() },
+    uSampleScale: { value: 0.5 },
   });
   const compMat = pass(COMPOSITE_FRAG, {
     tScene: { value: rtScene.texture },
-    tBloom: { value: rtA.texture },
+    tBloom: { value: rtScene.texture },
     tBg2d: { value: rtBg2d.texture },
     uHasBg2d: { value: 0 },
-    uStrength: { value: strength },
-    uExposure: { value: exposure },
-    uContrast: { value: contrast },
-    uSaturation: { value: saturation },
+    uStrength: { value: 0 },
+    uBloomColor: { value: new THREE.Color(1, 1, 1) },
+    uExposure: { value: 1 },
+    uContrast: { value: 1 },
+    uSaturation: { value: 1 },
+    uColorFilter: { value: new THREE.Color(1, 1, 1) },
   });
 
   let dofCfg = null;
@@ -480,6 +525,65 @@ export function createBloom(renderer, {
   let is3dScene = false;
   let bg2dState = { active: false, texture: null, uvMat: new THREE.Matrix3(), key: '' };
   let cachedBgKey = '';
+
+  function resizeBloom() {
+    // VLPostProcessPass.SetupVLBloom 0x187AAE270: count is clamped AFTER
+    // flooring, whereas fractional sample scale uses the unclamped floor.
+    let w = Math.max(1, rtScene.width >> 1);
+    let h = Math.max(1, rtScene.height >> 1);
+    const logs = Math.log2(Math.max(w, h)) + bloomDiffusion - 10;
+    const logsFloor = Math.floor(logs);
+    bloomLevels = Math.max(2, Math.min(7, logsFloor));
+    upMat.uniforms.uSampleScale.value = 0.5 + logs - logsFloor;
+    for (let i = 0; i < bloomLevels; i++) {
+      if (!bloomDown[i]) {
+        bloomDown[i] = new THREE.WebGLRenderTarget(w, h, { type: hdrType, depthBuffer: false });
+      } else {
+        bloomDown[i].setSize(w, h);
+      }
+      if (i < bloomLevels - 1) {
+        if (!bloomUp[i]) {
+          bloomUp[i] = new THREE.WebGLRenderTarget(w, h, { type: hdrType, depthBuffer: false });
+        } else {
+          bloomUp[i].setSize(w, h);
+        }
+      }
+      w = Math.max(1, w >> 1);
+      h = Math.max(1, h >> 1);
+    }
+    while (bloomDown.length > bloomLevels) bloomDown.pop().dispose();
+    while (bloomUp.length >= bloomLevels) bloomUp.pop().dispose();
+  }
+
+  /** Apply a resolved Unity Volume stack, or reset to native constructor defaults.
+   * Inputs are immutable unless the caller increments revision (SceneVolumeResolver).
+   * A missing component resets independently; no authored values carry into another scene.
+   */
+  function setSceneVolumes(volumesOrNull, revision = 0) {
+    const volumes = volumesOrNull ?? null;
+    if (sceneVolumes === volumes && sceneVolumeRevision === revision) return;
+    sceneVolumes = volumes;
+    sceneVolumeRevision = revision;
+    const bloom = volumes?.bloom;
+    const grading = volumes?.colorAdjustments;
+    const intensity = Math.max(0, bloom?.intensity ?? 0);
+    compMat.uniforms.uStrength.value = Math.expm1(intensity / 10 * Math.LN2);
+    downMat.uniforms.uThreshold.value = gammaToLinear(Math.max(0, bloom?.threshold ?? 1));
+    setUnityColor(compMat.uniforms.uBloomColor.value, bloom?.color);
+    const tint = compMat.uniforms.uBloomColor.value;
+    const luminance = tint.r * 0.2126729 + tint.g * 0.7151522 + tint.b * 0.0721750;
+    if (luminance > 0) tint.multiplyScalar(1 / luminance);
+    else tint.setRGB(1, 1, 1);
+    const diffusion = Math.max(0, Math.min(10, Math.trunc(bloom?.diffusion ?? 10)));
+    if (diffusion !== bloomDiffusion || bloomLevels === 0) {
+      bloomDiffusion = diffusion;
+      resizeBloom();
+    }
+    compMat.uniforms.uExposure.value = 2 ** (grading?.postExposure ?? 0);
+    compMat.uniforms.uContrast.value = 1 + (grading?.contrast ?? 0) / 100;
+    compMat.uniforms.uSaturation.value = 1 + (grading?.saturation ?? 0) / 100;
+    setUnityColor(compMat.uniforms.uColorFilter.value, grading?.colorFilter);
+  }
 
   function draw(material, target) {
     quad.material = material;
@@ -511,6 +615,7 @@ export function createBloom(renderer, {
   }
 
   return {
+    setSceneVolumes,
     setSize(w, h) {
       const dpr = renderer.getPixelRatio();
       const pw = Math.max(1, Math.floor(w * dpr));
@@ -524,11 +629,7 @@ export function createBloom(renderer, {
       rtDofHalfA.setSize(hw, hh);
       rtDofHalfB.setSize(hw, hh);
       rtDofPost.setSize(hw, hh);
-      const bw = Math.max(1, Math.floor(pw / 4));
-      const bh = Math.max(1, Math.floor(ph / 4));
-      rtA.setSize(bw, bh);
-      rtB.setSize(bw, bh);
-      blurMat.uniforms.uDir.value.set(1 / bw, 0);
+      resizeBloom();
       bg2dMat.uniforms.uTexel.value.set(1 / pw, 1 / ph);
       dofPrefilterMat.uniforms.uFullTexel.value.set(1 / pw, 1 / ph);
       dofBokehMat.uniforms.uFullTexel.value.set(1 / pw, 1 / ph);
@@ -610,26 +711,36 @@ export function createBloom(renderer, {
         sceneColorTex = rtDofFull.texture;
       }
 
-      // 4. URP Bloom + ColorAdjustments composite
-      brightMat.uniforms.tSrc.value = sceneColorTex;
-      draw(brightMat, rtB);
-
-      const bw = rtA.width, bh = rtA.height;
-      blurMat.uniforms.tSrc.value = rtB.texture;
-      blurMat.uniforms.uDir.value.set(1 / bw, 0);
-      draw(blurMat, rtA);
-      blurMat.uniforms.tSrc.value = rtA.texture;
-      blurMat.uniforms.uDir.value.set(0, 1 / bh);
-      draw(blurMat, rtB);
-      blurMat.uniforms.tSrc.value = rtB.texture;
-      blurMat.uniforms.uDir.value.set(2 / bw, 0);
-      draw(blurMat, rtA);
-      blurMat.uniforms.tSrc.value = rtA.texture;
-      blurMat.uniforms.uDir.value.set(0, 2 / bh);
-      draw(blurMat, rtB);
+      // 4. Native VLBloom half-resolution downsample/additive reconstruction.
+      // Intensity zero skips the pyramid; use a valid current texture, never stale bloom.
+      let bloomTexture = sceneColorTex;
+      if (compMat.uniforms.uStrength.value > 0) {
+        if (bloomLevels === 0) resizeBloom();
+        let source = sceneColorTex;
+        let sourceW = pw, sourceH = ph;
+        for (let i = 0; i < bloomLevels; i++) {
+          downMat.uniforms.tSrc.value = source;
+          downMat.uniforms.uTexel.value.set(1 / sourceW, 1 / sourceH);
+          downMat.uniforms.uPrefilter.value = i === 0;
+          draw(downMat, bloomDown[i]);
+          source = bloomDown[i].texture;
+          sourceW = bloomDown[i].width;
+          sourceH = bloomDown[i].height;
+        }
+        for (let i = bloomLevels - 2; i >= 0; i--) {
+          upMat.uniforms.tSrc.value = source;
+          upMat.uniforms.tHigh.value = bloomDown[i].texture;
+          upMat.uniforms.uTexel.value.set(1 / sourceW, 1 / sourceH);
+          draw(upMat, bloomUp[i]);
+          source = bloomUp[i].texture;
+          sourceW = bloomUp[i].width;
+          sourceH = bloomUp[i].height;
+        }
+        bloomTexture = source;
+      }
 
       compMat.uniforms.tScene.value = sceneColorTex;
-      compMat.uniforms.tBloom.value = rtB.texture;
+      compMat.uniforms.tBloom.value = bloomTexture;
       draw(compMat, null);
       renderer.setRenderTarget(null);
     },

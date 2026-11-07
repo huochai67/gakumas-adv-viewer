@@ -4,11 +4,13 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 import { parseAdv, buildTimeline } from './adv.js';
 import { createBloom } from './bloom.js';
+import { createEnvironmentProbes, createEnvironmentMaterial } from './environment.js';
 import { applyCameraSetting, unityEulerQuat } from './camera.js';
 import { loadCharacter } from './char.js';
 import { getClip, evalClip, setClipCharMeta } from './clips.js';
 import { applyAnimationManage, blendAnimationManage } from './animation_manage.js';
 import { getBrowserEnv } from '../runtime/bundle_env.js';
+import { SceneVolumeResolver } from '../runtime/scene_volumes.js';
 import {
   PARTS as DEFAULT_PARTS,
   buildEnv3dFromBundles,
@@ -175,10 +177,11 @@ function downsampleRgba(src, sw, sh, maxDim) {
   let w = sw;
   let h = sh;
   let data = src;
+  const hdr = src instanceof Uint16Array;
   while ((w > maxDim || h > maxDim) && w >= 2 && h >= 2) {
     const nw = w >> 1;
     const nh = h >> 1;
-    const dst = new Uint8Array(nw * nh * 4);
+    const dst = hdr ? new Uint16Array(nw * nh * 4) : new Uint8Array(nw * nh * 4);
     for (let y = 0; y < nh; y++) {
       const r0 = y * 2 * w * 4;
       const r1 = r0 + w * 4;
@@ -188,10 +191,18 @@ function downsampleRgba(src, sw, sh, maxDim) {
         const i01 = i00 + 4;
         const i10 = r1 + (x << 3);
         const i11 = i10 + 4;
-        dst[di] = (data[i00] + data[i01] + data[i10] + data[i11] + 2) >> 2;
-        dst[di + 1] = (data[i00 + 1] + data[i01 + 1] + data[i10 + 1] + data[i11 + 1] + 2) >> 2;
-        dst[di + 2] = (data[i00 + 2] + data[i01 + 2] + data[i10 + 2] + data[i11 + 2] + 2) >> 2;
-        dst[di + 3] = (data[i00 + 3] + data[i01 + 3] + data[i10 + 3] + data[i11 + 3] + 2) >> 2;
+        if (hdr) {
+          for (let c = 0; c < 4; c++) {
+            dst[di + c] = THREE.DataUtils.toHalfFloat((
+              THREE.DataUtils.fromHalfFloat(data[i00 + c]) + THREE.DataUtils.fromHalfFloat(data[i01 + c])
+              + THREE.DataUtils.fromHalfFloat(data[i10 + c]) + THREE.DataUtils.fromHalfFloat(data[i11 + c])) * 0.25);
+          }
+        } else {
+          dst[di] = (data[i00] + data[i01] + data[i10] + data[i11] + 2) >> 2;
+          dst[di + 1] = (data[i00 + 1] + data[i01 + 1] + data[i10 + 1] + data[i11 + 1] + 2) >> 2;
+          dst[di + 2] = (data[i00 + 2] + data[i01 + 2] + data[i10 + 2] + data[i11 + 2] + 2) >> 2;
+          dst[di + 3] = (data[i00 + 3] + data[i01 + 3] + data[i10 + 3] + data[i11 + 3] + 2) >> 2;
+        }
         di += 4;
       }
     }
@@ -1308,14 +1319,7 @@ export class ViewerEngine {
     scene.add(envGroup);
     this.envGroup = envGroup;
 
-    this.bloom = createBloom(renderer, {
-      strength: 0.32,
-      threshold: 0.98,
-      knee: 0.25,
-      exposure: 0.97,
-      contrast: 1.04,
-      saturation: 1.06,
-    });
+    this.bloom = createBloom(renderer);
   }
 
   _createGroundShadow() {
@@ -1762,7 +1766,14 @@ export class ViewerEngine {
     const stageGroup = new THREE.Group();
     stageGroup.name = sceneName;
     stageGroup.add(gltf.scene);
-    const entry = { sceneName, meta, group: stageGroup, skyTexture: null, skyTarget: null, textures: new Set() };
+    const entry = {
+      sceneName, meta, group: stageGroup, skyTexture: null, skyTarget: null, textures: new Set(),
+      volumeResolver: new SceneVolumeResolver(meta), volumeRevision: -1, fallbackLightmaps: [],
+      lighting: {
+        uLightmapIntensity: { value: 1 },
+        uLightmapColor: { value: new THREE.Color(1, 1, 1) },
+      },
+    };
     try {
 
     const stageTexCache = new Map();
@@ -1773,13 +1784,15 @@ export class ViewerEngine {
       const ckey = `${rel}|${srgb ? 1 : 0}|${flipY ? 1 : 0}|${maxDim}`;
       let tex = stageTexCache.get(ckey);
       if (!tex) {
-        const img =
-          image.width > maxDim || image.height > maxDim
-            ? downsampleRgba(image.data, image.width, image.height, maxDim)
-            : image;
-        tex = new THREE.DataTexture(img.data, img.width, img.height, THREE.RGBAFormat);
+        const hdr = image.type === 'half-float';
+        const img = image.width > maxDim || image.height > maxDim
+          ? downsampleRgba(image.data, image.width, image.height, maxDim)
+          : image;
+        tex = new THREE.DataTexture(img.data, img.width, img.height, THREE.RGBAFormat,
+          hdr ? THREE.HalfFloatType : THREE.UnsignedByteType);
         tex.flipY = flipY;
-        tex.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+        tex.colorSpace = image.colorSpace === 'linear' ? THREE.LinearSRGBColorSpace
+          : srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
         tex.wrapS = THREE.RepeatWrapping;
         tex.wrapT = THREE.RepeatWrapping;
         tex.magFilter = THREE.LinearFilter;
@@ -1801,15 +1814,18 @@ export class ViewerEngine {
         lmap.needsUpdate = true;
       }
     }
+    const shadowMap = stageTex(meta.lightmap?.shadow, false, true, 2048);
 
     let stageSkyTexture = null;
     if (meta.skybox) {
       const skyEntry = textures.get(meta.skybox);
       if (skyEntry) {
+        const hdr = skyEntry.type === 'half-float';
         const small = downsampleRgba(skyEntry.data, skyEntry.width, skyEntry.height, 1024);
-        const eqTex = new THREE.DataTexture(small.data, small.width, small.height, THREE.RGBAFormat);
+        const eqTex = new THREE.DataTexture(small.data, small.width, small.height, THREE.RGBAFormat,
+          hdr ? THREE.HalfFloatType : THREE.UnsignedByteType);
         eqTex.flipY = false;
-        eqTex.colorSpace = THREE.SRGBColorSpace;
+        eqTex.colorSpace = hdr ? THREE.LinearSRGBColorSpace : THREE.SRGBColorSpace;
         eqTex.mapping = THREE.EquirectangularReflectionMapping;
         eqTex.minFilter = THREE.LinearFilter;
         eqTex.magFilter = THREE.LinearFilter;
@@ -1825,10 +1841,11 @@ export class ViewerEngine {
         }
       }
     }
+    entry.probes = createEnvironmentProbes(meta, textures, entry.textures);
 
-    const lmVolIntensity =
-      (meta.volumes && meta.volumes.lightmap && meta.volumes.lightmap.intensity) ?? 0.95;
-    const lmScale = 1.45 * Math.PI * lmVolIntensity;
+    const lmScale = Math.PI;
+    const mainLight = meta.lights?.filter((light) => light.type === 1)
+      .sort((a, b) => b.intensity - a.intensity)[0];
 
     gltf.scene.traverse((o) => {
       if (!o.isMesh) return;
@@ -1861,10 +1878,20 @@ export class ViewerEngine {
       const ec = mdesc.colors._EmissionColor || [0, 0, 0, 1];
       const emMax = Math.max(ec[0] || 0, ec[1] || 0, ec[2] || 0);
       const defRel = mdesc.maps && mdesc.maps._DefMap;
-      const defMap = emMax > 0.5 && defRel ? stageTex(defRel, false, false) : null;
+      const nativeEnvironment = info.lightmap && lmap && mdesc.shader === 'Environment/Default';
+      const defMap = (nativeEnvironment || emMax > 0.5) && defRel ? stageTex(defRel, false, false) : null;
 
       let mat;
-      if (info.lightmap && lmap) {
+      if (nativeEnvironment) {
+        mat = createEnvironmentMaterial({
+          name: matName, description: mdesc, info, geometry: o.geometry,
+          albedo, normalMap: stageTex(mdesc.maps?._BumpMap, false, false), defMap,
+          lightMap: lmap, shadowMap, reflections: entry.probes, lighting: entry.lighting,
+          tint, opacity: alphaFactor, side, transparent: isBlend,
+          alphaTest: alphaClip || mdesc.keywords?.includes('_ALPHATEST_ON') ? (fl._Cutoff ?? 0.5) : 0,
+          mainLight,
+        });
+      } else if (info.lightmap && lmap) {
         mat = new THREE.MeshBasicMaterial({
           name: matName,
           map: albedo,
@@ -1893,7 +1920,8 @@ export class ViewerEngine {
           depthWrite: !isBlend,
         });
       }
-      if (defMap && emMax > 0.5) {
+      if (mat.isMeshBasicMaterial && mat.lightMap) entry.fallbackLightmaps.push(mat);
+      if (!nativeEnvironment && defMap && emMax > 0.5) {
         const emVec = new THREE.Vector3(ec[0], ec[1], ec[2]);
         mat.onBeforeCompile = (shader) => {
           shader.uniforms.uStageDef = { value: defMap };
@@ -2005,6 +2033,26 @@ export class ViewerEngine {
       delete this.bgMeta[name];
     }
     this.renderer?.renderLists.dispose();
+  }
+
+  _applyStageVolumes(entry) {
+    if (!entry) {
+      this.bloom?.setSceneVolumes(null);
+      return;
+    }
+    const resolver = entry.volumeResolver;
+    resolver.update(this.camera.position);
+    const volumes = resolver.volumes;
+    if (entry.volumeRevision !== resolver.revision) {
+      entry.volumeRevision = resolver.revision;
+      const lightmap = volumes.lightmap;
+      entry.lighting.uLightmapIntensity.value = lightmap.intensity;
+      entry.lighting.uLightmapColor.value.setRGB(lightmap.color.r, lightmap.color.g, lightmap.color.b);
+      for (const material of entry.fallbackLightmaps) {
+        material.lightMapIntensity = Math.PI * lightmap.intensity;
+      }
+    }
+    this.bloom?.setSceneVolumes(volumes, resolver.revision);
   }
 
   _activateEnv3d(sceneName) {
@@ -3069,6 +3117,8 @@ export class ViewerEngine {
     if (this.controls && this.controls.enabled) {
       this.controls.update();
     }
+    if (is3d) this._applyStageVolumes(this.envInfo);
+    else this.bloom?.setSceneVolumes(is2d ? this.bgMeta[sceneName]?.volumes || null : null);
 
     const { x, y, z, rotY } = this.assetActorTransform;
     this.actorGroup.visible = true;
@@ -3347,6 +3397,8 @@ export class ViewerEngine {
     if (is3d) {
       this._activateEnv3d(src);
     }
+    if (is3d) this._applyStageVolumes(this.envInfo);
+    else this.bloom?.setSceneVolumes(this.bgMeta[src]?.volumes || null);
     this._activeAnimationManageVolume = is3d
       ? this.envInfo?.meta?.volumes?.animationManage : this.bgMeta[src]?.volumes?.animationManage;
     this.envGroup.visible = is3d;

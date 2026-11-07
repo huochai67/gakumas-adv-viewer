@@ -340,9 +340,13 @@ function halfLookup(bits: number): number {
   return halfTable[bits];
 }
 
+function bc6hToHalf(value: number): number {
+  return (value * 31) >>> 6;
+}
+
 /** Convert an unquantized BC6H value to an 8-bit channel. */
 function bc6hToByte(value: number): number {
-  const half = (value * 31) >>> 6;
+  const half = bc6hToHalf(value);
   const f = halfLookup(half);
   return Math.min(255, Math.max(0, Math.trunc(f * 255.0)));
 }
@@ -352,7 +356,7 @@ const BC6H_RESERVED = new Uint8Array(16 * 3);
 /**
  * Decode one 16-byte BC6H (UF16) block into 16 RGB pixels (48 bytes).
  */
-function decodeBc6hBlock(data: Uint8Array, out: Uint8Array): void {
+function decodeBc6hBlock(data: Uint8Array, out: Uint8Array | Uint16Array, half = false): void {
   const bits = new BitReader(data);
 
   const r = [0, 0, 0, 0];
@@ -735,6 +739,7 @@ function decodeBc6hBlock(data: Uint8Array, out: Uint8Array): void {
   const baseIndexBits = tableMode >= 10 ? 4 : 3;
   const anchor = numPartitions === 1 ? ANCHOR2[partition] : 0;
   const partPattern = numPartitions === 1 ? PART2[partition] : 0;
+  const convert = half ? bc6hToHalf : bc6hToByte;
 
   for (let py = 0; py < 4; py++) {
     for (let px = 0; px < 4; px++) {
@@ -751,11 +756,29 @@ function decodeBc6hBlock(data: Uint8Array, out: Uint8Array): void {
       const index = bits.readBits(baseIndexBits - (isFixUp ? 1 : 0));
       const ep = subset * 2;
       const dst = pixel * 3;
-      out[dst] = bc6hToByte(interpolate(r[ep], r[ep + 1], weights, index));
-      out[dst + 1] = bc6hToByte(interpolate(g[ep], g[ep + 1], weights, index));
-      out[dst + 2] = bc6hToByte(interpolate(b[ep], b[ep + 1], weights, index));
+      out[dst] = convert(interpolate(r[ep], r[ep + 1], weights, index));
+      out[dst + 1] = convert(interpolate(g[ep], g[ep + 1], weights, index));
+      out[dst + 2] = convert(interpolate(b[ep], b[ep + 1], weights, index));
     }
   }
+}
+
+/** Decode an HDR mip face to RGBA16F, with original Unity row order. */
+export function decodeBc6hHalf(src: Uint8Array, width: number, height: number): Uint16Array {
+  const bx = Math.ceil(width / 4), by = Math.ceil(height / 4);
+  if (width <= 0 || height <= 0 || src.length < bx * by * 16) throw new Error('Invalid or truncated BC6H mip');
+  const out = new Uint16Array(width * height * 4);
+  const block = new Uint16Array(48);
+  for (let yb = 0; yb < by; yb++) for (let xb = 0; xb < bx; xb++) {
+    const off = (yb * bx + xb) * 16;
+    decodeBc6hBlock(src.subarray(off, off + 16), block, true);
+    for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) {
+      if (xb * 4 + x >= width || yb * 4 + y >= height) continue;
+      const d = ((yb * 4 + y) * width + xb * 4 + x) * 4, s = (y * 4 + x) * 3;
+      out[d] = block[s]; out[d + 1] = block[s + 1]; out[d + 2] = block[s + 2]; out[d + 3] = 0x3c00;
+    }
+  }
+  return out;
 }
 
 /* -------------------------------------------------------------------------- */

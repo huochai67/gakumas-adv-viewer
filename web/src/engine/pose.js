@@ -1,5 +1,5 @@
 // Humanoid FK derives native muscle frames and scale from this actor's bind skeleton.
-// Post-rig IK and Quartz run before ActorSwing secondary motion.
+// Post-rig IK, Quartz and ActorSwing precede the final humanoid twist pass.
 import * as THREE from 'three';
 import { ActorSwing } from './actor_swing.js';
 import { QuartzDriver } from './quartz.js';
@@ -87,6 +87,12 @@ export class PoseSolver {
     this.tposeMuscles = this.humanRig.tposeMuscles;
     this.humanScale = this.humanRig.humanScale;
     this.muscles = new Float32Array(this.tposeMuscles);
+    this._twistSources = this.humanRig.bones.map(({ node }) => ({ node, rotation: node.quaternion.clone() }));
+    this._twistCaptured = false;
+    this._twistPosition = new THREE.Vector3();
+    this._twistOuterInverse = new THREE.Matrix4();
+    this._rigRoot = this.humanRig.body[0].node;
+    while (this.bind.has(this._rigRoot.parent)) this._rigRoot = this._rigRoot.parent;
     this._initSwingAndIK();
   }
 
@@ -118,8 +124,6 @@ export class PoseSolver {
     }
     const ik = new HumanIKPose(rig, rotations, positions);
     solveHumanGoals(ik, clipHumanGoals(ik, root, rq, targetCenter));
-    // Keep the outer pose's twist pass separate from custom stream SolveIK.
-    applyHumanTwist(ik);
     const worldDeltaU = {};
     for (const bone of rig.bones) {
       worldDeltaU[bone.name] = qmul(ik.worldRotations.get(bone), qinv(bone.rotation));
@@ -188,6 +192,7 @@ export class PoseSolver {
 
   /** Write a pose to the rig, optionally blending from another pose (w=1 -> b). */
   applyPose(a, b, w = 1) {
+    this._restoreFinalTwist();
     this.swing.restorePose();
     this.quartz.restorePose();
     this.bodyIK.restorePose();
@@ -233,6 +238,7 @@ export class PoseSolver {
   }
 
   resetPose() {
+    this._restoreFinalTwist();
     this.swing.restorePose();
     this.quartz.restorePose();
     this.bodyIK.restorePose();
@@ -256,14 +262,16 @@ export class PoseSolver {
   }
 
   resetSwing() {
+    this._restoreFinalTwist();
     this.swing.reset();
   }
 
   /**
-   * Run post-FK / post-LookTarget arm IK, serialized QuartzDriver rules, then
-   * ActorSwing cloth/hair physics, matching the native animation job order.
+   * Run custom stream IK, Quartz and ActorSwing on the pre-twist skeleton.
+   * EvaluateAvatarEnd redistributes humanoid twist only after these jobs.
    */
   updatePostRig(simTime = 0) {
+    this._restoreFinalTwist();
     this.swing.restorePose();
     this.quartz.restorePose();
     this.bodyIK.restorePose();
@@ -275,8 +283,54 @@ export class PoseSolver {
     if (this.enableIK !== false) this.bodyIK.update();
     this.quartz.update(this.muscles);
     this.swing.update(simTime, this.enableSwing !== false);
+    this._applyFinalTwist();
   }
 
+  _restoreFinalTwist() {
+    if (!this._twistCaptured) return;
+    for (const { node, rotation } of this._twistSources) {
+      node.quaternion.copy(rotation);
+      node.updateMatrix();
+    }
+    this._twistCaptured = false;
+  }
 
-
+  _applyFinalTwist() {
+    const rig = this.humanRig, outer = this._rigRoot.parent;
+    this._rigRoot.updateWorldMatrix(true, true);
+    if (outer) this._twistOuterInverse.copy(outer.matrixWorld).invert();
+    else this._twistOuterInverse.identity();
+    const rotations = new Map(), positions = new Map(), world = new Map();
+    // Local quaternion products exclude scene placement and remain valid through
+    // zero-scale weight handles; matrix decomposition would lose their rotation.
+    const currentRotation = node => {
+      if (!node || !this.bind.has(node)) return new THREE.Quaternion();
+      if (!world.has(node)) world.set(node, currentRotation(node.parent).clone().multiply(node.quaternion));
+      return world.get(node);
+    };
+    for (const { node, rotation } of this._twistSources) {
+      rotation.copy(node.quaternion);
+      const bone = rig.byNode.get(node), q = currentRotation(node);
+      rotations.set(bone, [-q.x, -q.y, q.z, q.w]);
+      node.getWorldPosition(this._twistPosition).applyMatrix4(this._twistOuterInverse);
+      positions.set(bone, [this._twistPosition.x, this._twistPosition.y, -this._twistPosition.z]);
+    }
+    const state = new HumanIKPose(rig, rotations, positions);
+    applyHumanTwist(state);
+    world.clear();
+    const finalRotation = node => {
+      if (!node || !this.bind.has(node)) return new THREE.Quaternion();
+      if (!world.has(node)) {
+        const bone = rig.byNode.get(node), q = bone && state.worldRotations.get(bone);
+        world.set(node, q ? convQ(q) : finalRotation(node.parent).clone().multiply(node.quaternion));
+      }
+      return world.get(node);
+    };
+    for (const { node } of this._twistSources) {
+      node.quaternion.copy(finalRotation(node.parent)).invert().multiply(finalRotation(node));
+      node.updateMatrix();
+    }
+    this._twistCaptured = true;
+    this._rigRoot.updateWorldMatrix(false, true);
+  }
 }

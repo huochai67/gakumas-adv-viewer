@@ -208,6 +208,24 @@ export function decodeTextureRgba(src, width, height, format, flip = true) {
   }
 }
 
+/** Lossless HDR BC6H decoding; no row flip or tone mapping. */
+export function decodeBc6hHalf(src, width, height) {
+  const ex = getExports();
+  const input = toBytes(src);
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) throw new Error('Invalid BC6H dimensions');
+  const srcBlock = alloc(input.length);
+  const dstBlock = alloc(width * height * 8);
+  try {
+    memoryBytes().set(input, srcBlock.ptr);
+    const rc = ex.wasm_decode_bc6h_half(srcBlock.ptr, input.length, width, height, dstBlock.ptr);
+    if (rc < 0) throw new Error(`BC6H half decoding failed (${rc})`);
+    return new Uint16Array(memoryBytes().slice(dstBlock.ptr, dstBlock.ptr + width * height * 8).buffer);
+  } finally {
+    free(dstBlock);
+    free(srcBlock);
+  }
+}
+
 /* ------------------------------------------------------------------------- */
 /* HCA voice + lip-sync                                                      */
 /* ------------------------------------------------------------------------- */

@@ -151,8 +151,9 @@ is required.
   export for glTF `flipY = false`, while lightmap `UV1` keeps Unity's bottom-up V
   paired with `lmap.flipY = true`.
 * Env geometry excludes the `occlusion` cull proxy, inactive GameObjects,
-  disabled `MeshRenderer`s, and `LOD1+` duplicates, and merges static geometry
-  into buckets keyed by `material|lightmap|OverrideBaseColor`.
+  disabled `MeshRenderer`s, and `LOD1+` duplicates. Buckets retain rendering-layer
+  masks, source tangents and renderer-local probe bounds/anchors; renderers that
+  can select different reflection probes are not merged by material alone.
 * Clip bundles carry a variant suffix (`_b` body, `_f` face) that the ADV script
   omits; `story.js` resolves both.
 * ADV script grammar: one bracketed command per line, values are JSON (with
@@ -165,19 +166,51 @@ is required.
 The 3D stage combines static lightmapped architecture with dynamically lit 3D
 props, HDR emissive lamps, skybox, and raycast-snapped `DecalProjector` quads:
 
-* **Lightmaps**: Lightmapped buckets render with `MeshBasicMaterial` + `lightMap`
-  (`channel = 1`, `flipY = true`, sRGB) scaled by `1.45 * Math.PI * intensity`
-  to cancel Three.js's built-in `RECIPROCAL_PI` factor and match Unity URP
-  baked irradiance, tinted by per-object `OverrideBaseColor`.
-* **Emissive fixtures**: Materials with HDR `_EmissionColor` (e.g. fluorescent
-  ceiling tubes) add `_DefMap.g * _EmissionColor` in `onBeforeCompile` so they
-  bloom naturally above the warm ceiling.
-* **Dynamic props & skybox**: Non-lightmapped 3D props (chairs, teapots, cups,
-  desk items) use `MeshStandardMaterial` lit by the scene's directional +
-  hemisphere lights and equirectangular skybox (`t_sky_noon-00.png`).
+* **Lightmapped Environment/Default**: `environment.js` ports the shipped
+  Universal Forward lightmapped fragment equations, including `_Tiling`/`_Offset`
+  with the exported V flip, RG/AG normal decoding and source tangent handedness.
+  `_DefMap * _DefValue` supplies metallic (R), emission (G), indirect mask (B),
+  and smoothness (A). Stale saved `_Metallic`/`_Smoothness` floats are not shader
+  inputs. Emission uses `max(G - 0.02, 0) * _EmissionColor` and
+  `_EmissionAlbedoScale`; indirect diffuse and Fresnel/roughness reflection use
+  the native equations rather than Three.js's standard BRDF.
+* **HDR baked lighting**: BC6H lightmaps are decoded to linear RGBA16F, preserving
+  values above one. `_LightmapScaleColor.rgb = color.rgb * intensity`; the old
+  RGBA8 clipping, sRGB reinterpretation and empirical `1.45` multiplier are gone.
+  Mixed main lights use their authored shadowmask channel and native rendering
+  layers/custom-light controls, so blocked sunlight is not added indoors.
+* **Room reflections**: enabled local probes and RenderSettings' generated/custom
+  default reflection retain all six HDR faces and their original roughness mips.
+  The shipped shader samples a single selected probe with box projection and
+  native roughness-to-LOD/Fresnel weighting; it does not blend two probes.
+  Coordinates mirror world Z without flipping the raw cube faces. Local probe
+  selection respects renderer bounds and importance, not merged-material bounds.
+* **Scene Volumes and postprocessing**: active referenced profiles are resolved
+  by priority, weight and override state; local collider influence follows the
+  camera. Lightmap color/intensity and Bloom/grading update together. Native
+  VLBloom uses `2^(intensity/10)-1`, gamma-to-linear threshold, diffusion-selected
+  downsample levels and additive box reconstruction. Exposure is in stops;
+  contrast uses HDR LogC, followed by linear color filter and saturation. Missing
+  scene settings reset to neutral defaults, including a return to the studio.
+  These grading equations are evaluated directly, not through Unity's 32³ LUT;
+  LUT quantization, other grading effects and other environment shader variants
+  are not claimed pixel-identical. Existing DOF and 2D artwork compositing remain.
+* **Other materials and skybox**: non-lightmapped props retain the existing
+  `MeshStandardMaterial` directional/hemisphere/sky approximation; other baked
+  shaders retain their Basic-material fallback. The displayed equirectangular
+  skybox is separate from the native default reflection cubemap.
 * **Decals**: `DecalProjector` boxes (whiteboard marker drawings, blackboard
   chalk, monitor screen, prop contact shadows) are raycast-snapped (`2.2 mm`
   normal offset) onto the stage surface triangles at export time.
+
+The optional CLI exporter writes HDR textures as `.rgba16f` with dimensions in
+`env.json.hdrTextures`; cubemap `.cube.json` manifests reference each face/mip.
+Browser uploads use the same half-float data in memory. Rebuild WASM after decoder
+changes with `pnpm run build:wasm`. Focused regressions:
+
+```bash
+node --test pipeline/core/bcn_png.test.mjs web/src/runtime/scene_volumes.test.mjs web/src/engine/environment.test.mjs
+```
 
 2D backgrounds are DOM `<img>` layers behind the canvas, driven by
 `backgroundsetting {position, scale, angle}` in 1920x1080 reference pixels.
@@ -220,23 +253,31 @@ correction:
   `human_ik.js`, `human_limb_ik.js` and `human_twist.js` implement the native
   `FullBodySolve` Goal stages: length adjustment (default stretch `0.05`),
   lower-limb DoF preparation, weighted two-bone solving, hint correction,
-  Goal rotation / end-DoF correction, then `TwistSolve` in native order (default
-  twist factors `0.5`). Stretch writes local translations as well as rotations;
+  Goal rotation / end-DoF correction. The final `TwistSolve` redistributes roll
+  with native default factors `0.5`. Stretch writes local translations as well as rotations;
   unstretched frames restore those translations during seeking and cross-fades.
   Foot targets retain the sole offset and each character's post-axis frame.
-  IK and twist run before clothing drivers and remain independent of story
-  placement. The clip adapter treats present T/Q channels as full-weight goals;
+  Custom hand/body IK, Quartz and ActorSwing consume the pre-twist skeleton;
+  `updatePostRig()` applies twist once at the end, matching `EvaluateAvatarEnd`.
+  Applying twist during clip sampling changes the elbow frame used by later
+  collision IK and can rotate the wrist even when its position remains close.
+  Final-output rotation snapshots are restored before the next sample, redraw
+  or reset, so twist never feeds back into simulation. All solves remain
+  independent of story placement. The clip adapter treats present T/Q channels as full-weight goals;
   this is not a reconstruction of Unity's complete AnimationStream activation
   flags, playable IK callbacks or look-at solver.
   The Goal math was compared against the matching UnityPlayer machine code:
   four characters at three animation times, fractional/zero weights, position-
   and rotation-only goals, hints, unreachable targets and an intermediate-bone
   chain. JavaScript double arithmetic is not bit-identical to native SIMD floats.
+  `node --test web/src/engine/pose.test.mjs` covers the Amao `idle-001` hand
+  avoidance endpoint against original native output, repeated redraws/resets,
+  cross-fade recovery, intermediate bones and actor-space placement.
   Full-body `actormotion` cues cross-fade directly over `transition` seconds,
   while `actoradditivemotion` subtracts its `t = 0` reference pose (`add(t) - add(0)`).
 * **Hand/body avoidance IK**: `body_ik.js` replaces the old post-pose analytical
   arm correction with the shared native `FullBodySolve` Goal path, before Quartz
-  and ActorSwing, without applying `TwistSolve` a second time. Goal locator
+  and ActorSwing; the final output pass owns `TwistSolve`. Goal locator
   scale X/Y supplies position/rotation weights; elbow Hint scale X supplies the
   hint blend/weight, while Hint scale Y independently enables and weights body
   avoidance. `ik_correction.js` checks the current wrist plus the configured

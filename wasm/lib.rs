@@ -117,6 +117,16 @@ pub unsafe extern "C" fn wasm_decode_texture2d_rgba(
     lz4_bcn::decode_texture2d_rgba(src, width as usize, height as usize, format, flip != 0, dst)
 }
 
+/// Decode a raw BC6H mip face to RGBA16F in Unity row order.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_decode_bc6h_half(src_ptr: *const u8, src_len: usize, width: u32, height: u32, dst_ptr: *mut u16) -> i32 {
+    let len = match (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(4)) {
+        Some(n) if n > 0 && !dst_ptr.is_null() => n,
+        _ => return -1,
+    };
+    lz4_bcn::decode_bc6h_half(input(src_ptr, src_len), width as usize, height as usize, slice::from_raw_parts_mut(dst_ptr, len))
+}
+
 /* ------------------------------------------------------------------------- */
 /* CRI HCA + lip-sync                                                       */
 /* ------------------------------------------------------------------------- */
