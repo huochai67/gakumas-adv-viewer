@@ -676,7 +676,6 @@ export function buildCatalog() {
   if (statOrNull(RESOURCE_DIR)) {
     for (const f of readdirSync(RESOURCE_DIR).sort()) {
       if (!f.endsWith(".txt") || seenScripts.has(f)) continue;
-      if (scripts.length >= 300) break;
       try {
         scripts.push(summarizeScriptFile(f, path.join(RESOURCE_DIR, f), "/cache/resources"));
         seenScripts.add(f);

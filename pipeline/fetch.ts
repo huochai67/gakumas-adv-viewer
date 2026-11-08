@@ -688,6 +688,7 @@ function printHelp(): void {
   console.log(
     [
       "Download + decrypt Octo asset bundles and raw resources.",
+      "Always sync the latest Octo manifest before selecting and downloading assets.",
       "",
       "Usage:",
       "  pnpm run fetch [options] [bundle-or-resource-or-glob ...]",
@@ -707,7 +708,6 @@ function printHelp(): void {
       "  -j, --concurrency N  Parallel download workers (default: 8)",
       "  --no-deps            Skip dependency closure expansion for bundles",
       "  --keep-raw           Also keep un-decrypted raw .bundle files in cache/downloads/",
-      "  --refresh-manifest   Force re-downloading OctoManifest.json from Octo API",
       "  --manifest-only      Only download/update OctoManifest.json and exit",
       "  -h, --help           Show this help message",
       "",
@@ -739,7 +739,6 @@ if (import.meta.main) {
   let flagAllEnvs = false;
   let flagAllScripts = false;
   let flagAllVoices = false;
-  let flagRefreshManifest = false;
   let flagManifestOnly = false;
   const patterns: string[] = [];
 
@@ -756,7 +755,6 @@ if (import.meta.main) {
     else if (a === "--all-voices") flagAllVoices = true;
     else if (a === "--no-deps") withDeps = false;
     else if (a === "--keep-raw") keepRaw = true;
-    else if (a === "--refresh-manifest") flagRefreshManifest = true;
     else if (a === "--manifest-only") flagManifestOnly = true;
     else if (a === "-j" || a === "--concurrency") {
       concurrency = Math.max(1, parseInt(rawArgs[++i] ?? "8", 10) || 8);
@@ -771,7 +769,7 @@ if (import.meta.main) {
     }
   }
 
-  const manifest = await ensure_manifest(flagRefreshManifest || flagManifestOnly, true);
+  const manifest = await ensure_manifest(true, true);
   if (flagManifestOnly) {
     process.exit(0);
   }

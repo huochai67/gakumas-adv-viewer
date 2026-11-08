@@ -142,6 +142,18 @@ pnpm run fetch:scripts        # download all 3,900+ ADV .txt scripts into cache/
 pnpm run fetch "mdl_chr_hski-*" "adv_dear_hski_*.txt" -j 12
 pnpm run export:all           # optional CLI export of .glb / .png / .mp3 / .json
 ```
+Every `fetch` CLI invocation (including `fetch:all`, `fetch:adv`, and
+`fetch:scripts`) first downloads the latest Octo manifest to
+`cache/OctoManifest.json`, then selects and downloads assets from that revision.
+If the manifest refresh fails, the command stops instead of using an older
+cached manifest. `--manifest-only` refreshes just the manifest; the former
+`--refresh-manifest` option has been removed because refreshing is now mandatory.
+On-demand server loading and offline exporters still use the cached manifest;
+restart a running server after refreshing it to reload its in-memory indexes.
+The Story Browser catalog includes all readable local `.txt` scripts from
+`web/assets/` and `cache/resources/`, without a count limit; built-in scripts
+take precedence when filenames overlap.
+
 Extra bundles are pulled by name from `cache/OctoManifest.json` (or
 `GAKUMAS_OCTO_MANIFEST`); `fetch.ts` resolves the dependency closure. All
 `SerializedFile` v22 objects and `MonoBehaviour`s embed complete `TypeTree`
