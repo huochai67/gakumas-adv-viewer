@@ -2,7 +2,62 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { viewerEngine } from '../engine/ViewerEngine.js';
 import { ActorTransformControl } from './ActorTransformControl.jsx';
 
+const SCRIPT_TYPE_FILTERS = [
+  { id: 'all', label: '全部' },
+  { id: 'dear', label: '亲爱度 (dear)' },
+  { id: 'pevent', label: '培育事件 (pevent)' },
+  { id: 'pstory', label: '培育主线 (pstory)' },
+  { id: 'cidol', label: '偶像卡 (cidol)' },
+  { id: 'csprt', label: '支援卡 (csprt)' },
+  { id: 'event', label: '活动 (event)' },
+  { id: 'pstep', label: '阶段 (pstep)' },
+  { id: 'unit', label: '组合 (unit)' },
+  { id: 'live', label: 'Live (live)' },
+  { id: 'produce', label: '课程 (produce)' },
+  { id: 'pgrowth', label: '特训 (pgrowth)' },
+  { id: 'pweek', label: '周常 (pweek)' },
+  { id: 'gasha', label: '抽卡 (gasha)' },
+  { id: 'startup', label: '登录 (startup)' },
+  { id: 'tutorial', label: '教程 (tutorial)' },
+  { id: 'presult', label: '结算 (presult)' },
+  { id: 'other', label: '其他' },
+];
+
+const KNOWN_SCRIPT_TYPES = {
+  dear: true,
+  pevent: true,
+  pstory: true,
+  cidol: true,
+  csprt: true,
+  event: true,
+  pstep: true,
+  unit: true,
+  live: true,
+  produce: true,
+  pgrowth: true,
+  pweek: true,
+  gasha: true,
+  startup: true,
+  tutorial: true,
+  presult: true,
+};
+
+function resolveScriptType(sc) {
+  if (sc.type) return sc.type;
+  const stem = String(sc.name || '').replace(/\.txt$/i, '');
+  if (stem.startsWith('adv_')) {
+    const m = /^([a-z0-9]+)(?:[_-]|$)/i.exec(stem.slice(4));
+    if (m) {
+      const t = m[1].toLowerCase();
+      if (KNOWN_SCRIPT_TYPES[t]) return t;
+    }
+  }
+  return 'other';
+}
+
 export function StoryBrowserPanel({ catalog, snap }) {
+  const [scriptTypeFilter, setScriptTypeFilter] = useState('all');
+  const [scriptSearch, setScriptSearch] = useState('');
   const [dialogueSearch, setDialogueSearch] = useState('');
   const [showRawModal, setShowRawModal] = useState(false);
   const [rawScriptInput, setRawScriptInput] = useState('');
@@ -12,6 +67,22 @@ export function StoryBrowserPanel({ catalog, snap }) {
   const scripts = catalog?.scripts || [];
   const dialogues = snap.storyDialogueList || [];
 
+  const filteredScripts = useMemo(() => {
+    const q = scriptSearch.trim().toLowerCase();
+    return scripts.filter((sc) => {
+      const scType = resolveScriptType(sc);
+      if (scriptTypeFilter !== 'all' && scType !== scriptTypeFilter) return false;
+      if (
+        q &&
+        !sc.name.toLowerCase().includes(q) &&
+        !(sc.preview && sc.preview.toLowerCase().includes(q)) &&
+        !(sc.actors && sc.actors.some((a) => a.toLowerCase().includes(q)))
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [scripts, scriptTypeFilter, scriptSearch]);
   // Identify the currently active dialogue line index based on snap.storyTime
   const activeDialogueIdx = useMemo(() => {
     const t = snap.storyTime || 0;
@@ -64,33 +135,62 @@ export function StoryBrowserPanel({ catalog, snap }) {
       <div className="section-card">
         <div className="section-header">
           <span className="section-title">ADV 剧情脚本选择 (.txt)</span>
-          <span className="section-count">{snap.storyStatus}</span>
+          <span className="section-count">
+            {filteredScripts.length} 篇 · {snap.storyStatus}
+          </span>
         </div>
 
-        <div className="item-list" style={{ maxHeight: 175 }}>
-          {scripts.map((sc) => (
+        <input
+          type="text"
+          className="search-input"
+          placeholder="搜索脚本名称、角色或台词预览 (如 amao, hski, 002)…"
+          value={scriptSearch}
+          onChange={(e) => setScriptSearch(e.target.value)}
+        />
+
+        <div className="pill-row">
+          {SCRIPT_TYPE_FILTERS.map((f) => (
             <button
-              key={sc.id}
+              key={f.id}
               type="button"
-              className={`item-row ${snap.storyScriptLabel === sc.name ? 'active' : ''}`}
-              onClick={() => viewerEngine.loadStoryFromUrl(sc.url, sc.name, false)}
+              className={`pill-btn ${scriptTypeFilter === f.id ? 'active' : ''}`}
+              onClick={() => setScriptTypeFilter(f.id)}
             >
-              <div className="item-main">
-                <div className="item-title">{sc.name}</div>
-                <div className="item-sub">
-                  {sc.cueCount} 指令 · {sc.messageCount} 句台词 · {sc.voiceCount} 条语音
-                </div>
-                {sc.preview && (
-                  <div className="item-sub" style={{ color: '#8a99b5' }}>
-                    {sc.preview}
-                  </div>
-                )}
-              </div>
-              <span className="badge cached">内置脚本</span>
+              {f.label}
             </button>
           ))}
         </div>
 
+        <div className="item-list" style={{ maxHeight: 210 }}>
+          {useMemo(
+            () =>
+              filteredScripts.map((sc) => {
+                const scType = resolveScriptType(sc);
+                return (
+                  <button
+                    key={sc.id}
+                    type="button"
+                    className={`item-row ${snap.storyScriptLabel === sc.name ? 'active' : ''}`}
+                    onClick={() => viewerEngine.loadStoryFromUrl(sc.url, sc.name, false)}
+                  >
+                    <div className="item-main">
+                      <div className="item-title">{sc.name}</div>
+                      <div className="item-sub">
+                        {sc.cueCount} 指令 · {sc.messageCount} 句台词 · {sc.voiceCount} 条语音
+                      </div>
+                      {sc.preview && (
+                        <div className="item-sub" style={{ color: '#8a99b5' }}>
+                          {sc.preview}
+                        </div>
+                      )}
+                    </div>
+                    <span className="badge cached">{scType}</span>
+                  </button>
+                );
+              }),
+            [filteredScripts, snap.storyScriptLabel],
+          )}
+        </div>
         <div className="pill-row" style={{ marginTop: 4 }}>
           <input
             ref={fileInputRef}

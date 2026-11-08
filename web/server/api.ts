@@ -426,6 +426,7 @@ export interface ScriptSummary {
   id: string;
   name: string;
   url: string;
+  type: string;
   cueCount: number;
   messageCount: number;
   voiceCount: number;
@@ -433,6 +434,40 @@ export interface ScriptSummary {
   backgrounds: string[];
   preview: string;
 }
+
+const KNOWN_SCRIPT_TYPES: Record<string, true> = {
+  dear: true,
+  pevent: true,
+  pstory: true,
+  cidol: true,
+  csprt: true,
+  event: true,
+  pstep: true,
+  unit: true,
+  live: true,
+  produce: true,
+  pgrowth: true,
+  pweek: true,
+  gasha: true,
+  startup: true,
+  tutorial: true,
+  presult: true,
+};
+
+export function parseScriptType(fileName: string): string {
+  const stem = fileName.replace(/\.txt$/i, "");
+  if (stem.startsWith("adv_")) {
+    const rest = stem.slice(4);
+    const m = /^([a-z0-9]+)(?:[_-]|$)/i.exec(rest);
+    if (m) {
+      const rawType = m[1].toLowerCase();
+      if (KNOWN_SCRIPT_TYPES[rawType]) return rawType;
+    }
+  }
+  return "other";
+}
+
+const scriptSummaryMemo = new Map<string, ScriptSummary>();
 
 function parseMotionBundle(stem: string, cached = true): MotionCatalogEntry {
   const isFacial = stem.includes("_facial-");
@@ -462,6 +497,9 @@ function summarizeScriptFile(
   filePath: string,
   urlPrefix = "./assets",
 ): ScriptSummary {
+  const memoKey = `${filePath}|${urlPrefix}`;
+  const cached = scriptSummaryMemo.get(memoKey);
+  if (cached) return cached;
   const raw = readFileSync(filePath, "utf8");
   const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
   const actors: string[] = [];
@@ -494,10 +532,11 @@ function summarizeScriptFile(
     }
   }
 
-  return {
+  const summary: ScriptSummary = {
     id: fileName,
     name: fileName,
     url: `${urlPrefix}/${fileName}`,
+    type: parseScriptType(fileName),
     cueCount: lines.length,
     messageCount,
     voiceCount,
@@ -505,6 +544,8 @@ function summarizeScriptFile(
     backgrounds,
     preview: firstMessages.join(" / "),
   };
+  scriptSummaryMemo.set(memoKey, summary);
+  return summary;
 }
 
 let manifestBundlesCache: OctoBundle[] | null = null;
@@ -675,7 +716,7 @@ export function buildCatalog() {
   }
   if (statOrNull(RESOURCE_DIR)) {
     for (const f of readdirSync(RESOURCE_DIR).sort()) {
-      if (!f.endsWith(".txt") || seenScripts.has(f)) continue;
+      if (!f.startsWith("adv_") || !f.endsWith(".txt") || seenScripts.has(f)) continue;
       try {
         scripts.push(summarizeScriptFile(f, path.join(RESOURCE_DIR, f), "/cache/resources"));
         seenScripts.add(f);
