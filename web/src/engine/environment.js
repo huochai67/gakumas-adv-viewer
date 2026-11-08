@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { PUNCTUAL_DECLARATIONS } from './punctual_lights.js';
 
 // Unity's baked cubemaps already contain roughness-filtered mip levels. Keep
 // both their radiance range and mip chain; a PNG or a second PMREM loses them.
@@ -30,6 +31,7 @@ export function createEnvironmentProbes(meta, textures, ownedTextures) {
   return {
     probes: (meta.reflectionProbes || []).map(upload),
     defaultReflection: meta.defaultReflection ? upload(meta.defaultReflection) : null,
+    getCubeTexture: (ref) => ref == null ? null : upload({ cubeRef: ref }).texture,
   };
 }
 
@@ -98,9 +100,11 @@ void main() {
   gl_Position = projectionMatrix * viewMatrix * world;
 }`;
 
-// Ported from shipped Environment/Default, Universal Forward, LIGHTMAP_ON
-// fragment blob 280. DefMap is R metallic, G emission, B indirect mask, A
-// smoothness; _Metallic/_Smoothness are stale saved properties, not uniforms.
+// Preserve Environment/Default's native baked/Def/normal/probe equations.
+// Transparent direct light follows Forward+ 296/392; opaque VLSRPRenderer uses
+// VLDeferredPass even in mode 2, with StencilDeferred 107/359 light equations.
+// DefMap is R metallic, G emission, B indirect mask, A smoothness;
+// _Metallic/_Smoothness are stale saved properties, not uniforms.
 const ENV_FRAGMENT = /* glsl */`
 #include <common>
 uniform sampler2D uBaseMap;
@@ -120,8 +124,8 @@ uniform vec3 uMainDirection;
 uniform vec3 uMainColor;
 uniform vec4 uMainProperties;
 uniform float uMixedAttenuation;
-#ifdef ENV_SHADOWMASK
 uniform sampler2D uShadowMask;
+#ifdef ENV_SHADOWMASK
 uniform vec4 uOcclusionChannel;
 #endif
 #ifdef ENV_PROBE
@@ -139,6 +143,7 @@ varying vec3 vEnvNormal;
 #ifdef ENV_TANGENT
 varying vec4 vEnvTangent;
 #endif
+${PUNCTUAL_DECLARATIONS}
 
 void main() {
   vec2 texUv = vEnvUv * uUvTransform.xy + uUvTransform.zw;
@@ -236,6 +241,10 @@ void main() {
     color += direct;
   #endif
   color += max(def.g - 0.02, 0.0) * uEmissionColor * mix(vec3(1.0), base.rgb, uEmissionAlbedoScale);
+  #ifdef ENV_PUNCTUAL
+    color = envPunctualLighting(vEnvPosition, N, V, diffuse, specular,
+      roughness, roughness2, baked, color);
+  #endif
   #ifdef ENV_BLEND
     gl_FragColor = vec4(color, base.a);
   #else
@@ -245,7 +254,8 @@ void main() {
 }`;
 
 export function createEnvironmentMaterial({ name, description, info, geometry, albedo, normalMap, defMap,
-  lightMap, shadowMap, reflections, lighting, tint, opacity, side, transparent, alphaTest, mainLight }) {
+  lightMap, shadowMap, reflections, lighting, tint, opacity, side, transparent, alphaTest, mainLight,
+  punctualLighting }) {
   const colors = description.colors || {}, floats = description.floats || {};
   const tiling = colors._Tiling || [1, 1], offset = colors._Offset || [0, 0];
   const probe = selectEnvironmentProbe(reflections.probes, info.reflection) || reflections.defaultReflection;
@@ -259,7 +269,9 @@ export function createEnvironmentMaterial({ name, description, info, geometry, a
   if (alphaTest > 0) defines.ENV_ALPHA_CLIP = 1;
   const lightMask = mainLight?.shaderLayerMask || 0;
   const objectMask = ((info.renderingLayerMask ?? 1) >>> 4 & 254) | 1;
-  if ((lightMask & 1) && ((lightMask >>> 4) & objectMask)) defines.ENV_MAIN_LIGHT = 1;
+  if (punctualLighting) defines.ENV_PUNCTUAL = 1;
+  else if ((lightMask & 1) && ((lightMask >>> 4) & objectMask)) defines.ENV_MAIN_LIGHT = 1;
+  if (punctualLighting && !transparent) defines.ENV_NATIVE_DEFERRED = 1;
   const channel = mainLight?.occlusionMaskChannel ?? -1;
   const occlusion = new THREE.Vector4(0, 0, 0, 0);
   if (shadowMap && mainLight?.bakeType === 1 && channel >= 0 && channel < 4) {
@@ -268,6 +280,10 @@ export function createEnvironmentMaterial({ name, description, info, geometry, a
   }
   const uniforms = {
     ...lighting,
+    ...punctualLighting?.uniforms,
+    uEnvRenderingLayer: { value: objectMask }, uEnvUnityLayer: { value: info.unityLayer ?? 0 },
+    uEnvReceiveShadows: { value: info.receiveShadows !== false && info.receiveShadows !== 0 },
+    uEnvHasShadowMask: { value: !!shadowMap },
     uBaseMap: { value: albedo }, uNormalMap: { value: normalMap }, uDefMap: { value: defMap },
     uLightmap: { value: lightMap },
     uUvTransform: { value: new THREE.Vector4(tiling[0], tiling[1], offset[0], 1 - tiling[1] - offset[1]) },
@@ -294,5 +310,9 @@ export function createEnvironmentMaterial({ name, description, info, geometry, a
     vertexShader: ENV_VERTEX, fragmentShader: ENV_FRAGMENT, side, transparent,
     depthWrite: !transparent, toneMapped: false });
   material.userData.environmentProbe = probe?.cubeRef || null;
+  material.userData.nativeShadowCaster = {
+    // ShadowCaster program 934 uses a fixed 0.5 cutoff, not a saved _Cutoff.
+    map: albedo, opacity, cutoff: alphaTest > 0 ? 0.5 : 0, uvTransform: uniforms.uUvTransform.value,
+  };
   return material;
 }

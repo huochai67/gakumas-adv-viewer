@@ -40,3 +40,33 @@ test('zero-distance local boundary and higher priority override do not reset unr
   assert.equal(resolver.volumes.colorAdjustments.postExposure, 0);
   assert.equal(resolver.volumes.colorAdjustments.contrast, 5.5);
 });
+
+test('actor profiles remain distinct and enum, bool and cube overrides switch without interpolation', () => {
+  const resolver = new SceneVolumeResolver({ volumeStack: [
+    { ...globalVolume, components: {
+      actorParam: { mainLightAngle: { x: 25, y: 24 }, mainLightSpace: 0, reflectionTexture: 'global.cube.json' },
+      litActor: { mainLightAngle: { x: 22, y: 22 } },
+      actorShadow: { directionalType: 0, useOffset: true },
+    } },
+    { ...corridor, weight: 0.25, components: {
+      actorParam: { mainLightAngle: { x: 65, y: 64 }, mainLightSpace: 1, reflectionTexture: null },
+      actorShadow: { directionalType: 2, useOffset: false },
+    } },
+  ] });
+  const volumes = resolver.update([0, 0, -5]);
+  assert.deepEqual(volumes.actorParam.mainLightAngle, { x: 35, y: 34 });
+  assert.deepEqual(volumes.litActor.mainLightAngle, { x: 22, y: 22 });
+  assert.equal(volumes.actorParam.mainLightSpace, 1);
+  assert.equal(volumes.actorParam.reflectionTexture, null);
+  assert.equal(volumes.actorShadow.directionalType, 2);
+  assert.equal(volumes.actorShadow.useOffset, false);
+  const revision = resolver.revision;
+  resolver.update([0.5, 0, -5]);
+  assert.equal(resolver.revision, revision);
+  resolver.update([3, 0, -5]);
+  assert.deepEqual(volumes.actorParam.mainLightAngle, { x: 25, y: 24 });
+  assert.equal(volumes.actorParam.mainLightSpace, 0);
+  assert.equal(volumes.actorParam.reflectionTexture, 'global.cube.json');
+  assert.equal(volumes.actorShadow.directionalType, 0);
+  assert.equal(volumes.actorShadow.useOffset, true);
+});

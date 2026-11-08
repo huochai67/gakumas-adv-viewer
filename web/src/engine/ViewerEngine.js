@@ -5,6 +5,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { parseAdv, buildTimeline } from './adv.js';
 import { createBloom } from './bloom.js';
 import { createEnvironmentProbes, createEnvironmentMaterial } from './environment.js';
+import { createPunctualLighting } from './punctual_lights.js';
 import { applyCameraSetting, unityEulerQuat } from './camera.js';
 import { loadCharacter } from './char.js';
 import { getClip, evalClip, setClipCharMeta } from './clips.js';
@@ -1151,7 +1152,7 @@ export class ViewerEngine {
     this.bgImages = new Map();
     this.bgTextures = new Map();
     this._bgUvMat = new THREE.Matrix3();
-    this._lastVolumeSrc = null;
+    this._actorLightingStates = new WeakMap();
 
     this.loading = true;
     this.loadingText = 'Initializing WASM & 3D Engine…';
@@ -1689,9 +1690,7 @@ export class ViewerEngine {
       this.char = char;
       this.envInfo = stage;
       setClipCharMeta(char.meta);
-      if (stage?.meta?.volumes) {
-        char.applyActorVolume(stage.meta.volumes);
-      }
+      this._applyCharacterLighting(char, stage);
       char.root.position.set(0, 0, 0);
       this.actorGroup.add(char.root);
 
@@ -1842,6 +1841,8 @@ export class ViewerEngine {
       }
     }
     entry.probes = createEnvironmentProbes(meta, textures, entry.textures);
+    this._prepareActorVolumes(entry, meta);
+    entry.punctualLighting = createPunctualLighting(meta);
 
     const lmScale = Math.PI;
     const mainLight = meta.lights?.filter((light) => light.type === 1)
@@ -1857,6 +1858,13 @@ export class ViewerEngine {
       const parentName = o.parent && o.parent.name ? o.parent.name.replace(/^env_/, '') : '';
       const info =
         meta.prims[exactName] || meta.prims[parentName] || meta.prims[strippedName] || {};
+      Object.assign(o.userData, {
+        renderingLayerMask: info.renderingLayerMask ?? 1,
+        unityLayer: info.unityLayer ?? 0,
+        castShadows: info.castShadows ?? 1,
+        receiveShadows: info.receiveShadows ?? true,
+      });
+      if (o.userData.castShadows === 3) o.layers.set(1);
       const matName = info.material || exactName.split('|')[0] || '';
       const mdesc = (meta.materials && meta.materials[matName]) || { colors: {}, floats: {} };
 
@@ -1889,7 +1897,7 @@ export class ViewerEngine {
           lightMap: lmap, shadowMap, reflections: entry.probes, lighting: entry.lighting,
           tint, opacity: alphaFactor, side, transparent: isBlend,
           alphaTest: alphaClip || mdesc.keywords?.includes('_ALPHATEST_ON') ? (fl._Cutoff ?? 0.5) : 0,
-          mainLight,
+          mainLight, punctualLighting: entry.punctualLighting,
         });
       } else if (info.lightmap && lmap) {
         mat = new THREE.MeshBasicMaterial({
@@ -1986,6 +1994,7 @@ export class ViewerEngine {
   }
 
   _disposeEnv3d(entry) {
+    entry.punctualLighting?.dispose();
     entry.group.removeFromParent();
     const geometries = new Set();
     const materials = new Set();
@@ -2030,9 +2039,39 @@ export class ViewerEngine {
       this.bgImages.delete(name);
       const info = this.bgMeta[name];
       if (info?.blobUrl) URL.revokeObjectURL(info.blobUrl);
+      for (const actorTexture of info?.textures || []) actorTexture.dispose();
+      info?.textures?.clear();
       delete this.bgMeta[name];
     }
     this.renderer?.renderLists.dispose();
+  }
+
+  _prepareActorVolumes(entry, meta) {
+    entry.actorVolumes = {
+      ...entry.volumeResolver.volumes, actorParam: { ...entry.volumeResolver.volumes.actorParam },
+      ambientSH: meta.renderSettings?.ambientSH || null,
+    };
+    // Upload every referenced profile cube before releasing the bundle scope;
+    // local volumes may select a different cube after the camera moves.
+    const preload = components => {
+      const actor = components?.actorParam;
+      for (const key of ['reflectionTexture', 'eyeReflectionTexture']) {
+        if (actor?.[key]) entry.probes.getCubeTexture(actor[key]);
+      }
+    };
+    preload(meta.volumes);
+    for (const volume of meta.volumeStack || []) preload(volume.components);
+  }
+
+  _applyCharacterLighting(char, entry) {
+    if (!char) return;
+    if (entry && entry.volumeRevision < 0) this._applyStageVolumes(entry);
+    const revision = entry?.volumeRevision ?? 0;
+    const previous = this._actorLightingStates.get(char);
+    if (previous?.entry === entry && previous.revision === revision) return;
+    char.applyActorVolume(entry?.actorVolumes || null);
+    char.setSceneLights(entry?.meta?.lights || null);
+    this._actorLightingStates.set(char, { entry, revision });
   }
 
   _applyStageVolumes(entry) {
@@ -2045,11 +2084,15 @@ export class ViewerEngine {
     const volumes = resolver.volumes;
     if (entry.volumeRevision !== resolver.revision) {
       entry.volumeRevision = resolver.revision;
-      const lightmap = volumes.lightmap;
-      entry.lighting.uLightmapIntensity.value = lightmap.intensity;
-      entry.lighting.uLightmapColor.value.setRGB(lightmap.color.r, lightmap.color.g, lightmap.color.b);
-      for (const material of entry.fallbackLightmaps) {
-        material.lightMapIntensity = Math.PI * lightmap.intensity;
+      const actor = entry.actorVolumes.actorParam;
+      Object.assign(actor, volumes.actorParam);
+      actor.reflectionTexture = entry.probes.getCubeTexture(volumes.actorParam.reflectionTexture);
+      actor.eyeReflectionTexture = entry.probes.getCubeTexture(volumes.actorParam.eyeReflectionTexture);
+      if (entry.lighting) {
+        const lightmap = volumes.lightmap;
+        entry.lighting.uLightmapIntensity.value = lightmap.intensity;
+        entry.lighting.uLightmapColor.value.setRGB(lightmap.color.r, lightmap.color.g, lightmap.color.b);
+        for (const material of entry.fallbackLightmaps) material.lightMapIntensity = Math.PI * lightmap.intensity;
       }
     }
     this.bloom?.setSceneVolumes(volumes, resolver.revision);
@@ -2148,6 +2191,20 @@ export class ViewerEngine {
     }
     const info = await loadBg2dFromBundle(env, src);
     if (!info) return updatedCatalog;
+    const sourceTextures = info.textures;
+    info.textures = new Set();
+    info.volumeResolver = new SceneVolumeResolver(info);
+    info.volumeRevision = -1;
+    try {
+      info.probes = createEnvironmentProbes({}, sourceTextures, info.textures);
+      this._prepareActorVolumes(info, info);
+    } catch (error) {
+      for (const texture of info.textures) texture.dispose();
+      if (info.blobUrl) URL.revokeObjectURL(info.blobUrl);
+      throw error;
+    } finally {
+      sourceTextures.clear();
+    }
     this.bgMeta[src] = info;
     const tex = new THREE.DataTexture(
       info.rgba,
@@ -2179,9 +2236,8 @@ export class ViewerEngine {
     const sceneName = this.assetSceneName || 'studio';
     if (sceneName.startsWith('env_3d_') && this.env3dCache.has(sceneName)) {
       this._activateEnv3d(sceneName);
-      if (this.char) {
-        this.char.applyActorVolume(this.envInfo?.meta?.volumes || null);
-      }
+      this._applyStageVolumes(this.envInfo);
+      this._applyCharacterLighting(this.char, this.envInfo);
       return;
     }
     if (this.sunLight) {
@@ -2194,13 +2250,9 @@ export class ViewerEngine {
       this.stageHemi.groundColor.setHex(0x9e9284);
       this.stageHemi.intensity = 1.45;
     }
-    if (this.char) {
-      if (sceneName.startsWith('env_2d_') && this.bgMeta[sceneName]?.volumes) {
-        this.char.applyActorVolume(this.bgMeta[sceneName].volumes);
-      } else {
-        this.char.applyActorVolume(null);
-      }
-    }
+    const entry = sceneName.startsWith('env_2d_') ? this.bgMeta[sceneName] || null : null;
+    this._applyStageVolumes(entry);
+    this._applyCharacterLighting(this.char, entry);
   }
 
   // -------------------- Mode Switching --------------------
@@ -2811,9 +2863,7 @@ export class ViewerEngine {
         this.char = newChar;
         this.currentParts = { ...wantParts };
         setClipCharMeta(newChar.meta);
-        if (this.envInfo?.meta?.volumes) {
-          newChar.applyActorVolume(this.envInfo.meta.volumes);
-        }
+        this._applyCharacterLighting(newChar, this.envInfo);
         newChar.root.position.set(0, 0, 0);
         this.actorGroup.add(newChar.root);
       }
@@ -2836,9 +2886,7 @@ export class ViewerEngine {
           this.loadingText = `正在加载同场角色模型 (${aid})…`;
           this._emit();
           const extraChar = await loadCharacter(null, parts);
-          if (this.envInfo?.meta?.volumes) {
-            extraChar.applyActorVolume(this.envInfo.meta.volumes);
-          }
+          this._applyCharacterLighting(extraChar, this.envInfo);
           const extraGroup = new THREE.Group();
           extraGroup.visible = false;
           extraChar.root.position.set(0, 0, 0);
@@ -2927,7 +2975,6 @@ export class ViewerEngine {
         }
       }
 
-      this._lastVolumeSrc = null;
       this.storyTimeline = timeline;
       this.storyPlayer = player;
       this.storyScriptLabel = label;
@@ -3117,8 +3164,9 @@ export class ViewerEngine {
     if (this.controls && this.controls.enabled) {
       this.controls.update();
     }
-    if (is3d) this._applyStageVolumes(this.envInfo);
-    else this.bloom?.setSceneVolumes(is2d ? this.bgMeta[sceneName]?.volumes || null : null);
+    const lightingEntry = is3d ? this.envInfo : is2d ? this.bgMeta[sceneName] : null;
+    this._applyStageVolumes(lightingEntry);
+    this._applyCharacterLighting(this.char, lightingEntry);
 
     const { x, y, z, rotY } = this.assetActorTransform;
     this.actorGroup.visible = true;
@@ -3157,11 +3205,12 @@ export class ViewerEngine {
     this.char.update(this.camera);
     this.char.renderShadow(this.renderer);
 
-    this.groundShadow.visible = !is2d;
+    this.groundShadow.visible = !is2d && !(is3d && this.envInfo.punctualLighting.hasActorShadows);
     const hips = this.char.solver.nameToNode.Hips;
     const hp = hips ? hips.getWorldPosition(new THREE.Vector3()) : this.actorGroup.position;
     this.groundShadow.position.set(hp.x, this.actorGroup.position.y + 0.004, hp.z);
     this._syncActorGizmoTransform();
+    if (is3d) this.envInfo.punctualLighting.renderShadows(this.renderer, this.scene, this.camera);
     if (this.bloom && this.useBloom) this.bloom.render(this.scene, this.camera);
     else this.renderer.render(this.scene, this.camera);
   }
@@ -3201,7 +3250,7 @@ export class ViewerEngine {
         entry.char.renderShadow(this.renderer);
       }
       if (entry.groundShadow) {
-        entry.groundShadow.visible = entry.group.visible && this.envGroup.visible;
+        entry.groundShadow.visible = entry.group.visible && this.envGroup.visible && !this.envInfo?.punctualLighting?.hasActorShadows;
         if (entry.groundShadow.visible) {
           const hips = entry.char.solver.nameToNode.Hips;
           const hp = hips ? hips.getWorldPosition(new THREE.Vector3()) : entry.group.position;
@@ -3210,6 +3259,7 @@ export class ViewerEngine {
       }
     }
     this._syncActorGizmoTransform();
+    if (this.envGroup.visible) this.envInfo?.punctualLighting?.renderShadows(this.renderer, this.scene, this.camera);
 
     if (this.bloom && this.useBloom) this.bloom.render(this.scene, this.camera);
     else this.renderer.render(this.scene, this.camera);
@@ -3379,12 +3429,9 @@ export class ViewerEngine {
     );
   }
 
-  _applyVolumeToAllStoryChars(vol) {
-    if (!vol) return;
-    if (this.char) this.char.applyActorVolume(vol);
-    for (const entry of this.extraStoryActors.values()) {
-      if (entry.char) entry.char.applyActorVolume(vol);
-    }
+  _applyLightingToAllStoryChars(lightingEntry) {
+    this._applyCharacterLighting(this.char, lightingEntry);
+    for (const entry of this.extraStoryActors.values()) this._applyCharacterLighting(entry.char, lightingEntry);
   }
 
   _applyStoryBackground(t, st) {
@@ -3397,20 +3444,13 @@ export class ViewerEngine {
     if (is3d) {
       this._activateEnv3d(src);
     }
-    if (is3d) this._applyStageVolumes(this.envInfo);
-    else this.bloom?.setSceneVolumes(this.bgMeta[src]?.volumes || null);
+    const lightingEntry = is3d ? this.envInfo : this.bgMeta[src] || null;
+    this._applyStageVolumes(lightingEntry);
+    this._applyLightingToAllStoryChars(lightingEntry);
     this._activeAnimationManageVolume = is3d
       ? this.envInfo?.meta?.volumes?.animationManage : this.bgMeta[src]?.volumes?.animationManage;
     this.envGroup.visible = is3d;
     this.scene.background = is3d && this.skyTexture ? this.skyTexture : null;
-    if (src && src !== this._lastVolumeSrc) {
-      this._lastVolumeSrc = src;
-      if (is3d && this.envInfo?.meta?.volumes) {
-        this._applyVolumeToAllStoryChars(this.envInfo.meta.volumes);
-      } else if (!is3d && this.bgMeta[src]?.volumes) {
-        this._applyVolumeToAllStoryChars(this.bgMeta[src].volumes);
-      }
-    }
     if (is3d || !src) {
       if (this.bgEl) {
         this.bgEl.style.display = 'none';

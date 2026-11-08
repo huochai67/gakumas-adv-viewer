@@ -166,21 +166,35 @@ is required.
 The 3D stage combines static lightmapped architecture with dynamically lit 3D
 props, HDR emissive lamps, skybox, and raycast-snapped `DecalProjector` quads:
 
-* **Lightmapped Environment/Default**: `environment.js` ports the shipped
-  Universal Forward lightmapped fragment equations, including `_Tiling`/`_Offset`
-  with the exported V flip, RG/AG normal decoding and source tangent handedness.
-  `_DefMap * _DefValue` supplies metallic (R), emission (G), indirect mask (B),
-  and smoothness (A). Stale saved `_Metallic`/`_Smoothness` floats are not shader
-  inputs. Emission uses `max(G - 0.02, 0) * _EmissionColor` and
-  `_EmissionAlbedoScale`; indirect diffuse and Fresnel/roughness reflection use
-  the native equations rather than Three.js's standard BRDF.
+* **Lightmapped Environment/Default**: `environment.js` ports the shipped baked
+  surface equations, including `_Tiling`/`_Offset` with the exported V flip,
+  RG/AG normal decoding and source tangent handedness. `_DefMap * _DefValue`
+  supplies metallic (R), emission (G), indirect mask (B), and smoothness (A).
+  Stale saved `_Metallic`/`_Smoothness` floats are not shader inputs. Emission uses
+  `max(G - 0.02, 0) * _EmissionColor` and `_EmissionAlbedoScale`; indirect diffuse
+  and Fresnel/roughness reflection use the native equations, not Three's BRDF.
+* **Realtime stage lights**: `punctual_lights.js` supplies texture-backed light
+  lists and point, spot and directional shadow maps. Opaque surfaces reproduce
+  the native deferred-light equations; transparent surfaces use the Forward+
+  equations. This ports their lighting math into the WebGL material, not Unity's
+  complete deferred renderer. Range/cone attenuation, specular, backlighting,
+  Emission/Multiply light modes, baked shadow masks and renderer/light layers
+  follow the source controls. Native opaque Multiply shadows deliberately do
+  not use the transparent path's distance/cone attenuation.
+  Source cast/receive flags, ShadowsOnly renderers, alpha-tested casters, shadow
+  bias, filtering and distance fade are retained. Character floor shadows use
+  these maps where authored, rather than a duplicate blob. The explicit quality
+  baseline is `CampusRenderPipelineHighAsset` (15 m shadow distance, 2048 main
+  and 512 additional shadow resolution); it does not read the installed game's
+  current quality selection.
 * **HDR baked lighting**: BC6H lightmaps are decoded to linear RGBA16F, preserving
   values above one. `_LightmapScaleColor.rgb = color.rgb * intensity`; the old
   RGBA8 clipping, sRGB reinterpretation and empirical `1.45` multiplier are gone.
   Mixed main lights use their authored shadowmask channel and native rendering
   layers/custom-light controls, so blocked sunlight is not added indoors.
 * **Room reflections**: enabled local probes and RenderSettings' generated/custom
-  default reflection retain all six HDR faces and their original roughness mips.
+  default reflection retain all six HDR faces and their original roughness mips;
+  BC6H and RGB9E5 sources decode to linear RGBA16F without clipping HDR values.
   The shipped shader samples a single selected probe with box projection and
   native roughness-to-LOD/Fresnel weighting; it does not blend two probes.
   Coordinates mirror world Z without flipping the raw cube faces. Local probe
@@ -209,7 +223,7 @@ Browser uploads use the same half-float data in memory. Rebuild WASM after decod
 changes with `pnpm run build:wasm`. Focused regressions:
 
 ```bash
-node --test pipeline/core/bcn_png.test.mjs web/src/runtime/scene_volumes.test.mjs web/src/engine/environment.test.mjs
+node --test pipeline/core/bcn_png.test.mjs web/src/runtime/cubemap.test.mjs web/src/runtime/scene_volumes.test.mjs web/src/engine/environment.test.mjs web/src/engine/punctual_lights.test.mjs
 ```
 
 2D backgrounds are DOM `<img>` layers behind the canvas, driven by
@@ -229,14 +243,30 @@ correction:
   * `m_ehl` (`2070`): additive eye highlights with `Stencil Equal 68`.
   * `m_hir` (`2550`): two-pass hair — pass 1 (`Stencil <= 64`) draws opaque
     crown/side/back hair; pass 2 (`Stencil > 64`, `depthWrite: false`) blends
-    bangs over eyebrows/eyes/creases with `1 - _BaseMap.a` so facial features
-    show softly through the bangs.
-  * `m_hirco` (`2450`): alpha-clipped (`_Cutoff 0.5`) wispy hair strands.
+    bangs over eyebrows/eyes/creases with the native head-front/head-up fade.
+  * `m_hirco` (`2450`): soft alpha-blended wispy hair strands.
+  * Opaque passes write coverage alpha 1; transparent passes retain native alpha,
+    preventing hair holes in transparent-canvas/2D and exported composites.
 * **Shading & outlines**: Directly implements the DXBC `Campus/Actor/Default`
   `_ShadeMap.a` split (`_ShadeMap.a < 0.5` clothing/hair cel ramp + `_RampMap` +
   `_DefMap` specular/rim vs `_ShadeMap.a >= 0.5` smooth skin ramp + nose line),
   plus smoothed-normal outlines from `TANGENT.xyz` and `COLOR_0` 12-bit thickness
   encoding (`(COLOR_0.r * 64 + COLOR_0.g) * (63/64)`).
+* **Actor lighting and Volumes**: protagonist `VLActorParameter`, mob
+  `CampusLitActor` and `VLActorShadow` remain separate components, with native
+  defaults and override/priority blending. Actor and eye reflection cubemaps,
+  main-light space/angles, shade colors, rim, GI and additional-light scales are
+  applied in asset, story, 3D and 2D modes and reset on scene changes. Up to eight
+  actor-layer lights follow the native actor pass. Serialized ambient SH is
+  consumed directly with mirrored-Z coefficients; runtime-generated probes or
+  SH inferred from ambient/trilight colors are not synthesized.
+* **Actor self-shadow**: the projector fits the currently posed body/hair bounds
+  instead of a fixed head box. Native caster masks, receiver keywords, tangent
+  normal bias, four-tap filtering, depth/distance gates and shadow-strength/
+  offset controls allow bangs to shadow the face and hair to self-shadow.
+  Shadow resources are stage/character owned and released during replacement.
+  These recovered equations do not imply pixel-identical output to an original
+  game frame with unmatched camera, pose or runtime lighting state.
 * **Face skinning & profile correction**: `export_char.ts` decodes
   `VLActorFaceModel.boneWeightAndIndices` across all 7 face bones (`Head`,
   `Eye_L/R`, `EyeHighlight_L/R_a/b`) and exports `CampusActorFaceCorrection`

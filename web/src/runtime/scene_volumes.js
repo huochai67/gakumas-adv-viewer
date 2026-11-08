@@ -1,9 +1,28 @@
-/** Unity VolumeParameter defaults for the exported scene-lighting/postprocess subset. */
+/** Shipped Unity VolumeParameter constructor defaults, before scene overrides. */
 export const SCENE_VOLUME_DEFAULTS = {
   lightmap: { intensity: 1, color: {r: 1, g: 1, b: 1, a: 1}, reflectionScale: 1 },
   bloom: { intensity: 0, threshold: 1, diffusion: 10, color: {r: 1, g: 1, b: 1, a: 1} },
   colorAdjustments: { postExposure: 0, contrast: 0, saturation: 0, hueShift: 0, colorFilter: {r: 1, g: 1, b: 1, a: 1} },
+  actorParam: {
+    lightColor: {r: 1, g: 1, b: 1, a: 1}, mainLightSpace: 0, mainLightAngle: {x: -7, y: 7},
+    matCapOffset: 0.3, matCapSmoothScale: 1,
+    shadeColorMultiply: {r: 1, g: 1, b: 1, a: 1}, shadeColorAdditive: {r: 0, g: 0, b: 0, a: 1}, shadeApplyRatio: 1,
+    rimAngle: {x: 0, y: 0}, rimBaseColorRatio: 1, rimPower: 8, rimColor: {r: 0, g: 0, b: 0, a: 1},
+    giScale: 0, additiveLightScale: 1, additiveLightSpecularScale: 1, skinSaturation: 0,
+    reflectionTexture: null, reflectionColor: {r: 1, g: 1, b: 1, a: 1},
+    eyeReflectionTexture: null, eyeReflectionColor: {r: 1, g: 1, b: 1, a: 1},
+    eyeHighlightColor: {r: 1, g: 1, b: 1, a: 1},
+  },
+  litActor: {
+    lightColor: {r: 1, g: 1, b: 1, a: 1}, mainLightSpace: 0, mainLightAngle: {x: -7, y: 7},
+    matCapOffset: 0, shadeColorMultiply: {r: 1, g: 1, b: 1, a: 1}, shadeColorAdditive: {r: 0, g: 0, b: 0, a: 1},
+    shadeApplyRatio: 1, rimAngle: {x: 0, y: 0}, rimBaseColorRatio: 1, rimPower: 8,
+    rimColor: {r: 0, g: 0, b: 0, a: 1}, giScale: 1,
+  },
+  actorShadow: { shadowStrength: 1, useOffset: true, directionalType: 0, lightDirectional: {x: 0, y: 0}, facePartsShadowStrength: 0 },
 };
+
+const STEP_PARAMETERS = new Set(['.actorParam.mainLightSpace', '.litActor.mainLightSpace', '.actorShadow.directionalType']);
 
 function colliderShape(c, m) {
   const center = c.center ?? {x: 0, y: 0, z: 0};
@@ -53,8 +72,8 @@ export class SceneVolumeResolver {
     const flatten = (source, target, prefix, output) => {
       for (const key of Object.keys(source)) {
         const value = source[key], path = `${prefix}.${key}`;
-        if (typeof value === 'number') {
-          const slot = { target, key, value, previous: NaN };
+        if (value === null || typeof value !== 'object') {
+          const slot = { target, key, value, previous: NaN, step: typeof value !== 'number' || STEP_PARAMETERS.has(path) };
           output.push(slot); slots.set(path, slot);
         } else flatten(value, target[key], path, output);
       }
@@ -66,9 +85,9 @@ export class SceneVolumeResolver {
       const collect = (source, prefix) => {
         for (const key of Object.keys(source)) {
           const value = source[key], path = `${prefix}.${key}`;
-          if (typeof value === 'number') {
+          if (value === null || typeof value !== 'object') {
             const slot = slots.get(path);
-            if (slot) overrides.push({ target: slot.target, key: slot.key, value });
+            if (slot) overrides.push({ target: slot.target, key: slot.key, value, step: slot.step });
           } else collect(value, path);
         }
       };
@@ -80,7 +99,7 @@ export class SceneVolumeResolver {
       const collect = (source, prefix) => {
         for (const key of Object.keys(source)) {
           const value = source[key], path = `${prefix}.${key}`;
-          if (typeof value === 'number') { const slot = slots.get(path); if (slot) slot.value = value; }
+          if (value === null || typeof value !== 'object') { const slot = slots.get(path); if (slot) slot.value = value; }
           else if (value && typeof value === 'object') collect(value, path);
         }
       };
@@ -102,7 +121,7 @@ export class SceneVolumeResolver {
       }
       if (weight <= 0) continue;
       for (const s of v.overrides) {
-        const value = s.target[s.key] + (s.value - s.target[s.key]) * weight;
+        const value = s.step ? s.value : s.target[s.key] + (s.value - s.target[s.key]) * weight;
         s.target[s.key] = s.key === 'diffusion' ? Math.trunc(value) : value;
       }
     }

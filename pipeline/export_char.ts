@@ -33,6 +33,7 @@ import {
 } from "./assets.ts";
 import { Glb } from "./core/gltf.ts";
 import { setSwingChainRestLengths } from "../web/src/runtime/swing_metadata.js";
+import { extractRendererControls } from "../web/src/runtime/bundle_loaders.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
@@ -183,6 +184,7 @@ class Exporter {
       name: mat.m_Name,
       part,
       renderQueue: mat.m_CustomRenderQueue === undefined ? -1 : Math.trunc(mat.m_CustomRenderQueue),
+      keywords: mat.m_ValidKeywords ?? String(mat.m_ShaderKeywords ?? '').split(/\s+/).filter(Boolean),
       maps: {},
       floats: {},
       colors: {},
@@ -424,6 +426,7 @@ class Exporter {
     bond_matrices: any[],
     materials: string[],
     name: string,
+    controls: Record<string, number | boolean>,
     blend_shapes?: BlendShape[] | null,
     weights_override?: [number[], number[]] | null,
   ): number {
@@ -456,9 +459,11 @@ class Exporter {
       skin,
       weights ?? undefined,
     );
+    this.glb.json.nodes[mesh_node].extras = { ...controls };
     this.meta.parts[name] = {
       node: mesh_node,
       materials,
+      ...controls,
       submeshCount: prims.length,
       vertexCount: (md.vertices ?? []).length,
       blendShapes: blend_shapes && blend_shapes.length ? blend_shapes.map((bs) => bs[0]) : [],
@@ -511,6 +516,7 @@ function main(): void {
       mesh.m_BindPose ?? [],
       mats,
       "body_geo",
+      extractRendererControls(env(), sf, r),
     );
   }
 
@@ -641,6 +647,7 @@ function main(): void {
       mb.bindposes ?? [],
       mats,
       "face_geo",
+      extractRendererControls(env(), sf, mb),
       shapes,
       override,
     );
@@ -679,6 +686,7 @@ function main(): void {
       mesh.m_BindPose ?? [],
       mats,
       `hair_geo${i}`,
+      extractRendererControls(env(), sf, r),
     );
   }
   // Native Quartz references are GameObject PPtrs, not Transform PPtrs.

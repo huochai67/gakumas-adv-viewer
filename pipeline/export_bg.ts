@@ -12,36 +12,14 @@ import { fileURLToPath } from "node:url";
 import { loadEnv, objectsOf } from "./assets.ts";
 import type { BundleContainer } from "./assets.ts";
 import { textureInfo } from "./core/bcn_png.ts";
+import { extractVolumeComponent } from '../web/src/runtime/bundle_loaders.js';
+import { writeCubemap } from './core/cubemap.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 const TEX = path.join(ROOT, "web", "assets", "tex");
 const OUT = path.join(ROOT, "web", "assets");
 
-const ACTOR_PARAM_FIELDS = [
-  "lightColor",
-  "mainLightSpace",
-  "mainLightAngle",
-  "shadeColorMultiply",
-  "shadeColorAdditive",
-  "shadeApplyRatio",
-  "rimAngle",
-  "rimBaseColorRatio",
-  "rimPower",
-  "rimColor",
-] as const;
-
-const ACTOR_SHADOW_FIELDS = [
-  "shadowStrength",
-  "directionalType",
-  "lightDirectional",
-  "facePartsShadowStrength",
-] as const;
-
-/** Material override slots store `{ m_Value, m_OverrideState }`. */
-function overrideActive(value: unknown): boolean {
-  return value === 1 || value === true;
-}
 
 function main(): void {
   const env = loadEnv();
@@ -71,6 +49,7 @@ function main(): void {
     }
 
     const volumes: Record<string, Record<string, unknown>> = {};
+    const registerCube = (texture: Parameters<typeof writeCubemap>[1]) => writeCubemap(env, texture, OUT);
     for (const obj of objectsOf(container, "MonoBehaviour")) {
       const tt = obj.read();
       if ("_verticalSetting" in tt && "_horizontalSetting" in tt) {
@@ -78,24 +57,8 @@ function main(): void {
         entry.horizontalSetting = tt._horizontalSetting;
         continue;
       }
-      if (!overrideActive(tt.active)) continue;
-
-      const mergeOvr = (dst: Record<string, unknown>, fields: readonly string[]): void => {
-        for (const fk of fields) {
-          const d = tt[fk];
-          if (d !== null && typeof d === "object" && !Array.isArray(d) && "m_Value" in d) {
-            if (overrideActive(d.m_OverrideState) || !(fk in dst)) dst[fk] = d.m_Value;
-          }
-        }
-      };
-
-      if ("shadeColorMultiply" in tt && "mainLightAngle" in tt) {
-        volumes.actorParam ??= {};
-        mergeOvr(volumes.actorParam, ACTOR_PARAM_FIELDS);
-      } else if ("shadowStrength" in tt && "lightDirectional" in tt) {
-        volumes.actorShadow ??= {};
-        mergeOvr(volumes.actorShadow, ACTOR_SHADOW_FIELDS);
-      }
+      const component = extractVolumeComponent(env, tt, registerCube);
+      if (component) Object.assign(volumes[component.key] ??= {}, component.parameters);
     }
     if (Object.keys(volumes).length > 0) entry.volumes = volumes;
     if (Object.keys(entry).length > 0) meta[bundle] = entry;

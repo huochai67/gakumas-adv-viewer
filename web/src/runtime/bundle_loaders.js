@@ -26,6 +26,7 @@ import {
 import { setSwingChainRestLengths } from './swing_metadata.js';
 import { ANIMATION_MANAGE_DEFAULTS, ANIMATION_MANAGE_FIELDS } from '../engine/animation_manage.js';
 import { SCENE_VOLUME_DEFAULTS, SceneVolumeResolver } from './scene_volumes.js';
+import { NATIVE_RENDER_PIPELINE } from './rendering_defaults.js';
 
 /* -------------------------------------------------------------------------- */
 /* Shared helpers                                                             */
@@ -149,13 +150,41 @@ export function extractLightControls(env, sf, light) {
     if ('m_CustomLightingType' in value) { data = value; break; }
   }
   const layers = Number(data?.m_RenderingLayers ?? 1);
+  const shadows = light.m_Shadows ?? {};
+  const shadowResolutionTier = Number(data?.m_AdditionalLightsShadowResolutionTier ?? 2);
   return {
     shaderLayerMask: (layers & 0xf00) ? layers : layers | 0x10,
+    renderingLayerMask: layers,
+    shadowRenderingLayerMask: data?.m_CustomShadowLayers ? Number(data.m_ShadowRenderingLayers) : layers,
+    cullingMask: Number(light.m_CullingMask?.m_Bits ?? 0xffffffff) >>> 0,
+    shadows: Number(shadows.m_Type ?? 0),
+    shadowStrength: Number(shadows.m_Strength ?? 1),
+    shadowBias: Number(shadows.m_Bias ?? 0),
+    shadowNormalBias: Number(shadows.m_NormalBias ?? 0),
+    shadowNearPlane: Number(shadows.m_NearPlane ?? 0.1),
+    usePipelineShadowSettings: !!(data?.m_UsePipelineSettings ?? 1),
+    shadowResolutionTier,
+    shadowResolution: shadows.m_CustomResolution > 0 ? Number(shadows.m_CustomResolution)
+      : Number(light.m_Type) === 1 ? NATIVE_RENDER_PIPELINE.mainShadowmapResolution
+        : NATIVE_RENDER_PIPELINE.additionalShadowResolutionTiers[shadowResolutionTier] ?? NATIVE_RENDER_PIPELINE.additionalShadowmapResolution,
+    softShadowQuality: Number(data?.m_SoftShadowQuality ?? 0) || NATIVE_RENDER_PIPELINE.softShadowQuality,
+    innerSpotAngle: Number(light.m_InnerSpotAngle ?? light.m_SpotAngle ?? 0),
     mixedLightingMode: Number(light.m_BakingOutput?.lightmapBakeMode?.mixedLightingMode ?? 0),
     occlusionMaskChannel: Number(light.m_BakingOutput?.occlusionMaskChannel ?? -1),
     isBaked: !!light.m_BakingOutput?.isBaked,
     customProperties: [data?.m_BackLightingIntensity ?? 0, data?.m_MainLightShadowStrength ?? 0,
       data?.m_SpecularStrength ?? 1, (data?.m_CustomLightingType ?? 0) | (data?.m_IndirectLighting ? 16 : 0)],
+  };
+}
+
+/** Keep culling, lighting and shadow layers distinct through mesh merging. */
+export function extractRendererControls(env, sf, renderer) {
+  const go = env.readPPtr(sf, renderer.m_GameObject);
+  return {
+    renderingLayerMask: Number(renderer.m_RenderingLayerMask ?? renderer.renderingLayerMask ?? 1),
+    unityLayer: Number(go?.m_Layer ?? 0),
+    castShadows: Number(renderer.m_CastShadows ?? 1),
+    receiveShadows: !!(renderer.m_ReceiveShadows ?? 1),
   };
 }
 
@@ -195,24 +224,48 @@ class LazyTextureMap extends Map {
   }
 }
 
+// RGB9E5 has at most nine significant bits and its entire finite range fits
+// binary16 exactly, including the smallest half subnormal (2^-24).
+function sharedExponentToHalf(mantissa, exponent) {
+  if (mantissa === 0) return 0;
+  const topBit = 31 - Math.clz32(mantissa), halfExponent = exponent + topBit - 9;
+  return halfExponent <= 0 ? mantissa * (2 ** exponent)
+    : (halfExponent << 10) | ((mantissa - (1 << topBit)) << (10 - topBit));
+}
+
+function decodeRgb9e5Half(bytes, width, height) {
+  const source = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const data = new Uint16Array(width * height * 4);
+  for (let i = 0; i < width * height; i++) {
+    const packed = source.getUint32(i * 4, true), exponent = packed >>> 27, j = i * 4;
+    data[j] = sharedExponentToHalf(packed & 511, exponent);
+    data[j + 1] = sharedExponentToHalf((packed >>> 9) & 511, exponent);
+    data[j + 2] = sharedExponentToHalf((packed >>> 18) & 511, exponent);
+    data[j + 3] = 0x3c00;
+  }
+  return data;
+}
+
 /** Unity stores each cube face's complete mip chain consecutively, +X,-X,+Y,-Y,+Z,-Z. */
 export function decodeProbeCubemap(env, tex, decodeHalf) {
   const tt = typeof tex.read === 'function' ? tex.read() : tex;
-  if (Number(tt.m_TextureFormat) !== 24) throw new Error(`Unsupported HDR probe format ${tt.m_TextureFormat}: ${tt.m_Name}`);
+  const format = Number(tt.m_TextureFormat);
+  if (format !== 24 && format !== 22) throw new Error(`Unsupported HDR cube format ${format}: ${tt.m_Name}`);
   let bytes = toBytes(tt['image data'] ?? tt.m_ImageData);
   if (!bytes.length) bytes = toBytes(env.getResourceData(tex.assetsFile ?? tex._assetsFile ?? tt._assetsFile, tt.m_StreamData));
   const mipmaps = [];
   let faceBytes = 0;
   for (let level = 0; level < Number(tt.m_MipCount); level++) {
     const width = Math.max(1, Number(tt.m_Width) >> level), height = Math.max(1, Number(tt.m_Height) >> level);
-    const length = Math.ceil(width / 4) * Math.ceil(height / 4) * 16;
+    const length = format === 22 ? width * height * 4 : Math.ceil(width / 4) * Math.ceil(height / 4) * 16;
     mipmaps.push({ width, height, offset: faceBytes, length, faces: [] });
     faceBytes += length;
   }
   if (!mipmaps.length || bytes.length !== faceBytes * 6) throw new Error(`Invalid probe mip payload: ${tt.m_Name}`);
   for (let face = 0; face < 6; face++) for (const mip of mipmaps) {
     const offset = face * faceBytes + mip.offset;
-    mip.faces.push(decodeHalf(bytes.subarray(offset, offset + mip.length), mip.width, mip.height));
+    const data = bytes.subarray(offset, offset + mip.length);
+    mip.faces.push(format === 22 ? decodeRgb9e5Half(data, mip.width, mip.height) : decodeHalf(data, mip.width, mip.height));
   }
   return { isCubemap: true, type: 'half-float', colorSpace: 'linear', faceOrder: ['+X', '-X', '+Y', '-Y', '+Z', '-Z'], mipmaps: mipmaps.map(({width, height, faces}) => ({width, height, faces})) };
 }
@@ -276,8 +329,34 @@ export function extractDefaultReflection(env, bundle, register) {
 }
 
 
+const ACTOR_VOLUME_TYPES = { VLActorParameter: 'actorParam', CampusLitActor: 'litActor', VLActorShadow: 'actorShadow' };
+
+/** Select by script type: CampusLitActor shares fields but is not the protagonist's lighting. */
+export function extractVolumeComponent(env, component, registerCube) {
+  if (!component || !(component.active ?? 1)) return null;
+  const script = env.readPPtr(component._assetsFile, component.m_Script);
+  const key = ACTOR_VOLUME_TYPES[script?.m_ClassName]
+    ?? ('reflectionScale' in component ? 'lightmap' : 'threshold' in component && 'diffusion' in component
+      ? 'bloom' : 'postExposure' in component ? 'colorAdjustments' : null);
+  if (!key) return null;
+  const parameters = {};
+  for (const field of Object.keys(SCENE_VOLUME_DEFAULTS[key])) {
+    const p = component[field];
+    if (!p?.m_OverrideState) continue;
+    if (field === 'reflectionTexture' || field === 'eyeReflectionTexture') {
+      if (pidIsZero(p.m_Value?.m_PathID)) parameters[field] = null;
+      else {
+        const texture = env.resolvePPtr(component._assetsFile, p.m_Value);
+        if (!texture) throw new Error(`Missing actor ${field} texture reference`);
+        parameters[field] = registerCube(texture);
+      }
+    } else parameters[field] = typeof SCENE_VOLUME_DEFAULTS[key][field] === 'boolean' ? !!p.m_Value : p.m_Value;
+  }
+  return { key, parameters };
+}
+
 /** Resolve only active, enabled profile references, never unattached profile assets. */
-export function extractSceneVolumes(env, bundle, world) {
+export function extractSceneVolumes(env, bundle, world, registerCube) {
   const stack = [];
   for (const o of env.objectsOf(bundle, 'MonoBehaviour')) {
     const t = o.read();
@@ -287,15 +366,8 @@ export function extractSceneVolumes(env, bundle, world) {
     const components = {};
     for (const ref of profile.components ?? []) {
       const c = env.readPPtr(profile._assetsFile, ref);
-      if (!c || !(c.active ?? 1)) continue;
-      const key = 'reflectionScale' in c ? 'lightmap' : 'threshold' in c && 'diffusion' in c ? 'bloom' : 'postExposure' in c ? 'colorAdjustments' : null;
-      if (!key) continue;
-      const parameters = {};
-      for (const field of Object.keys(SCENE_VOLUME_DEFAULTS[key])) {
-        const p = c[field];
-        if (p?.m_OverrideState) parameters[field] = p.m_Value;
-      }
-      components[key] = parameters;
+      const component = extractVolumeComponent(env, c, registerCube);
+      if (component) components[component.key] = component.parameters;
     }
     const tr = componentTransform(env, o.assetsFile, t), matrix = world(tr, env);
     const go = env.readPPtr(o.assetsFile, t.m_GameObject), colliders = [];
@@ -406,6 +478,7 @@ class CharExporter {
       name: mat.m_Name,
       part,
       renderQueue: mat.m_CustomRenderQueue === undefined ? -1 : Math.trunc(mat.m_CustomRenderQueue),
+      keywords: mat.m_ValidKeywords ?? String(mat.m_ShaderKeywords ?? '').split(/\s+/).filter(Boolean),
       maps: {},
       floats: {},
       colors: {},
@@ -624,7 +697,7 @@ class CharExporter {
     return [prims, out_weights];
   }
 
-  add_skinned(part_name, parent_go, mesh, joints, bond_matrices, materials, name, blend_shapes, weights_override) {
+  add_skinned(part_name, parent_go, mesh, joints, bond_matrices, materials, name, controls, blend_shapes, weights_override) {
     const md = meshData(mesh, this.env);
     const joint_nodes = [];
     for (const t of joints) {
@@ -654,9 +727,11 @@ class CharExporter {
       skin,
       weights ?? undefined,
     );
+    this.glb.json.nodes[mesh_node].extras = { ...controls };
     this.meta.parts[name] = {
       node: mesh_node,
       materials,
+      ...controls,
       submeshCount: prims.length,
       vertexCount: (md.vertices ?? []).length,
       blendShapes: blend_shapes && blend_shapes.length ? blend_shapes.map((bs) => bs[0]) : [],
@@ -732,6 +807,7 @@ export async function buildCharFromBundles(env, parts = PARTS) {
       mesh.m_BindPose ?? [],
       mats,
       'body_geo',
+      extractRendererControls(env, sf, r),
     );
   }
 
@@ -860,6 +936,7 @@ export async function buildCharFromBundles(env, parts = PARTS) {
       mb.bindposes ?? [],
       mats,
       'face_geo',
+      extractRendererControls(env, sf, mb),
       shapes,
       override,
     );
@@ -900,6 +977,7 @@ export async function buildCharFromBundles(env, parts = PARTS) {
       mesh.m_BindPose ?? [],
       mats,
       `hair_geo${i}`,
+      extractRendererControls(env, sf, r),
     );
   }
   // Native Quartz references are GameObject PPtrs, not Transform PPtrs.
@@ -1245,6 +1323,7 @@ class EnvExporter {
       renderSettings: {},
       decals: [],
       volumes: {},
+      renderPipeline: NATIVE_RENDER_PIPELINE,
       skybox: null,
     };
     this.stats = { renderers: 0, verts: 0, tris: 0, skipped: 0, decals: 0 };
@@ -1412,6 +1491,7 @@ class EnvExporter {
 
     const ovrMap = this.colorOverrides.get(pidKey(node.go)) ?? new Map();
     const submeshes = md.submeshes ?? [];
+    const controls = extractRendererControls(env, mr._assetsFile, mr);
     for (let si = 0; si < submeshes.length; si++) {
       const sub = submeshes[si];
       const start = Array.isArray(sub) ? sub[0] : sub.start;
@@ -1425,7 +1505,7 @@ class EnvExporter {
       const ovrTag = ovr !== null
         ? `${fmt3(ovr[0])}_${fmt3(ovr[1])}_${fmt3(ovr[2])}_${fmt3(ovr[3])}`
         : '1';
-      const bkey = `${mname}|${lm >= 0 ? 'lm' : 'lit'}|${ovrTag}|${reflection.usage ? mrPid : 'off'}|${vTan.length ? 'tangent' : 'no-tangent'}|${mr.m_RenderingLayerMask ?? 1}`;
+      const bkey = `${mname}|${lm >= 0 ? 'lm' : 'lit'}|${ovrTag}|${reflection.usage ? mrPid : 'off'}|${vTan.length ? 'tangent' : 'no-tangent'}|${controls.renderingLayerMask}|${controls.unityLayer}|${controls.castShadows}|${Number(controls.receiveShadows)}`;
       let bkt = this.buckets.get(bkey);
       if (bkt === undefined) {
         bkt = {
@@ -1434,7 +1514,7 @@ class EnvExporter {
           lightmap: lm >= 0,
           overrideColor: ovr,
           reflection,
-          renderingLayerMask: Number(mr.m_RenderingLayerMask ?? 1),
+          controls,
           tan: [],
           pos: [],
           nrm: [],
@@ -1504,7 +1584,7 @@ class EnvExporter {
     };
     this.meta.reflectionProbes = extractReflectionProbes(env, this.bundle, this.world.bind(this), registerCube);
     this.meta.defaultReflection = extractDefaultReflection(env, this.bundle, registerCube);
-    const resolvedVolumes = extractSceneVolumes(env, this.bundle, this.world.bind(this));
+    const resolvedVolumes = extractSceneVolumes(env, this.bundle, this.world.bind(this), registerCube);
     Object.assign(this.meta.volumes, resolvedVolumes.volumes);
     this.meta.volumeStack = resolvedVolumes.stack;
     // scene roots
@@ -1566,18 +1646,7 @@ class EnvExporter {
           if (!(key in this.meta.volumes)) this.meta.volumes[key] = {};
           return this.meta.volumes[key];
         };
-        if ('shadeColorMultiply' in tt && 'mainLightAngle' in tt) {
-          mergeOvr(vol('actorParam'), [
-            'lightColor', 'mainLightSpace', 'mainLightAngle',
-            'shadeColorMultiply', 'shadeColorAdditive', 'shadeApplyRatio',
-            'rimAngle', 'rimBaseColorRatio', 'rimPower', 'rimColor',
-          ]);
-        } else if ('shadowStrength' in tt && 'lightDirectional' in tt) {
-          mergeOvr(vol('actorShadow'), [
-            'shadowStrength', 'directionalType', 'lightDirectional',
-            'facePartsShadowStrength',
-          ]);
-        } else if ('modelingPoseWeight' in tt && 'swingPowerWeight' in tt) {
+        if ('modelingPoseWeight' in tt && 'swingPowerWeight' in tt) {
           mergeOvr(vol('animationManage'), ANIMATION_MANAGE_FIELDS);
         } else if ('radius' in tt && 'maxAmount' in tt && 'position' in tt) {
           const posU = v('position') ?? { x: 0, y: 0, z: 0 };
@@ -1873,7 +1942,6 @@ class EnvExporter {
         spotAngle: Number(L.m_SpotAngle ?? 0.0),
         position: [p2[0], p2[1], p2[2]],
         direction: [d2[0], d2[1], d2[2]],
-        shadows: L.m_Shadows?.value ?? 0,
       });
     }
     for (const o of env.objectsOf(this.bundle, 'RenderSettings')) {
@@ -1886,6 +1954,7 @@ class EnvExporter {
         ambientEquatorColor: rgb(rs.m_AmbientEquatorColor),
         ambientGroundColor: rgb(rs.m_AmbientGroundColor),
         ambientIntensity: rs.m_AmbientIntensity ?? 1.0,
+        ambientSH: rs.m_AmbientProbe ? Object.values(rs.m_AmbientProbe) : null,
         fog: Boolean(rs.m_Fog ?? false),
         fogColor: has('m_FogColor') ? rgb(rs.m_FogColor) : null,
         fogDensity: rs.m_FogDensity ?? 0.0,
@@ -1928,7 +1997,7 @@ class EnvExporter {
         lightmap: bkt.lightmap,
         overrideColor: bkt.overrideColor,
         reflection: bkt.reflection,
-        renderingLayerMask: bkt.renderingLayerMask,
+        ...bkt.controls,
       };
     }
   }
@@ -1954,25 +2023,6 @@ export async function buildEnv3dFromBundles(env, sceneName = SCENE) {
 /* 2D background (pipeline/export_bg.ts)                                      */
 /* -------------------------------------------------------------------------- */
 
-const ACTOR_PARAM_FIELDS = [
-  'lightColor',
-  'mainLightSpace',
-  'mainLightAngle',
-  'shadeColorMultiply',
-  'shadeColorAdditive',
-  'shadeApplyRatio',
-  'rimAngle',
-  'rimBaseColorRatio',
-  'rimPower',
-  'rimColor',
-];
-
-const ACTOR_SHADOW_FIELDS = [
-  'shadowStrength',
-  'directionalType',
-  'lightDirectional',
-  'facePartsShadowStrength',
-];
 
 function overrideActive(value) {
   return value === 1 || value === true;
@@ -2011,6 +2061,12 @@ export async function loadBg2dFromBundle(env, bundleName) {
   let verticalSetting = null;
   let horizontalSetting = null;
   const volumes = {};
+  const textures = new LazyTextureMap(env);
+  const registerCube = texture => {
+    const t = texture.read(), ref = `tex/${t.m_Name}.cube.json`;
+    textures.register(ref, t.m_Name, texture);
+    return ref;
+  };
   for (const obj of env.objectsOf(bundle, 'MonoBehaviour')) {
     const tt = obj.read();
     if ('_verticalSetting' in tt && '_horizontalSetting' in tt) {
@@ -2029,13 +2085,9 @@ export async function loadBg2dFromBundle(env, bundleName) {
       }
     };
 
-    if ('shadeColorMultiply' in tt && 'mainLightAngle' in tt) {
-      volumes.actorParam ??= {};
-      mergeOvr(volumes.actorParam, ACTOR_PARAM_FIELDS);
-    } else if ('shadowStrength' in tt && 'lightDirectional' in tt) {
-      volumes.actorShadow ??= {};
-      mergeOvr(volumes.actorShadow, ACTOR_SHADOW_FIELDS);
-    } else if ('modelingPoseWeight' in tt && 'swingPowerWeight' in tt) {
+    const component = extractVolumeComponent(env, tt, registerCube);
+    if (component) Object.assign(volumes[component.key] ??= {}, component.parameters);
+    if ('modelingPoseWeight' in tt && 'swingPowerWeight' in tt) {
       volumes.animationManage ??= {};
       mergeOvr(volumes.animationManage, ANIMATION_MANAGE_FIELDS);
     }
@@ -2049,6 +2101,7 @@ export async function loadBg2dFromBundle(env, bundleName) {
     verticalSetting,
     horizontalSetting,
     volumes,
+    textures,
     data,
     rgba: data,
     blobUrl,

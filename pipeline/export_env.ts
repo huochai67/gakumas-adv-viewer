@@ -18,7 +18,9 @@ import { Glb } from "./core/gltf.ts";
 import type { SerializedFile, UnityObject } from "./core/serialized_file.ts";
 import { ANIMATION_MANAGE_FIELDS } from "../web/src/engine/animation_manage.js";
 import { decodeBc6hHalf } from './core/bcn_png.ts';
-import { decodeProbeCubemap, decodeTexture, extractReflectionProbes, extractDefaultReflection, extractSceneVolumes, rendererReflection, environmentNormalMatrix, activeComponent, extractLightControls } from '../web/src/runtime/bundle_loaders.js';
+import { decodeTexture, extractReflectionProbes, extractDefaultReflection, extractSceneVolumes, rendererReflection, environmentNormalMatrix, activeComponent, extractLightControls, extractRendererControls } from '../web/src/runtime/bundle_loaders.js';
+import { NATIVE_RENDER_PIPELINE } from '../web/src/runtime/rendering_defaults.js';
+import { writeCubemap } from './core/cubemap.ts';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(MODULE_DIR, "..");
@@ -106,7 +108,7 @@ interface Bucket {
   lightmap: boolean;
   overrideColor: number[] | null;
   reflection: { usage: number; anchor: number[]; bounds: { min: number[]; max: number[] } };
-  renderingLayerMask: number;
+  controls: { renderingLayerMask: number; unityLayer: number; castShadows: number; receiveShadows: boolean };
   tan: number[];
   pos: number[];
   nrm: number[];
@@ -145,6 +147,7 @@ export class EnvExporter {
     this.meta = {
       materials: {}, lightmap: {}, lights: [],
       renderSettings: {}, decals: [], volumes: {}, skybox: null,
+      renderPipeline: NATIVE_RENDER_PIPELINE,
     };
     this.stats = { renderers: 0, verts: 0, tris: 0, skipped: 0, decals: 0 };
   }
@@ -337,6 +340,7 @@ export class EnvExporter {
 
     const ovrMap = this.colorOverrides.get(pidKey(node.go)) ?? new Map<number, number[]>();
     const submeshes: any[] = md.submeshes ?? [];
+    const controls = extractRendererControls(env, mr._assetsFile, mr);
     for (let si = 0; si < submeshes.length; si++) {
       const sub = submeshes[si];
       const start = Array.isArray(sub) ? sub[0] : sub.start;
@@ -350,7 +354,7 @@ export class EnvExporter {
       const ovrTag = ovr !== null
         ? `${fmt3(ovr[0])}_${fmt3(ovr[1])}_${fmt3(ovr[2])}_${fmt3(ovr[3])}`
         : "1";
-      const bkey = `${mname}|${lm >= 0 ? 'lm' : 'lit'}|${ovrTag}|${reflection.usage ? mrPid : 'off'}|${vTan.length ? 'tangent' : 'no-tangent'}|${mr.m_RenderingLayerMask ?? 1}`;
+      const bkey = `${mname}|${lm >= 0 ? 'lm' : 'lit'}|${ovrTag}|${reflection.usage ? mrPid : 'off'}|${vTan.length ? 'tangent' : 'no-tangent'}|${controls.renderingLayerMask}|${controls.unityLayer}|${controls.castShadows}|${Number(controls.receiveShadows)}`;
       let bkt = this.buckets.get(bkey);
       if (bkt === undefined) {
         bkt = {
@@ -359,7 +363,7 @@ export class EnvExporter {
           lightmap: lm >= 0,
           overrideColor: ovr,
           reflection,
-          renderingLayerMask: Number(mr.m_RenderingLayerMask ?? 1),
+          controls,
           tan: [],
           pos: [],
           nrm: [],
@@ -422,21 +426,10 @@ export class EnvExporter {
 
   run(): void {
     const env = assets.loadEnv();
-    const registerCube = (texture: UnityObject) => {
-      const t = texture.read(), ref = `tex/${t.m_Name}.cube.json`;
-      const cube = decodeProbeCubemap(env, texture, decodeBc6hHalf);
-      fs.mkdirSync(TEX, { recursive: true });
-      const mipmaps = cube.mipmaps.map((mip: { width: number; height: number; faces: Uint16Array[] }, level: number) => ({ width: mip.width, height: mip.height, faces: mip.faces.map((data: Uint16Array, face: number) => {
-        const file = `tex/${t.m_Name}.m${level}.f${face}.rgba16f`;
-        fs.writeFileSync(path.join(OUT, file), new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-        return file;
-      }) }));
-      fs.writeFileSync(path.join(OUT, ref), JSON.stringify({ ...cube, mipmaps }));
-      return ref;
-    };
+    const registerCube = (texture: UnityObject) => writeCubemap(env, texture, OUT);
     this.meta.reflectionProbes = extractReflectionProbes(env, this.bundle, this.world.bind(this), registerCube);
     this.meta.defaultReflection = extractDefaultReflection(env, this.bundle, registerCube);
-    const resolvedVolumes = extractSceneVolumes(env, this.bundle, this.world.bind(this));
+    const resolvedVolumes = extractSceneVolumes(env, this.bundle, this.world.bind(this), registerCube);
     Object.assign(this.meta.volumes, resolvedVolumes.volumes);
     this.meta.volumeStack = resolvedVolumes.stack;
     // scene roots
@@ -499,18 +492,7 @@ export class EnvExporter {
           if (!(key in this.meta.volumes)) this.meta.volumes[key] = {};
           return this.meta.volumes[key];
         };
-        if ("shadeColorMultiply" in tt && "mainLightAngle" in tt) {
-          mergeOvr(vol("actorParam"), [
-            "lightColor", "mainLightSpace", "mainLightAngle",
-            "shadeColorMultiply", "shadeColorAdditive", "shadeApplyRatio",
-            "rimAngle", "rimBaseColorRatio", "rimPower", "rimColor",
-          ]);
-        } else if ("shadowStrength" in tt && "lightDirectional" in tt) {
-          mergeOvr(vol("actorShadow"), [
-            "shadowStrength", "directionalType", "lightDirectional",
-            "facePartsShadowStrength",
-          ]);
-        } else if ("modelingPoseWeight" in tt && "swingPowerWeight" in tt) {
+        if ("modelingPoseWeight" in tt && "swingPowerWeight" in tt) {
           mergeOvr(vol("animationManage"), [...ANIMATION_MANAGE_FIELDS]);
         } else if ("radius" in tt && "maxAmount" in tt && "position" in tt) {
           const posU = v("position") ?? { x: 0, y: 0, z: 0 };
@@ -794,7 +776,6 @@ export class EnvExporter {
         spotAngle: Number(L.m_SpotAngle ?? 0.0),
         position: [p2[0], p2[1], p2[2]],
         direction: [d2[0], d2[1], d2[2]],
-        shadows: L.m_Shadows?.value ?? 0,
       });
     }
     for (const o of assets.objectsOf(this.bundle, "RenderSettings")) {
@@ -807,6 +788,7 @@ export class EnvExporter {
         ambientEquatorColor: rgb(rs.m_AmbientEquatorColor),
         ambientGroundColor: rgb(rs.m_AmbientGroundColor),
         ambientIntensity: rs.m_AmbientIntensity ?? 1.0,
+        ambientSH: rs.m_AmbientProbe ? Object.values(rs.m_AmbientProbe) : null,
         fog: Boolean(rs.m_Fog ?? false),
         fogColor: has("m_FogColor") ? rgb(rs.m_FogColor) : null,
         fogDensity: rs.m_FogDensity ?? 0.0,
@@ -849,7 +831,7 @@ export class EnvExporter {
         lightmap: bkt.lightmap,
         overrideColor: bkt.overrideColor,
         reflection: bkt.reflection,
-        renderingLayerMask: bkt.renderingLayerMask,
+        ...bkt.controls,
       };
     }
     fs.mkdirSync(OUT, { recursive: true });
