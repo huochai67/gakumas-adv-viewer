@@ -36,7 +36,10 @@ WebGL renderer (`web/src/engine/ViewerEngine.js`):
 Character switches dispose the previous actor's textures, skeleton/bone textures,
 materials (including the separate hair-shadow pass), geometry and shadow render
 target. Texture ownership is per character; loading another actor cannot overwrite
-or dispose textures still used by a character in the current story.
+or dispose textures still used by a character in the current story. The shared
+white/black fallback textures (`WHITE_SRGB` / `BLACK_SRGB`) survive character
+disposal. The disposal exclusion list must match these live fallbacks; obsolete
+constants would throw during cleanup and prevent character replacement.
 
 The viewer retains only the selected asset scene and backgrounds referenced by
 the current story, so timeline seeking remains immediate. Other 3D stages release
@@ -56,6 +59,10 @@ scene, and compare `viewerEngine.renderer.info.memory` in DevTools. After warm-u
 GPU resource counts should return to the same baseline. Browser allocators and
 WebAssembly linear memory may retain their high-water allocation; immediate OS
 memory reduction is not required for released objects to be collectable.
+
+Character-switch smoke check: select `krnh`, switch back to `amao`, then select
+`krnh` again. Each switch must finish loading, display the selected character,
+and produce no `Failed to load character parts` / `ReferenceError` in the console.
 
 ## Project Structure
 

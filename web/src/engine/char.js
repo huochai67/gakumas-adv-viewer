@@ -14,7 +14,7 @@ import { buildCharFromBundles } from '../runtime/bundle_loaders.js';
 const OUTLINE_SCALE = parseFloat(new URLSearchParams(location.search).get('outline') ?? '1.0');
 const STENCIL_MASK = 108; // 0x6C (bits 2, 3, 5, 6 used by Campus/Actor/Default)
 
-// Fallback 1x1 white & neutral textures so shader uniforms are never null
+// Shared 1x1 white & black fallbacks; never disposed with character-owned textures.
 function solidTex(r, g, b, a = 255, srgb = false) {
   const t = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1, THREE.RGBAFormat);
   t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
@@ -677,7 +677,7 @@ function disposeCharacterResources(resources) {
   for (const material of resources.materials) material.dispose();
 
   // Passes share skeletons, and distinct skeletons may share a bone texture.
-  const disposedTextures = new Set([WHITE_SRGB, DEF_NEUTRAL, RAMP_DEFAULT]);
+  const disposedTextures = new Set([WHITE_SRGB, BLACK_SRGB]);
   for (const skeleton of resources.skeletons) {
     const texture = skeleton.boneTexture;
     if (texture) {
